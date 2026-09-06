@@ -146,9 +146,14 @@ fn item_has_meaningful_context(item: &InputItem) -> bool {
                 InputContent::InputText(text) | InputContent::OutputText(text) | InputContent::ReasoningText(text) => {
                     !text.text.trim().is_empty()
                 }
-                InputContent::InputImage(image) => image.image_url.as_deref().is_some_and(|url| !url.trim().is_empty()),
-                // Message files are rejected during typed input validation.
-                InputContent::InputFile(_) | InputContent::Unknown => false,
+                // An image is context whether it is inline or a file reference.
+                InputContent::InputImage(image) => [image.image_url.as_deref(), image.file_id.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|reference| !reference.trim().is_empty()),
+                InputContent::Refusal(refusal) => !refusal.refusal.trim().is_empty(),
+                // Message files and unmodeled parts are rejected during typed input validation.
+                InputContent::InputFile(_) | InputContent::Unknown(_) => false,
             }),
         },
         InputItem::FunctionCall(call) => !call.name.trim().is_empty() || !call.arguments.trim().is_empty(),
@@ -205,9 +210,13 @@ fn add_message_content(estimate: &mut InputTokenEstimate, content: &InputMessage
                         estimate.add_tokens(ESTIMATED_CONTENT_PART_OVERHEAD_TOKENS);
                         estimate.add_text(&text.text);
                     }
+                    InputContent::Refusal(refusal) => {
+                        estimate.add_tokens(ESTIMATED_CONTENT_PART_OVERHEAD_TOKENS);
+                        estimate.add_text(&refusal.refusal);
+                    }
                     InputContent::InputImage(_) => estimate.add_tokens(ESTIMATED_IMAGE_TOKENS),
                     InputContent::InputFile(file) => add_file_content(estimate, file),
-                    InputContent::Unknown => estimate.add_tokens(ESTIMATED_CONTENT_PART_OVERHEAD_TOKENS),
+                    InputContent::Unknown(_) => estimate.add_tokens(ESTIMATED_CONTENT_PART_OVERHEAD_TOKENS),
                 }
             }
         }
@@ -565,9 +574,9 @@ mod tests {
 
     fn inline_image(encoded_bytes: usize) -> InputImageContent {
         InputImageContent {
-            file_id: None,
             image_url: Some(format!("data:image/png;base64,{}", "A".repeat(encoded_bytes))),
             detail: Some("auto".to_owned()),
+            ..InputImageContent::default()
         }
     }
 
@@ -840,6 +849,29 @@ mod tests {
 
             assert_eq!(small, large);
         }
+    }
+
+    #[test]
+    fn an_image_referenced_by_file_id_is_meaningful_context() {
+        let image_by = |content: InputImageContent| {
+            InputItem::Message(InputMessage {
+                id: None,
+                role: "user".to_owned(),
+                status: None,
+                content: InputMessageContent::Parts(vec![InputContent::InputImage(content)]),
+            })
+        };
+
+        assert!(super::item_has_meaningful_context(&image_message(1)));
+        assert!(super::item_has_meaningful_context(&image_by(InputImageContent {
+            file_id: Some("file_diagram".to_owned()),
+            ..InputImageContent::default()
+        })));
+        assert!(!super::item_has_meaningful_context(&image_by(InputImageContent {
+            file_id: Some("  ".to_owned()),
+            image_url: Some(String::new()),
+            ..InputImageContent::default()
+        })));
     }
 
     #[test]
