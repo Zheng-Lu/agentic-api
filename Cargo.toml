@@ -41,7 +41,17 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "internal-logs"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "http-proto",
+    "reqwest-blocking-client",
+    "trace",
+    "metrics",
+    "internal-logs",
+] }
 tracing = "0.1"
+tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.8"
 tokio-tungstenite = "0.29"
