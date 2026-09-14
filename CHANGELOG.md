@@ -32,6 +32,10 @@ All notable changes to Agentic API are documented here.
   text/image ordering, multiple images per turn, client-executed `view_image` tool output, `previous_response_id`
   continuation, `conversation_id` rehydration, stateless `store: false` proxying, and compaction of retained
   image-bearing user messages, over both the HTTP and WebSocket transports.
+- Recorded matching OpenAI-reference and gateway image-input cassettes — a 64x64 PNG sent inline as `input_image`,
+  then continued by `previous_response_id` — with replay coverage comparing request shape, completed response
+  structure, the streaming event lifecycle, and rehydrated continuation history against OpenAI (#253). The cassette
+  recorder now accepts `--input-file` for the first of several turns.
 
 ### Changed
 
