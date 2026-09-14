@@ -1,7 +1,7 @@
 use crate::executor::accumulator::Validation;
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::gateway_accumulator::StreamEvent;
-use crate::executor::inference::{call_inference, fetch_response_json};
+use crate::executor::inference::{call_inference_limited, fetch_response_json_limited};
 use crate::executor::pipeline::{AgentPipeline, StreamPayload};
 use crate::executor::rehydrate::validate_message_files;
 use crate::executor::request::{ExecutionContext, RequestContext};
@@ -10,7 +10,6 @@ use crate::executor::translate::TranslationContext;
 use crate::tool::{ToolRegistry, ToolSearchState};
 use crate::types::request_response::ResponsePayload;
 use crate::utils::common::serialize_to_string;
-use futures::StreamExt;
 use std::sync::Arc;
 
 /// Snapshot tool facts at the orchestration boundary, excluding all execution bindings.
@@ -77,6 +76,15 @@ pub(super) fn agent_pipeline(
     AgentPipeline::new(ctx, tool_search_state, sender)
 }
 
+pub(super) fn agent_pipeline_with_limits(
+    ctx: RequestContext,
+    tool_search_state: Option<ToolSearchState>,
+    sender: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+    max_stream_event_bytes: usize,
+) -> AgentPipeline {
+    AgentPipeline::with_limits(ctx, tool_search_state, sender, max_stream_event_bytes)
+}
+
 pub(super) async fn fetch_blocking_payload(
     agent: &mut AgentPipeline,
     exec_ctx: &ExecutionContext,
@@ -86,11 +94,20 @@ pub(super) async fn fetch_blocking_payload(
 ) -> ExecutorResult<ResponsePayload> {
     agent.ensure_request_prepared()?;
     let upstream_json = upstream_request(&agent.request, false)?;
-    let body = fetch_response_json(upstream_json, &exec_ctx.responses_url(), &exec_ctx.client, auth).await?;
-    if let Some(response_budget) = response_budget {
-        response_budget.consume(body.len())?;
-    }
-    agent.run_with_json_body(&body, Validation::Lenient, translation_context(registry, agent))
+    let body = fetch_response_json_limited(
+        upstream_json,
+        &exec_ctx.responses_url(),
+        &exec_ctx.client,
+        auth,
+        exec_ctx.responses_config.max_upstream_json_bytes,
+    )
+    .await?;
+    agent.run_with_json_body(
+        &body,
+        Validation::Lenient,
+        translation_context(registry, agent),
+        response_budget.cloned(),
+    )
 }
 
 /// A complete upstream response, in whichever form the caller received it.
@@ -112,7 +129,7 @@ pub async fn decode_upstream(
     let mut agent = agent_pipeline(ctx, None, None);
     let payload = match body {
         UpstreamBody::Json(body) => {
-            agent.run_with_json_body(body, Validation::Strict, TranslationContext::default())?
+            agent.run_with_json_body(body, Validation::Strict, TranslationContext::default(), None)?
         }
         UpstreamBody::Sse(body) => {
             let lines = futures::stream::iter(body.lines().map(|line| Ok(line.to_owned())));
@@ -123,6 +140,7 @@ pub async fn decode_upstream(
                     TranslationContext::default(),
                     &ToolRegistry::default(),
                     0,
+                    None,
                 )
                 .await?
                 .payload
@@ -142,18 +160,14 @@ pub(super) async fn fetch_stream_payload(
 ) -> ExecutorResult<StreamPayload> {
     agent.ensure_request_prepared()?;
     let upstream_json = upstream_request(&agent.request, true)?;
-    let lines = call_inference(
+    let lines = call_inference_limited(
         upstream_json,
         exec_ctx.responses_url(),
         Arc::clone(&exec_ctx.client),
         auth.map(str::to_owned),
         exec_ctx.streaming_timeout,
-    )
-    .map(|line| {
-        let line = line?;
-        response_budget.consume(line.len())?;
-        Ok(line)
-    });
+        exec_ctx.responses_config.max_upstream_sse_line_bytes,
+    );
     agent
         .run_with_stream_body(
             lines,
@@ -161,6 +175,7 @@ pub(super) async fn fetch_stream_payload(
             translation_context(registry, agent),
             registry,
             output_offset,
+            Some(response_budget.clone()),
         )
         .await
 }
@@ -199,7 +214,7 @@ pub(super) mod tests {
         assert_eq!(context.tool_type("raw_echo"), ToolType::Custom);
         assert_eq!(context.tool_type("tool_search"), ToolType::ToolSearch);
         assert_eq!(context.tool_type("unknown"), ToolType::Function);
-        let mut pipeline = RoundIngestion::new("resp_1".to_owned(), None, Validation::Lenient, context);
+        let mut pipeline = RoundIngestion::new("resp_1".to_owned(), None, Validation::Lenient, context, None);
         let line = format!(
             "data: {}",
             serde_json::json!({
@@ -238,7 +253,7 @@ pub(super) mod tests {
         let json_context = translation_context(&registry, &agent);
         drop(registry);
 
-        let mut ingestion = RoundIngestion::new("resp_1".to_owned(), None, Validation::Lenient, stream_context);
+        let mut ingestion = RoundIngestion::new("resp_1".to_owned(), None, Validation::Lenient, stream_context, None);
         let created = serde_json::json!({"type":"response.created","response":{
             "id":"upstream","status":"in_progress","tools":[],
             "tool_choice":{"type":"function","name":"raw_echo"}
@@ -269,7 +284,7 @@ pub(super) mod tests {
         let stream_payload = ingestion.finish("test", None, None).unwrap();
         let body = serde_json::json!({"id":"upstream","status":"completed","output":[item]}).to_string();
         let json_payload = agent
-            .run_with_json_body(&body, Validation::Lenient, json_context)
+            .run_with_json_body(&body, Validation::Lenient, json_context, None)
             .unwrap();
         assert_eq!(
             serde_json::to_value(&stream_payload.output).unwrap(),
@@ -357,7 +372,7 @@ pub(super) mod tests {
         let context = ExecutionContext::new(
             ConversationHandler::new(ConversationStore::disabled()),
             ResponseHandler::new(ResponseStore::disabled()),
-            Arc::new(reqwest::Client::new()),
+            Arc::new(reqwest::Client::builder().no_proxy().build().unwrap()),
             format!("http://{address}"),
         );
         (context, server)
@@ -457,8 +472,7 @@ pub(super) mod tests {
                     &ExecutorResponseBudget::new(),
                 )
                 .await
-                .err()
-                .expect("translation must reject the stream");
+                .expect_err("translation must reject the stream");
                 assert!(error.to_string().contains(expected_error), "{error}");
                 errors.push(error.to_string());
             }
@@ -471,14 +485,46 @@ pub(super) mod tests {
     async fn streamed_response_reader_enforces_the_cumulative_budget() {
         use std::fmt::Write as _;
 
-        let data = "x".repeat(200 * 1024);
+        let item_id = "msg_1";
+        let delta = "x".repeat(300 * 1024);
         let mut response = String::new();
-        for sequence_number in 0..6 {
-            write!(
-                &mut response,
-                "data: {{\"type\":\"test.event\",\"sequence_number\":{sequence_number},\"delta\":\"{data}\"}}\n\n"
-            )
-            .expect("writing to a String cannot fail");
+        let events = [
+            serde_json::json!({"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "status": "in_progress"
+                }
+            }),
+            serde_json::json!({
+                "type": "response.content_part.added",
+                "output_index": 0,
+                "item_id": item_id,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": item_id,
+                "content_index": 0,
+                "delta": delta
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": item_id,
+                "content_index": 0,
+                "delta": delta
+            }),
+        ];
+        for event in &events {
+            write!(&mut response, "data: {event}\n\n").expect("writing to a String cannot fail");
         }
         let app = axum::Router::new().route(
             "/v1/responses",
@@ -497,17 +543,370 @@ pub(super) mod tests {
         let exec_ctx = ExecutionContext::new(
             ConversationHandler::new(ConversationStore::disabled()),
             ResponseHandler::new(ResponseStore::disabled()),
-            Arc::new(reqwest::Client::new()),
+            Arc::new(reqwest::Client::builder().no_proxy().build().unwrap()),
             format!("http://{address}"),
         );
-        let budget = ExecutorResponseBudget::new();
+        let budget = ExecutorResponseBudget::with_limit(500 * 1024);
 
         let mut agent = agent_pipeline(request_context(), None, None);
         let error = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
             .await
-            .err()
-            .expect("cumulative streamed response must be bounded");
+            .expect_err("cumulative streamed response must be bounded");
         assert!(error.to_string().contains("executor response budget exceeded"));
+        server.abort();
+    }
+
+    fn synthetic_events(size: usize, chunk: usize) -> (Value, Vec<Value>) {
+        let text = "x".repeat(size);
+        let part = serde_json::json!({"type": "output_text", "text": text, "annotations": []});
+        let item = serde_json::json!({
+            "id": "msg_fixture",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [part]
+        });
+        let response = serde_json::json!({
+            "id": "resp_fixture",
+            "object": "response",
+            "created_at": 1_789_151_000,
+            "model": "fixture",
+            "status": "completed",
+            "output": [item],
+            "error": null,
+            "incomplete_details": null
+        });
+        let initial = serde_json::json!({
+            "id": "resp_fixture",
+            "object": "response",
+            "created_at": 1_789_151_000,
+            "model": "fixture",
+            "status": "in_progress",
+            "output": [],
+            "error": null,
+            "incomplete_details": null
+        });
+        let mut events = Vec::new();
+        events.push(serde_json::json!({"type": "response.created", "response": initial}));
+        events.push(serde_json::json!({"type": "response.in_progress", "response": initial}));
+        events.push(serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "msg_fixture",
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": []
+            }
+        }));
+        events.push(serde_json::json!({
+            "type": "response.content_part.added",
+            "output_index": 0,
+            "item_id": "msg_fixture",
+            "content_index": 0,
+            "part": {"type": "output_text", "text": ""}
+        }));
+        let mut at = 0;
+        while at < size {
+            let end = (at + chunk).min(size);
+            events.push(serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": "msg_fixture",
+                "content_index": 0,
+                "delta": &text[at..end]
+            }));
+            at = end;
+        }
+        events.push(serde_json::json!({
+            "type": "response.output_text.done",
+            "output_index": 0,
+            "item_id": "msg_fixture",
+            "content_index": 0,
+            "text": text
+        }));
+        events.push(serde_json::json!({
+            "type": "response.content_part.done",
+            "output_index": 0,
+            "item_id": "msg_fixture",
+            "content_index": 0,
+            "part": {"type": "output_text", "text": text, "annotations": []}
+        }));
+        events.push(serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": item
+        }));
+        events.push(serde_json::json!({
+            "type": "response.completed",
+            "response": response
+        }));
+        (response, events)
+    }
+
+    #[tokio::test]
+    async fn small_and_large_sse_chunking_and_json_produce_identical_retained_bytes() {
+        let (json_response, events_1byte) = synthetic_events(8000, 1);
+        let (_, events_1024byte) = synthetic_events(8000, 1024);
+
+        // 1. Stream with 1-byte chunks and 1 MiB budget
+        // In the original bug (Issue #288), 8000 1-byte chunks failed after 7,655 bytes with a 1 MiB budget
+        // because wire bytes charged 1,048,582 bytes. Now it succeeds!
+        let budget_1byte = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let (exec_ctx, server) = streaming_test_upstream(&events_1byte).await;
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result_1byte =
+            fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget_1byte)
+                .await
+                .expect("1-byte chunks must succeed under 1 MiB budget");
+        server.abort();
+
+        // 2. Stream with 1024-byte chunks
+        let budget_1024byte = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let (exec_ctx, server) = streaming_test_upstream(&events_1024byte).await;
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result_1024byte = fetch_stream_payload(
+            &mut agent,
+            &exec_ctx,
+            None,
+            &ToolRegistry::default(),
+            0,
+            &budget_1024byte,
+        )
+        .await
+        .expect("1024-byte chunks must succeed");
+        server.abort();
+
+        // 3. JSON body
+        let budget_json = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result_json = agent
+            .run_with_json_body(
+                &json_response.to_string(),
+                Validation::Strict,
+                TranslationContext::default(),
+                Some(budget_json.clone()),
+            )
+            .expect("JSON body must succeed");
+
+        // Retained bytes charged MUST be identical across 1-byte chunks, 1024-byte chunks, and JSON!
+        assert_eq!(budget_1byte.used(), budget_1024byte.used());
+        assert_eq!(budget_1byte.used(), budget_json.used());
+        // Verify payload equivalence
+        assert_eq!(
+            serde_json::to_value(&result_1byte.payload.output).unwrap(),
+            serde_json::to_value(&result_1024byte.payload.output).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&result_1byte.payload.output).unwrap(),
+            serde_json::to_value(&result_json.output).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_completion_snapshots_do_not_double_count_retained_bytes() {
+        let (json_response, events) = synthetic_events(1000, 100);
+        let budget = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .unwrap();
+        server.abort();
+
+        let budget_json = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let _ = agent
+            .run_with_json_body(
+                &json_response.to_string(),
+                Validation::Strict,
+                TranslationContext::default(),
+                Some(budget_json.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(budget.used(), budget_json.used());
+        assert_eq!(result.payload.output.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_response_larger_than_old_stream_event_cap_succeeds_under_default_config() {
+        let (_response, events) = synthetic_events(2 * 1024 * 1024, 64 * 1024);
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(128);
+        let mut agent = agent_pipeline_with_limits(
+            request_context(),
+            None,
+            Some(sender),
+            exec_ctx.responses_config.max_stream_event_bytes,
+        );
+        let result = fetch_stream_payload(
+            &mut agent,
+            &exec_ctx,
+            None,
+            &ToolRegistry::default(),
+            0,
+            &ExecutorResponseBudget::new(),
+        )
+        .await
+        .expect("2 MiB stream should succeed under default config");
+        server.abort();
+        assert_eq!(result.payload.output.len(), 1);
+        let mut saw_output_item_done = false;
+        while let Ok(event) = receiver.try_recv() {
+            if event.content.contains("response.output_item.done") {
+                saw_output_item_done = true;
+            }
+        }
+        assert!(saw_output_item_done, "stream must emit response.output_item.done");
+        let (_, mut accumulator) = agent.into_parts();
+        let terminal_chunk = accumulator
+            .terminal_response_chunk(&result.payload)
+            .expect("terminal response chunk of 2 MiB succeeds under default limit");
+        assert!(terminal_chunk.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn lenient_done_without_output_item_done_reconciles_budget() {
+        let text = "x".repeat(5000);
+        let events = vec![
+            serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_lenient", "status": "in_progress"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "msg_lenient",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": []
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "item_id": "msg_lenient",
+                "content_index": 0,
+                "text": &text
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp_lenient", "status": "completed", "output": []}
+            }),
+        ];
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let budget = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect("lenient stream with done-only text should reconcile and succeed");
+        server.abort();
+        assert_eq!(result.payload.output.len(), 1);
+        assert!(budget.used() >= 5000);
+    }
+
+    #[tokio::test]
+    async fn shared_budget_draws_down_across_stream_rounds() {
+        let (_, events) = synthetic_events(400 * 1024, 64 * 1024);
+        let budget = ExecutorResponseBudget::with_limit(500 * 1024);
+
+        // Round 1 consumes ~400 KiB
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let _ = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect("round 1 must fit within budget");
+        server.abort();
+
+        // Round 2 tries to consume another ~400 KiB and must exceed the 500 KiB budget
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let error = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect_err("round 2 must exceed shared budget");
+        assert!(error.to_string().contains("executor response budget exceeded"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_sse_line_limit_is_enforced() {
+        use std::fmt::Write as _;
+        let mut response = String::new();
+        let huge_line = "x".repeat(1000);
+        write!(
+            &mut response,
+            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{huge_line}\"}}\n\n"
+        )
+        .unwrap();
+
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move || {
+                let response = response.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], response) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let mut exec_ctx = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::builder().no_proxy().build().unwrap()),
+            format!("http://{address}"),
+        );
+        exec_ctx.responses_config.max_upstream_sse_line_bytes = 500;
+
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let error = fetch_stream_payload(
+            &mut agent,
+            &exec_ctx,
+            None,
+            &ToolRegistry::default(),
+            0,
+            &ExecutorResponseBudget::new(),
+        )
+        .await
+        .expect_err("line exceeding max_upstream_sse_line_bytes must fail");
+        assert!(error.to_string().contains("upstream SSE line exceeded"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_json_body_limit_is_enforced() {
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    "x".repeat(2000),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let mut exec_ctx = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::builder().no_proxy().build().unwrap()),
+            format!("http://{address}"),
+        );
+        exec_ctx.responses_config.max_upstream_json_bytes = 1000;
+
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let error = fetch_blocking_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), None)
+            .await
+            .expect_err("body exceeding max_upstream_json_bytes must fail");
+        assert!(error.to_string().contains("upstream response exceeded"));
         server.abort();
     }
 }

@@ -30,7 +30,9 @@ use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
 #[cfg(test)]
 use crate::executor::response_budget::MAX_EXECUTOR_RESPONSE_BYTES;
-use crate::executor::upstream::{agent_pipeline, fetch_blocking_payload, fetch_stream_payload};
+#[cfg(test)]
+use crate::executor::upstream::agent_pipeline;
+use crate::executor::upstream::{agent_pipeline_with_limits, fetch_blocking_payload, fetch_stream_payload};
 use crate::tool::{ToolRegistry, ToolSearchMetadata, ToolSearchState, mcp};
 use crate::types::io::{InputItem, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use crate::types::request_response::{IncompleteDetails, RequestPayload, ResponsePayload};
@@ -237,7 +239,7 @@ struct EngineOrchestration<'a> {
 
 impl<'a> EngineOrchestration<'a> {
     async fn new(agent: &'a mut AgentPipeline, exec_ctx: &'a ExecutionContext) -> ExecutorResult<Self> {
-        let response_budget = ExecutorResponseBudget::new();
+        let response_budget = ExecutorResponseBudget::with_limit(exec_ctx.responses_config.max_retained_bytes);
         let registry = build_tool_registry(agent, exec_ctx, &response_budget).await?;
         Ok(Self {
             agent,
@@ -541,7 +543,12 @@ async fn run_blocking(
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
 ) -> ExecutorResult<ResponsePayload> {
-    let mut agent = agent_pipeline(ctx, tool_search_state, None);
+    let mut agent = agent_pipeline_with_limits(
+        ctx,
+        tool_search_state,
+        None,
+        exec_ctx.responses_config.max_stream_event_bytes,
+    );
     let (payload, tool_search_metadata) = run_until_gateway_tools_complete(&mut agent, exec_ctx, auth, false).await?;
     let (ctx, _) = agent.into_parts();
 
@@ -563,7 +570,12 @@ fn run_stream(
         let (event_tx, mut event_rx) = mpsc::channel(STREAM_EVENT_BUFFER);
         let exec_ctx_for_run = Arc::clone(&exec_ctx);
         let event_tx_for_run = event_tx.clone();
-        let mut agent = agent_pipeline(ctx, tool_search_state, Some(event_tx_for_run));
+        let mut agent = agent_pipeline_with_limits(
+            ctx,
+            tool_search_state,
+            Some(event_tx_for_run),
+            exec_ctx.responses_config.max_stream_event_bytes,
+        );
         let mut run_handle = AbortOnDrop::new(tokio::spawn(async move {
             let result = run_until_gateway_tools_complete(
                 &mut agent,
@@ -982,8 +994,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            crate::executor::error::ExecutorError::StreamError(message)
-                if message.contains("response budget exceeded")
+            crate::executor::error::ExecutorError::ResourceLimitExceeded {
+                limit: crate::executor::error::ResourceLimit::ResponseBudget,
+                ..
+            } | crate::executor::error::ExecutorError::StreamError(_)
         ));
     }
 
@@ -1210,6 +1224,8 @@ mod tests {
     #[tokio::test]
     async fn oversized_terminal_response_is_not_persisted() {
         let (mut exec_ctx, server) = streaming_execution_context().await;
+        exec_ctx.responses_config.max_retained_bytes = 512 * 1024;
+        exec_ctx.responses_config.max_stream_event_bytes = 512 * 1024;
         let pool = create_pool_with_schema(Some("sqlite::memory:"))
             .await
             .expect("create response store");

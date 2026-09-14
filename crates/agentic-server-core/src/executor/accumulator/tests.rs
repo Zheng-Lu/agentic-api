@@ -101,7 +101,7 @@ fn completed_items_reject_late_events_strictly_and_suppress_lenient_translation(
                     );
                 }
             }
-            acc.finalize_all();
+            acc.finalize_all().unwrap();
             let expected: OutputItem = serde_json::from_value(item.clone()).expect("valid completed item");
             assert_eq!(serde_json::to_value(&acc.output).unwrap(), json!([expected]));
         }
@@ -176,7 +176,7 @@ fn completed_slots_cannot_be_reopened_by_id_or_index() {
                 strict,
             )
             .expect_err("completed identity remains reserved");
-            acc.finalize_all();
+            acc.finalize_all().unwrap();
             assert_eq!(serde_json::to_value(acc.output).unwrap(), json!([item]));
         }
     }
@@ -221,7 +221,7 @@ fn repeated_completion_preserves_field_fallbacks_and_rejects_strict_duplicates()
             } else {
                 assert!(result.expect("equivalent resolved completion").is_none());
             }
-            acc.finalize_all();
+            acc.finalize_all().unwrap();
             let expected: OutputItem = serde_json::from_value(item.clone()).unwrap();
             assert_eq!(serde_json::to_value(acc.output).unwrap(), json!([expected]));
         }
@@ -243,7 +243,7 @@ fn identical_done_only_calls_preserve_provider_status() {
                 .expect("identical duplicate")
                 .is_none()
         );
-        acc.finalize_all();
+        acc.finalize_all().unwrap();
         assert_eq!(serde_json::to_value(acc.output).unwrap(), json!([item]));
     }
 }
@@ -504,7 +504,7 @@ fn test_process_event_mcp_list_tools_done_accumulates_output() {
     for line in remaining {
         let _ = acc.process_line(SseLine::parse(&line)).expect("valid SSE event");
     }
-    acc.finalize_all();
+    acc.finalize_all().unwrap();
 
     assert_eq!(acc.status, ResponseStatus::Completed);
     assert_eq!(acc.output.len(), 1);
@@ -1367,7 +1367,7 @@ fn test_function_call_done_uses_deltas_when_arguments_empty() {
         wire: WireEvent::new("test"),
     });
 
-    acc.finalize_all();
+    acc.finalize_all().unwrap();
     assert_eq!(acc.output.len(), 1);
     if let OutputItem::FunctionCall(fc) = &acc.output[0] {
         assert_eq!(fc.arguments, r#"{"q":"rust"}"#);
@@ -1543,7 +1543,7 @@ fn test_function_call_done_updates_metadata() {
         wire: WireEvent::new("test"),
     });
 
-    acc.finalize_all();
+    acc.finalize_all().unwrap();
     if let OutputItem::FunctionCall(fc) = &acc.output[0] {
         assert_eq!(fc.call_id, "new_call");
         assert_eq!(fc.name, "new_name");
@@ -1639,7 +1639,7 @@ fn test_function_call_empty_item_id_generates_uuid() {
         wire: WireEvent::new("test"),
     });
 
-    acc.finalize_all();
+    acc.finalize_all().unwrap();
     if let OutputItem::FunctionCall(fc) = &acc.output[0] {
         assert!(fc.id.starts_with("fc_"), "expected fc_ prefix, got: {}", fc.id);
     } else {

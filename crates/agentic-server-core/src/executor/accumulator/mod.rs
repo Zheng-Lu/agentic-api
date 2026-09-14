@@ -19,6 +19,9 @@ use crate::events::{
     expected_item_type, normalize_sse_data_checked, output_item_identity, validate_frame,
 };
 use crate::executor::error::{ExecutorError, ExecutorResult};
+use crate::executor::response_budget::{
+    ExecutorResponseBudget, RETAINED_CONTAINER_OVERHEAD_BYTES, retained_response_parts_bytes,
+};
 use crate::types::event::ResponseStatus;
 use crate::types::io::{FunctionToolCall, OutputItem, ResponseUsage};
 use crate::types::request_response::{IncompleteDetails, ResponsePayload};
@@ -124,6 +127,7 @@ pub struct ResponseAccumulator {
     slots: SlotMap,
     strict_call_ids: HashMap<u32, CallIdObservation>,
     stream_lifecycle: StreamLifecycle,
+    pub(super) budget: Option<ExecutorResponseBudget>,
 }
 
 impl ResponseAccumulator {
@@ -150,7 +154,19 @@ impl ResponseAccumulator {
             slots: SlotMap::default(),
             strict_call_ids: HashMap::new(),
             stream_lifecycle: StreamLifecycle::AwaitingCreated,
+            budget: None,
         }
+    }
+
+    pub(super) fn with_validation_and_budget(
+        response_id: String,
+        conversation_id: Option<String>,
+        validation: Validation,
+        budget: Option<ExecutorResponseBudget>,
+    ) -> Self {
+        let mut acc = Self::with_validation(response_id, conversation_id, validation);
+        acc.budget = budget;
+        acc
     }
 
     /// Parses a non-streaming JSON response body.
@@ -162,7 +178,14 @@ impl ResponseAccumulator {
     }
 
     pub(super) fn load_json_body(&mut self, body: &str) -> ExecutorResult<()> {
-        *self = Self::read_json(body, self.conversation_id.clone(), self.validation)?;
+        let acc = Self::read_json(body, self.conversation_id.clone(), self.validation)?;
+        let retained = retained_response_parts_bytes(&acc.response_id, &acc.output);
+        if let Some(budget) = &self.budget {
+            budget.consume(retained)?;
+        }
+        let budget = self.budget.clone();
+        *self = acc;
+        self.budget = budget;
         Ok(())
     }
 
@@ -205,6 +228,7 @@ impl ResponseAccumulator {
             slots: SlotMap::default(),
             strict_call_ids: HashMap::new(),
             stream_lifecycle: StreamLifecycle::Terminal,
+            budget: None,
         })
     }
 
@@ -256,7 +280,7 @@ impl ResponseAccumulator {
         for line in rx {
             let _ = acc.process_line(SseLine::parse(&line))?;
         }
-        acc.finish_stream();
+        acc.finish_stream()?;
         Ok(acc)
     }
 
@@ -277,13 +301,15 @@ impl ResponseAccumulator {
         for line in lines {
             let _ = acc.process_line(SseLine::parse(&line))?;
         }
-        acc.finalize_all();
+        acc.finalize_all()?;
         Ok(acc)
     }
 
     /// Finalizes all streaming items in upstream `output_index` order.
-    pub(crate) fn finalize_all(&mut self) {
-        self.output.extend(self.slots.drain_output());
+    pub(crate) fn finalize_all(&mut self) -> ExecutorResult<()> {
+        self.output
+            .extend(self.slots.drain_output_with_budget(self.budget.as_ref())?);
+        Ok(())
     }
 
     /// Normalize classified data once, then validate and fold under the fixed policy.
@@ -491,16 +517,16 @@ impl ResponseAccumulator {
                 "upstream stream ended without a terminal event".to_owned(),
             ));
         }
-        self.finish_stream();
-        Ok(())
+        self.finish_stream()
     }
 
-    pub(crate) fn finish_stream(&mut self) {
-        self.finalize_all();
+    pub(crate) fn finish_stream(&mut self) -> ExecutorResult<()> {
+        self.finalize_all()?;
         if self.status == ResponseStatus::InProgress {
             self.status = ResponseStatus::Completed;
         }
         self.stream_lifecycle = StreamLifecycle::Terminal;
+        Ok(())
     }
 
     /// Feeds typed test fixtures through the same policy-controlled transitions as ingestion.
@@ -515,8 +541,13 @@ impl ResponseAccumulator {
         validated: Option<&ValidatedFrame<'_>>,
     ) -> ExecutorResult<EventDisposition> {
         match (&frame.event_type, &frame.payload) {
-            (SSEEventType::ResponseCreated, EventPayload::Response { id, .. }) if !id.is_empty() => {
-                self.response_id.clone_from(id);
+            (SSEEventType::ResponseCreated, EventPayload::Response { id, .. }) => {
+                if !id.is_empty() {
+                    if let Some(budget) = &self.budget {
+                        budget.consume(RETAINED_CONTAINER_OVERHEAD_BYTES + id.len())?;
+                    }
+                    self.response_id.clone_from(id);
+                }
                 self.stream_lifecycle = StreamLifecycle::Created;
             }
             (SSEEventType::ResponseInProgress, EventPayload::Response { .. }) => {
@@ -527,13 +558,16 @@ impl ResponseAccumulator {
                 | SSEEventType::ResponseFailed
                 | SSEEventType::ResponseIncomplete),
                 EventPayload::Response { usage, .. },
-            ) => self.finish_response_event(*event_type, *usage),
+            ) => self.finish_response_event(*event_type, *usage)?,
             _ => {
                 let Some(identity) = item_identity(frame, validated) else {
                     return Ok(EventDisposition::Emit(None));
                 };
                 let index = match frame.event_type {
-                    SSEEventType::OutputItemAdded => self.slots.open(identity, &frame.payload, self.validation)?,
+                    SSEEventType::OutputItemAdded => {
+                        self.slots
+                            .open(identity, &frame.payload, self.validation, self.budget.as_ref())?
+                    }
                     SSEEventType::OutputItemDone => self.slots.complete(
                         identity,
                         &frame.payload,
@@ -541,8 +575,11 @@ impl ResponseAccumulator {
                             .and_then(|frame| frame.item.as_ref())
                             .and_then(|item| item.done_item.as_ref()),
                         self.validation,
+                        self.budget.as_ref(),
                     )?,
-                    _ => self.slots.apply(identity, &frame.payload, self.validation)?,
+                    _ => self
+                        .slots
+                        .apply(identity, &frame.payload, self.validation, self.budget.as_ref())?,
                 };
                 if self.validation == Validation::Strict
                     && let Some(index) = index
@@ -570,21 +607,22 @@ impl ResponseAccumulator {
         Ok(EventDisposition::Emit(None))
     }
 
-    fn finish_response_event(&mut self, event_type: SSEEventType, usage: Option<ResponseUsage>) {
+    fn finish_response_event(&mut self, event_type: SSEEventType, usage: Option<ResponseUsage>) -> ExecutorResult<()> {
         let status = match event_type {
             SSEEventType::ResponseCompleted => ResponseStatus::Completed,
             SSEEventType::ResponseFailed => ResponseStatus::Error,
             SSEEventType::ResponseIncomplete => ResponseStatus::Incomplete,
-            _ => return,
+            _ => return Ok(()),
         };
-        self.finish_response(status, usage);
+        self.finish_response(status, usage)
     }
 
-    fn finish_response(&mut self, status: ResponseStatus, usage: Option<ResponseUsage>) {
-        self.finalize_all();
+    fn finish_response(&mut self, status: ResponseStatus, usage: Option<ResponseUsage>) -> ExecutorResult<()> {
+        self.finalize_all()?;
         self.status = status;
         self.usage = usage;
         self.stream_lifecycle = StreamLifecycle::Terminal;
+        Ok(())
     }
 
     /// Marks the response as incomplete due to an error or interruption.
@@ -604,7 +642,7 @@ impl ResponseAccumulator {
     ) -> ExecutorResult<ResponsePayload> {
         match self.validation {
             Validation::Strict => self.finish_strict_stream()?,
-            Validation::Lenient => self.finish_stream(),
+            Validation::Lenient => self.finish_stream()?,
         }
         Ok(self.finalize(model, previous_response_id, instructions))
     }
