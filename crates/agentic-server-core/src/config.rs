@@ -24,6 +24,93 @@ pub const DEFAULT_SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 6_144_000;
 pub const DEFAULT_SQLITE_MMAP_SIZE_BYTES: u64 = 268_435_456;
 pub const DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS: NonZeroUsize = NonZeroUsize::new(5).expect("default is nonzero");
 
+pub const DEFAULT_MAX_RETAINED_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_UPSTREAM_JSON_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_UPSTREAM_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_MAX_STREAM_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
+pub const MAX_RETAINED_RESPONSE_BYTES_ENV: &str = "AGENTIC_MAX_RETAINED_RESPONSE_BYTES";
+pub const MAX_UPSTREAM_JSON_BYTES_ENV: &str = "AGENTIC_MAX_UPSTREAM_JSON_BYTES";
+pub const MAX_UPSTREAM_SSE_LINE_BYTES_ENV: &str = "AGENTIC_MAX_UPSTREAM_SSE_LINE_BYTES";
+pub const MAX_STREAM_EVENT_BYTES_ENV: &str = "AGENTIC_MAX_STREAM_EVENT_BYTES";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponsesConfig {
+    pub max_retained_bytes: usize,
+    pub max_upstream_json_bytes: usize,
+    pub max_upstream_sse_line_bytes: usize,
+    pub max_stream_event_bytes: usize,
+}
+
+impl Default for ResponsesConfig {
+    fn default() -> Self {
+        Self {
+            max_retained_bytes: DEFAULT_MAX_RETAINED_RESPONSE_BYTES,
+            max_upstream_json_bytes: DEFAULT_MAX_UPSTREAM_JSON_BYTES,
+            max_upstream_sse_line_bytes: DEFAULT_MAX_UPSTREAM_SSE_LINE_BYTES,
+            max_stream_event_bytes: DEFAULT_MAX_STREAM_EVENT_BYTES,
+        }
+    }
+}
+
+impl ResponsesConfig {
+    /// Validates internal consistency between configured limits.
+    ///
+    /// # Errors
+    /// Returns [`Error::Config`] when streaming delivery limit cannot admit the retained response.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.max_stream_event_bytes < self.max_retained_bytes {
+            return Err(Error::Config(format!(
+                "max_stream_event_bytes ({}) cannot be smaller than max_retained_bytes ({})",
+                self.max_stream_event_bytes, self.max_retained_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolves responses configuration from process environment variables,
+    /// falling back to standard defaults for unset variables.
+    ///
+    /// # Errors
+    /// Returns [`Error::Config`] when any configured limit is not a positive integer
+    /// or limits are mutually inconsistent.
+    pub fn from_env() -> Result<Self, Error> {
+        let default = Self::default();
+        let max_retained_bytes = parse_env_nonzero_usize(MAX_RETAINED_RESPONSE_BYTES_ENV, default.max_retained_bytes)?;
+        let max_upstream_json_bytes =
+            parse_env_nonzero_usize(MAX_UPSTREAM_JSON_BYTES_ENV, default.max_upstream_json_bytes)?;
+        let max_upstream_sse_line_bytes =
+            parse_env_nonzero_usize(MAX_UPSTREAM_SSE_LINE_BYTES_ENV, default.max_upstream_sse_line_bytes)?;
+        let max_stream_event_bytes =
+            parse_env_nonzero_usize(MAX_STREAM_EVENT_BYTES_ENV, default.max_stream_event_bytes)?;
+        let config = Self {
+            max_retained_bytes,
+            max_upstream_json_bytes,
+            max_upstream_sse_line_bytes,
+            max_stream_event_bytes,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+}
+
+/// Parses an optional environment variable as a non-zero `usize`.
+///
+/// # Errors
+/// Returns an error if the variable is set to a non-integer, zero, or cannot be read.
+pub fn parse_env_nonzero_usize(name: &str, default: usize) -> Result<usize, Error> {
+    match std::env::var(name) {
+        Ok(value) => {
+            let parsed = value
+                .parse::<NonZeroUsize>()
+                .map_err(|error| Error::Config(format!("{name} must be a positive integer: {error}")))?;
+            Ok(parsed.get())
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(Error::Config(format!("failed to read {name}: {error}"))),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PostgresConfig {
     pub max_connections: u32,
@@ -190,6 +277,7 @@ pub struct Config {
     pub postgres: PostgresConfig,
     pub sqlite: SqliteConfig,
     pub tools: ToolRuntimeConfig,
+    pub responses: ResponsesConfig,
 }
 
 /// Resolves the directory used for user configuration and local state.

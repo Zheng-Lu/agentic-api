@@ -9,6 +9,9 @@ use indexmap::IndexMap;
 use crate::events::types::ShellCommandUpdate;
 use crate::events::{EventPayload, SSEItemType};
 use crate::executor::error::{ExecutorError, ExecutorResult};
+use crate::executor::response_budget::{
+    ExecutorResponseBudget, RETAINED_CONTAINER_OVERHEAD_BYTES, retained_output_item_bytes,
+};
 use crate::types::event::MessageStatus;
 use crate::types::io::output::McpListTools;
 use crate::types::io::{
@@ -67,10 +70,26 @@ impl SlotMap {
         self.slots.get(&index)
     }
 
-    pub(super) fn drain_output(&mut self) -> impl Iterator<Item = OutputItem> + '_ {
+    pub(super) fn drain_output_with_budget(
+        &mut self,
+        budget: Option<&ExecutorResponseBudget>,
+    ) -> ExecutorResult<Vec<OutputItem>> {
         self.slots.sort_keys();
         self.indexes_by_id.clear();
-        self.slots.drain(..).filter_map(|(_, slot)| slot.state.finalize())
+        let mut items = Vec::new();
+        for (_, slot) in self.slots.drain(..) {
+            if let Some(item) = slot.state.finalize() {
+                let total_bytes = retained_output_item_bytes(&item);
+                if total_bytes > slot.retained_bytes {
+                    let diff = total_bytes - slot.retained_bytes;
+                    if let Some(budget) = budget {
+                        budget.consume(diff)?;
+                    }
+                }
+                items.push(item);
+            }
+        }
+        Ok(items)
     }
 
     /// Resolves without mutating either map; a rejected event cannot bind an ID.
@@ -154,7 +173,7 @@ impl SlotMap {
             .ok_or_else(|| invalid("upstream stream exhausted output indexes"))
     }
 
-    fn insert(&mut self, index: OutputIndex, item_id: Option<&str>, state: SlotState) {
+    fn insert(&mut self, index: OutputIndex, item_id: Option<&str>, state: SlotState, retained_bytes: usize) {
         if let Some(id) = item_id {
             self.indexes_by_id.insert(id.to_owned(), index);
         }
@@ -163,6 +182,7 @@ impl SlotMap {
             Slot {
                 item_id: item_id.map(str::to_owned),
                 state,
+                retained_bytes,
             },
         );
     }
@@ -182,12 +202,17 @@ impl SlotMap {
         identity: ItemIdentity<'_>,
         payload: &EventPayload,
         validation: Validation,
+        budget: Option<&ExecutorResponseBudget>,
     ) -> ExecutorResult<Option<OutputIndex>> {
         let Some(index) = self.resolve(identity, SlotAction::Open, validation)? else {
             return Ok(None);
         };
         if let Some(item) = ActiveItem::from_added(payload) {
-            self.insert(index, identity.item_id, SlotState::Active(item));
+            let initial_bytes = initial_added_retained_bytes(identity, payload);
+            if let Some(budget) = budget {
+                budget.consume(initial_bytes)?;
+            }
+            self.insert(index, identity.item_id, SlotState::Active(item), initial_bytes);
             return Ok(Some(index));
         }
         Ok(None)
@@ -198,15 +223,22 @@ impl SlotMap {
         identity: ItemIdentity<'_>,
         payload: &EventPayload,
         validation: Validation,
+        budget: Option<&ExecutorResponseBudget>,
     ) -> ExecutorResult<Option<OutputIndex>> {
         let Some(index) = self.resolve(identity, SlotAction::Mutate, validation)? else {
             return Ok(None);
         };
-        if let Some(Slot {
-            state: SlotState::Active(item),
-            ..
-        }) = self.slots.get_mut(&index)
+        let Some(slot) = self.slots.get_mut(&index) else {
+            return Ok(None);
+        };
+        let delta_bytes = delta_retained_bytes(payload);
+        if delta_bytes > 0
+            && let Some(budget) = budget
         {
+            budget.consume(delta_bytes)?;
+        }
+        slot.retained_bytes += delta_bytes;
+        if let SlotState::Active(item) = &mut slot.state {
             item.apply_event(payload)?;
         }
         self.bind_id(index, identity.item_id);
@@ -219,6 +251,7 @@ impl SlotMap {
         payload: &EventPayload,
         validated_done_item: Option<&OutputItem>,
         validation: Validation,
+        budget: Option<&ExecutorResponseBudget>,
     ) -> ExecutorResult<Option<OutputIndex>> {
         let Some(index) = self.resolve(identity, SlotAction::Complete, validation)? else {
             return Ok(None);
@@ -272,9 +305,19 @@ impl SlotMap {
                 )));
             }
             if let Some(item) = candidate {
+                let total_bytes = retained_output_item_bytes(&item);
+                if total_bytes > slot.retained_bytes {
+                    let diff = total_bytes - slot.retained_bytes;
+                    if let Some(budget) = budget {
+                        budget.consume(diff)?;
+                    }
+                }
                 self.bind_id(index, identity.item_id);
                 if let Some(slot) = self.slots.get_mut(&index) {
                     slot.state = SlotState::Done(item);
+                    if total_bytes > slot.retained_bytes {
+                        slot.retained_bytes = total_bytes;
+                    }
                 }
                 return Ok(Some(index));
             }
@@ -297,10 +340,43 @@ impl SlotMap {
             {
                 call.id = uuid7_str("ws_");
             }
-            self.insert(index, identity.item_id, SlotState::Done(item));
+            let total_bytes = retained_output_item_bytes(&item);
+            if let Some(budget) = budget {
+                budget.consume(total_bytes)?;
+            }
+            self.insert(index, identity.item_id, SlotState::Done(item), total_bytes);
             return Ok(Some(index));
         }
         Ok(None)
+    }
+}
+
+fn initial_added_retained_bytes(identity: ItemIdentity<'_>, payload: &EventPayload) -> usize {
+    let mut bytes = RETAINED_CONTAINER_OVERHEAD_BYTES + identity.item_id.map_or(0, str::len);
+    if let EventPayload::OutputItemAdded { name, call_id, .. } = payload {
+        if let Some(name) = name {
+            bytes += name.len();
+        }
+        if let Some(call_id) = call_id {
+            bytes += call_id.len();
+        }
+    }
+    bytes
+}
+
+fn delta_retained_bytes(payload: &EventPayload) -> usize {
+    match payload {
+        EventPayload::TextDelta { delta, .. }
+        | EventPayload::FunctionCallArgsDelta { delta, .. }
+        | EventPayload::CustomToolCallInputDelta { delta, .. }
+        | EventPayload::ReasoningTextDelta { delta, .. }
+        | EventPayload::ReasoningSummaryTextDelta { delta, .. } => delta.len(),
+        EventPayload::ShellCallCommand { update, .. } => match update {
+            ShellCommandUpdate::Added(cmd) => RETAINED_CONTAINER_OVERHEAD_BYTES + cmd.len(),
+            ShellCommandUpdate::Delta(delta) => delta.len(),
+            ShellCommandUpdate::Done(_) => 0,
+        },
+        _ => 0,
     }
 }
 
@@ -519,11 +595,15 @@ impl ActiveItem {
                     }
                 }
             }
-            Self::Message { text, .. } => {
-                if let EventPayload::TextDelta { delta, .. } = payload {
+            Self::Message { text, .. } => match payload {
+                EventPayload::TextDelta { delta, .. } => {
                     text.push_str(delta);
                 }
-            }
+                EventPayload::TextDone { text: done_text, .. } if text.len() < done_text.len() => {
+                    text.clone_from(done_text);
+                }
+                _ => {}
+            },
             Self::Reasoning { item } => {
                 if matches!(
                     payload,
@@ -589,6 +669,7 @@ impl ActiveItem {
 pub(super) struct Slot {
     pub(super) item_id: Option<String>,
     pub(super) state: SlotState,
+    pub(super) retained_bytes: usize,
 }
 
 /// A completed item owns no streaming buffers and cannot accept further deltas.
