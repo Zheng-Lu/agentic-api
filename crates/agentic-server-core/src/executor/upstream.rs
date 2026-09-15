@@ -814,6 +814,8 @@ pub(super) mod tests {
         use crate::executor::error::ResourceLimit;
 
         let text = "x".repeat(5000);
+        // Note: No terminal response.completed. The stream must fail promptly on output_text.done
+        // rather than at terminal stream completion.
         let events = vec![
             serde_json::json!({
                 "type": "response.created",
@@ -837,10 +839,6 @@ pub(super) mod tests {
                 "content_index": 0,
                 "text": &text
             }),
-            serde_json::json!({
-                "type": "response.completed",
-                "response": {"id": "resp_lenient", "status": "completed", "output": []}
-            }),
         ];
         let (exec_ctx, server) = streaming_test_upstream(&events).await;
         let budget = ExecutorResponseBudget::with_limit(4000);
@@ -858,11 +856,18 @@ pub(super) mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn two_part_done_only_stream_preserves_both_parts() {
-        use crate::types::io::OutputItem;
-
-        let events = vec![
+    fn two_part_stream_events(deltas: bool) -> Vec<serde_json::Value> {
+        let (t0, k0, v0) = if deltas {
+            ("response.output_text.delta", "delta", "part 0 text ")
+        } else {
+            ("response.output_text.done", "text", "part 0 text ")
+        };
+        let (t1, k1, v1) = if deltas {
+            ("response.output_text.delta", "delta", "part 1 text")
+        } else {
+            ("response.output_text.done", "text", "part 1 text")
+        };
+        vec![
             serde_json::json!({
                 "type": "response.created",
                 "response": {"id": "resp_2parts", "status": "in_progress"}
@@ -879,24 +884,31 @@ pub(super) mod tests {
                 }
             }),
             serde_json::json!({
-                "type": "response.output_text.done",
+                "type": t0,
                 "output_index": 0,
                 "item_id": "msg_2parts",
                 "content_index": 0,
-                "text": "part 0 text "
+                k0: v0
             }),
             serde_json::json!({
-                "type": "response.output_text.done",
+                "type": t1,
                 "output_index": 0,
                 "item_id": "msg_2parts",
                 "content_index": 1,
-                "text": "part 1 text"
+                k1: v1
             }),
             serde_json::json!({
                 "type": "response.completed",
                 "response": {"id": "resp_2parts", "status": "completed", "output": []}
             }),
-        ];
+        ]
+    }
+
+    #[tokio::test]
+    async fn two_part_done_only_stream_preserves_both_parts() {
+        use crate::types::io::OutputItem;
+
+        let events = two_part_stream_events(false);
         let (exec_ctx, server) = streaming_test_upstream(&events).await;
         let budget = ExecutorResponseBudget::with_limit(1024 * 1024);
         let mut agent = agent_pipeline(request_context(), None, None);
@@ -912,6 +924,29 @@ pub(super) mod tests {
         } else {
             panic!("expected OutputItem::Message");
         }
+
+        // Equivalent multi-part stream with deltas to assert budget invariance
+        let delta_events = two_part_stream_events(true);
+        let (exec_ctx_delta, server_delta) = streaming_test_upstream(&delta_events).await;
+        let delta_budget = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let mut agent_delta = agent_pipeline(request_context(), None, None);
+        let result_delta = fetch_stream_payload(
+            &mut agent_delta,
+            &exec_ctx_delta,
+            None,
+            &ToolRegistry::default(),
+            0,
+            &delta_budget,
+        )
+        .await
+        .expect("two-part delta stream must succeed");
+        server_delta.abort();
+
+        assert_eq!(budget.used(), delta_budget.used());
+        assert_eq!(
+            serde_json::to_value(&result.payload.output).unwrap(),
+            serde_json::to_value(&result_delta.payload.output).unwrap()
+        );
     }
 
     #[tokio::test]

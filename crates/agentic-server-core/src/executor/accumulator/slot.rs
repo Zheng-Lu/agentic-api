@@ -384,13 +384,20 @@ fn semantically_equal(left: &OutputItem, right: &OutputItem) -> bool {
     }
 }
 
+/// Tracks the streamed text content and whether deltas have been streamed for a message part.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct StreamedPart {
+    pub(super) text: String,
+    pub(super) streamed: bool,
+}
+
 /// Tracks a single output item currently being streamed, together with its
 /// accumulated text/arguments buffer.
 #[derive(Clone)]
 pub(super) enum ActiveItem {
     Message {
         item: OutputMessage,
-        parts: IndexMap<u32, (String, bool)>,
+        parts: IndexMap<u32, StreamedPart>,
     },
     Reasoning {
         item: ReasoningOutput,
@@ -596,14 +603,14 @@ impl ActiveItem {
         }
     }
 
-    fn apply_message(parts: &mut IndexMap<u32, (String, bool)>, payload: &EventPayload) -> usize {
+    fn apply_message(parts: &mut IndexMap<u32, StreamedPart>, payload: &EventPayload) -> usize {
         match payload {
             EventPayload::TextDelta {
                 delta, content_index, ..
             } => {
-                let part = parts.entry(*content_index).or_insert_with(|| (String::new(), false));
-                part.1 = true;
-                part.0.push_str(delta);
+                let part = parts.entry(*content_index).or_default();
+                part.streamed = true;
+                part.text.push_str(delta);
                 delta.len()
             }
             EventPayload::TextDone {
@@ -611,12 +618,12 @@ impl ActiveItem {
                 content_index,
                 ..
             } => {
-                let part = parts.entry(*content_index).or_insert_with(|| (String::new(), false));
-                if part.1 {
+                let part = parts.entry(*content_index).or_default();
+                if part.streamed {
                     0
                 } else {
-                    let additional = done_text.len().saturating_sub(part.0.len());
-                    part.0.clone_from(done_text);
+                    let additional = done_text.len().saturating_sub(part.text.len());
+                    part.text.clone_from(done_text);
                     additional
                 }
             }
@@ -774,9 +781,9 @@ impl ActiveItem {
             Self::ToolSearchCall { item } => Some(OutputItem::ToolSearchCall(item)),
             Self::Message { mut item, mut parts } => {
                 parts.sort_keys();
-                for (_, (text, _)) in parts {
-                    if !text.is_empty() {
-                        item.content.push(OutputTextContent::new(text));
+                for (_, part) in parts {
+                    if !part.text.is_empty() {
+                        item.content.push(OutputTextContent::new(part.text));
                     }
                 }
                 item.status = MessageStatus::Completed;
