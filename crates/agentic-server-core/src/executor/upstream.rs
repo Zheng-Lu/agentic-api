@@ -184,6 +184,7 @@ pub(super) async fn fetch_stream_payload(
 pub(super) mod tests {
     use super::*;
     use crate::events::SseLine;
+    use crate::executor::error::ResourceLimit;
     use crate::executor::modes::{ConversationHandler, ResponseHandler};
     use crate::executor::pipeline::RoundIngestion;
     use crate::storage::{ConversationStore, ResponseStore};
@@ -347,7 +348,13 @@ pub(super) mod tests {
             .consume(crate::executor::response_budget::MAX_EXECUTOR_RESPONSE_BYTES / 2)
             .expect("second round should consume the budget");
         let error = budget.consume(1).expect_err("next round must exceed shared budget");
-        assert!(error.to_string().contains("executor response budget exceeded"));
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::ResponseBudget,
+                ..
+            }
+        ));
     }
 
     async fn streaming_test_upstream(events: &[Value]) -> (ExecutionContext, tokio::task::JoinHandle<()>) {
@@ -552,7 +559,13 @@ pub(super) mod tests {
         let error = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
             .await
             .expect_err("cumulative streamed response must be bounded");
-        assert!(error.to_string().contains("executor response budget exceeded"));
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::ResponseBudget,
+                ..
+            }
+        ));
         server.abort();
     }
 
@@ -968,7 +981,13 @@ pub(super) mod tests {
         let error = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
             .await
             .expect_err("round 2 must exceed shared budget");
-        assert!(error.to_string().contains("executor response budget exceeded"));
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::ResponseBudget,
+                ..
+            }
+        ));
         server.abort();
     }
 
@@ -1014,7 +1033,13 @@ pub(super) mod tests {
         )
         .await
         .expect_err("line exceeding max_upstream_sse_line_bytes must fail");
-        assert!(error.to_string().contains("upstream SSE line exceeded"));
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::UpstreamSseLine,
+                ..
+            }
+        ));
         server.abort();
     }
 
@@ -1046,7 +1071,13 @@ pub(super) mod tests {
         let error = fetch_blocking_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), None)
             .await
             .expect_err("body exceeding max_upstream_json_bytes must fail");
-        assert!(error.to_string().contains("upstream response exceeded"));
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::UpstreamJsonBody,
+                ..
+            }
+        ));
         server.abort();
     }
 }

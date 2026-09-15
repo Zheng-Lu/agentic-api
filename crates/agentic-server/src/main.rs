@@ -366,12 +366,7 @@ fn build_config(llm_api_base: String, common: &CommonArgs, file: &FileConfig) ->
             messages_gateway_tool_aliases: file.messages_gateway.tool_aliases.clone(),
             max_concurrent_gateway_calls,
         },
-        responses: ResponsesConfig {
-            max_retained_bytes,
-            max_upstream_json_bytes,
-            max_upstream_sse_line_bytes,
-            max_stream_event_bytes,
-        },
+        responses: responses_config,
     })
 }
 

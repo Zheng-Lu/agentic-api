@@ -399,6 +399,9 @@ pub(super) enum ActiveItem {
         item: OutputMessage,
         parts: IndexMap<u32, StreamedPart>,
     },
+    // Unlike Message which buffers streamed text parts in memory, Reasoning tracks
+    // streamed byte counts per index for prompt incremental budget enforcement, and
+    // applies the finalized text upon receiving ReasoningTextDone / SummaryTextDone.
     Reasoning {
         item: ReasoningOutput,
         content_streamed: HashMap<u32, usize>,
