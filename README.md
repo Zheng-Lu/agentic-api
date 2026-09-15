@@ -284,6 +284,8 @@ request-declared remote MCP URLs; configured `[mcp_servers]` entries are trusted
   SSE line buffer.
 - `max_stream_event_bytes` (`AGENTIC_MAX_STREAM_EVENT_BYTES`, default 16 MiB): bounds a single serialized SSE/WebSocket
   event delivered to the client, including full `response.output_item.done` snapshots and terminal `response.completed`.
+  The WebSocket transport applies the same limit to each routed event (its `stream_id` member counts toward it), and
+  the executor validates the terminal event against that transport limit before persisting the response.
 
 Validation enforces that `max_stream_event_bytes`, `max_upstream_sse_line_bytes`, and `max_upstream_json_bytes` each
 exceed `max_retained_bytes` by proportional wire headroom (`max(64 KiB, max_retained_bytes / 4)`) to account for JSON

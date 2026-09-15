@@ -28,11 +28,13 @@ use crate::types::request_response::{IncompleteDetails, ResponsePayload};
 use crate::utils::common::{deserialize_from_str, deserialize_from_value_opt};
 use crate::utils::uuid7_str;
 
+mod active;
 mod completion;
 mod json;
 mod slot;
 
-use slot::{ActiveItem, ItemIdentity, OutputIndex, SlotMap, SlotState};
+use active::ActiveItem;
+use slot::{ItemIdentity, OutputIndex, SlotMap, SlotState};
 
 /// Validation policy selected once for an accumulator's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,10 +478,10 @@ impl ResponseAccumulator {
     pub(super) fn accumulated_function_call(&self, output_index: u32) -> Option<AccumulatedFunctionCall<'_>> {
         let slot = self.slots.get(OutputIndex::new(output_index))?;
         match &slot.state {
-            SlotState::Active(ActiveItem::FunctionCall { item, arguments, .. }) => Some(AccumulatedFunctionCall {
-                item,
+            SlotState::Active(ActiveItem::FunctionCall(state)) => Some(AccumulatedFunctionCall {
+                item: &state.item,
                 output_index,
-                arguments,
+                arguments: &state.arguments,
             }),
             SlotState::Done(OutputItem::FunctionCall(item)) => Some(AccumulatedFunctionCall {
                 item,
@@ -742,6 +744,8 @@ fn item_identity<'a>(frame: &'a EventFrame, validated: Option<&ValidatedFrame<'a
     })
 }
 
+#[cfg(test)]
+mod budget_tests;
 #[cfg(test)]
 mod tests;
 
