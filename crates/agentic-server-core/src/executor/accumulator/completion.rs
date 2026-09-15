@@ -2,6 +2,7 @@
 
 use indexmap::IndexMap;
 
+use super::slot::StreamedPart;
 use crate::events::EventPayload;
 use crate::types::io::output::McpListTools;
 use crate::types::io::{
@@ -19,8 +20,8 @@ pub(super) trait MergeDone<Context = (), Completed = Self> {
     fn merge_done(&mut self, done: &Completed, context: Context);
 }
 
-impl MergeDone<&mut IndexMap<u32, (String, bool)>> for OutputMessage {
-    fn merge_done(&mut self, done: &Self, parts: &mut IndexMap<u32, (String, bool)>) {
+impl MergeDone<&mut IndexMap<u32, StreamedPart>> for OutputMessage {
+    fn merge_done(&mut self, done: &Self, parts: &mut IndexMap<u32, StreamedPart>) {
         self.clone_from(done);
         parts.clear();
     }

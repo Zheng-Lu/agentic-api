@@ -58,11 +58,17 @@ impl Default for ResponsesConfig {
 impl ResponsesConfig {
     /// Validates internal consistency between configured limits.
     ///
+    /// The wire limits (`max_stream_event_bytes`, `max_upstream_sse_line_bytes`,
+    /// and `max_upstream_json_bytes`) must exceed `max_retained_bytes` by proportional
+    /// wire headroom (`max(MIN_WIRE_HEADROOM_BYTES, max_retained_bytes / 4)`) to account for
+    /// JSON serialization overhead, escaping, and message envelopes.
+    ///
     /// # Errors
     /// Returns [`Error::Config`] when streaming delivery, upstream line, or JSON limits
     /// cannot admit the retained response plus wire headroom.
     pub fn validate(&self) -> Result<(), Error> {
-        let required = self.max_retained_bytes.saturating_add(MIN_WIRE_HEADROOM_BYTES);
+        let headroom = MIN_WIRE_HEADROOM_BYTES.max(self.max_retained_bytes / 4);
+        let required = self.max_retained_bytes.saturating_add(headroom);
         if self.max_stream_event_bytes < required {
             return Err(Error::Config(format!(
                 "max_stream_event_bytes ({}) cannot be smaller than max_retained_bytes ({}) plus headroom ({})",
@@ -517,5 +523,14 @@ mod tests {
         let mut invalid_json = valid;
         invalid_json.max_upstream_json_bytes = 1024 * 1024;
         assert!(invalid_json.validate().is_err());
+
+        // For 4 MiB retained, 64 KiB is not enough headroom (requires 25% = 1 MiB)
+        let borderline = ResponsesConfig {
+            max_retained_bytes: 4 * 1024 * 1024,
+            max_upstream_json_bytes: 4 * 1024 * 1024 + 64 * 1024,
+            max_upstream_sse_line_bytes: 5 * 1024 * 1024,
+            max_stream_event_bytes: 5 * 1024 * 1024,
+        };
+        assert!(borderline.validate().is_err());
     }
 }
