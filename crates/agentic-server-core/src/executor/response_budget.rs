@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::types::io::{McpCallError, OutputItem, WebSearchAction};
+#[cfg(test)]
 use crate::types::request_response::ResponsePayload;
 
 #[cfg(test)]
@@ -32,13 +33,13 @@ impl ExecutorResponseBudget {
 
     #[cfg(test)]
     pub(super) fn used(&self) -> usize {
-        self.used.load(Ordering::Relaxed)
+        self.used.load(Ordering::Acquire)
     }
 
     pub(super) fn consume(&self, bytes: usize) -> ExecutorResult<()> {
         let limit = self.limit;
         self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 let next = used.checked_add(bytes)?;
                 if next > limit { None } else { Some(next) }
             })
@@ -144,6 +145,10 @@ pub(in crate::executor) fn retained_output_item_bytes(item: &OutputItem) -> usiz
     }
 }
 
+/// Approximates the serialized byte footprint of an arbitrary JSON value (e.g. MCP schemas or errors).
+///
+/// This provides a heuristic lower-bound estimate to prevent unbounded memory growth from unstructured
+/// JSON schemas without incurring the overhead of full re-serialization.
 fn estimate_json_value_bytes(val: &serde_json::Value) -> usize {
     match val {
         serde_json::Value::Null => 4,
@@ -170,7 +175,7 @@ pub(in crate::executor) fn retained_response_parts_bytes(response_id: &str, outp
     bytes
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(in crate::executor) fn retained_response_bytes(response: &ResponsePayload) -> usize {
     retained_response_parts_bytes(&response.id, &response.output)
 }

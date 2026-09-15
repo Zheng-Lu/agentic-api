@@ -89,48 +89,6 @@ impl ResponsesConfig {
         }
         Ok(())
     }
-
-    /// Resolves responses configuration from process environment variables,
-    /// falling back to standard defaults for unset variables.
-    ///
-    /// # Errors
-    /// Returns [`Error::Config`] when any configured limit is not a positive integer
-    /// or limits are mutually inconsistent.
-    pub fn from_env() -> Result<Self, Error> {
-        let default = Self::default();
-        let max_retained_bytes = parse_env_nonzero_usize(MAX_RETAINED_RESPONSE_BYTES_ENV, default.max_retained_bytes)?;
-        let max_upstream_json_bytes =
-            parse_env_nonzero_usize(MAX_UPSTREAM_JSON_BYTES_ENV, default.max_upstream_json_bytes)?;
-        let max_upstream_sse_line_bytes =
-            parse_env_nonzero_usize(MAX_UPSTREAM_SSE_LINE_BYTES_ENV, default.max_upstream_sse_line_bytes)?;
-        let max_stream_event_bytes =
-            parse_env_nonzero_usize(MAX_STREAM_EVENT_BYTES_ENV, default.max_stream_event_bytes)?;
-        let config = Self {
-            max_retained_bytes,
-            max_upstream_json_bytes,
-            max_upstream_sse_line_bytes,
-            max_stream_event_bytes,
-        };
-        config.validate()?;
-        Ok(config)
-    }
-}
-
-/// Parses an optional environment variable as a non-zero `usize`.
-///
-/// # Errors
-/// Returns an error if the variable is set to a non-integer, zero, or cannot be read.
-pub fn parse_env_nonzero_usize(name: &str, default: usize) -> Result<usize, Error> {
-    match std::env::var(name) {
-        Ok(value) => {
-            let parsed = value
-                .parse::<NonZeroUsize>()
-                .map_err(|error| Error::Config(format!("{name} must be a positive integer: {error}")))?;
-            Ok(parsed.get())
-        }
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(Error::Config(format!("failed to read {name}: {error}"))),
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
