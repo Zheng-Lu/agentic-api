@@ -542,13 +542,9 @@ async fn run_blocking(
     tool_search_state: Option<ToolSearchState>,
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
+    max_stream_event_bytes: usize,
 ) -> ExecutorResult<ResponsePayload> {
-    let mut agent = agent_pipeline_with_limits(
-        ctx,
-        tool_search_state,
-        None,
-        exec_ctx.responses_config.max_stream_event_bytes,
-    );
+    let mut agent = agent_pipeline_with_limits(ctx, tool_search_state, None, max_stream_event_bytes);
     let (payload, tool_search_metadata) = run_until_gateway_tools_complete(&mut agent, exec_ctx, auth, false).await?;
     let (ctx, _) = agent.into_parts();
 
@@ -559,11 +555,17 @@ async fn run_blocking(
     Ok(payload)
 }
 
+/// `max_stream_event_bytes` is the effective limit for one serialized client
+/// event on the transport that will deliver this stream. The terminal
+/// `response.completed` frame is validated against it before the response is
+/// persisted or a session checkpoint is published, so a frame the transport
+/// cannot deliver never leaves a stored response behind.
 fn run_stream(
     ctx: RequestContext,
     tool_search_state: Option<ToolSearchState>,
     exec_ctx: Arc<ExecutionContext>,
     auth: Option<String>,
+    max_stream_event_bytes: usize,
 ) -> BoxStream {
     Box::pin(stream! {
         let failure_context = StreamFailureContext::from(&ctx);
@@ -574,7 +576,7 @@ fn run_stream(
             ctx,
             tool_search_state,
             Some(event_tx_for_run),
-            exec_ctx.responses_config.max_stream_event_bytes,
+            max_stream_event_bytes,
         );
         let mut run_handle = AbortOnDrop::new(tokio::spawn(async move {
             let result = run_until_gateway_tools_complete(
@@ -747,6 +749,7 @@ pub struct ExecuteRequest {
     exec_ctx: Arc<ExecutionContext>,
     client_auth: Option<String>,
     continuation: Option<super::session::ResponseContinuation>,
+    max_stream_event_bytes: Option<usize>,
 }
 
 impl ExecuteRequest {
@@ -757,7 +760,24 @@ impl ExecuteRequest {
             exec_ctx,
             client_auth: None,
             continuation: None,
+            max_stream_event_bytes: None,
         }
+    }
+
+    /// Bound every serialized client event, including the terminal
+    /// `response.completed`, to what the delivering transport can carry after
+    /// its own routing metadata. The configured `max_stream_event_bytes` still
+    /// applies; a larger transport limit does not raise it.
+    #[must_use]
+    pub fn with_max_stream_event_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_stream_event_bytes = Some(max_bytes);
+        self
+    }
+
+    fn effective_max_stream_event_bytes(&self) -> usize {
+        let configured = self.exec_ctx.responses_config.max_stream_event_bytes;
+        self.max_stream_event_bytes
+            .map_or(configured, |transport| transport.min(configured))
     }
 
     /// Override the bearer token for this request only; does not touch the shared [`ExecutionContext`].
@@ -794,6 +814,7 @@ impl ExecuteRequest {
             tools = self.payload.tools.as_ref().map_or(0, Vec::len),
             "executor received responses request"
         );
+        let max_stream_event_bytes = self.effective_max_stream_event_bytes();
         let ctx =
             super::rehydrate::rehydrate_with_continuation(self.payload, &self.exec_ctx, self.continuation).await?;
         if !ctx.enriched_request.input.has_compaction_trigger() {
@@ -807,6 +828,7 @@ impl ExecuteRequest {
                 tool_search_state,
                 self.exec_ctx,
                 self.client_auth,
+                max_stream_event_bytes,
             )))
         } else {
             Ok(Either::Left(
@@ -815,6 +837,7 @@ impl ExecuteRequest {
                     tool_search_state,
                     &self.exec_ctx,
                     self.client_auth.as_deref(),
+                    max_stream_event_bytes,
                 ))
                 .await?,
             ))

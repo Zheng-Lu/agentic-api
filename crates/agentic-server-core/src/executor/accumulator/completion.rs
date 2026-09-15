@@ -2,7 +2,7 @@
 
 use indexmap::IndexMap;
 
-use super::slot::StreamedPart;
+use super::active::StreamedPart;
 use crate::events::EventPayload;
 use crate::types::io::output::McpListTools;
 use crate::types::io::{
