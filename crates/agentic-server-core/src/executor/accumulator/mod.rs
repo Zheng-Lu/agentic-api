@@ -476,7 +476,7 @@ impl ResponseAccumulator {
     pub(super) fn accumulated_function_call(&self, output_index: u32) -> Option<AccumulatedFunctionCall<'_>> {
         let slot = self.slots.get(OutputIndex::new(output_index))?;
         match &slot.state {
-            SlotState::Active(ActiveItem::FunctionCall { item, arguments }) => Some(AccumulatedFunctionCall {
+            SlotState::Active(ActiveItem::FunctionCall { item, arguments, .. }) => Some(AccumulatedFunctionCall {
                 item,
                 output_index,
                 arguments,
@@ -541,13 +541,11 @@ impl ResponseAccumulator {
         validated: Option<&ValidatedFrame<'_>>,
     ) -> ExecutorResult<EventDisposition> {
         match (&frame.event_type, &frame.payload) {
-            (SSEEventType::ResponseCreated, EventPayload::Response { id, .. }) => {
-                if !id.is_empty() {
-                    if let Some(budget) = &self.budget {
-                        budget.consume(RETAINED_CONTAINER_OVERHEAD_BYTES + id.len())?;
-                    }
-                    self.response_id.clone_from(id);
+            (SSEEventType::ResponseCreated, EventPayload::Response { id, .. }) if !id.is_empty() => {
+                if let Some(budget) = &self.budget {
+                    budget.consume(RETAINED_CONTAINER_OVERHEAD_BYTES + id.len())?;
                 }
+                self.response_id.clone_from(id);
                 self.stream_lifecycle = StreamLifecycle::Created;
             }
             (SSEEventType::ResponseInProgress, EventPayload::Response { .. }) => {

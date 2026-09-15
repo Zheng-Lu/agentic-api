@@ -810,6 +810,111 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn lenient_done_without_output_item_done_exceeding_budget_fails_promptly() {
+        use crate::executor::error::ResourceLimit;
+
+        let text = "x".repeat(5000);
+        let events = vec![
+            serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_lenient", "status": "in_progress"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "msg_lenient",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": []
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "item_id": "msg_lenient",
+                "content_index": 0,
+                "text": &text
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp_lenient", "status": "completed", "output": []}
+            }),
+        ];
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let budget = ExecutorResponseBudget::with_limit(4000);
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let error = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect_err("stream exceeding budget on done payload must fail promptly");
+        server.abort();
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::ResponseBudget,
+                max_bytes: 4000,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn two_part_done_only_stream_preserves_both_parts() {
+        use crate::types::io::OutputItem;
+
+        let events = vec![
+            serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_2parts", "status": "in_progress"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "msg_2parts",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": []
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "item_id": "msg_2parts",
+                "content_index": 0,
+                "text": "part 0 text "
+            }),
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "item_id": "msg_2parts",
+                "content_index": 1,
+                "text": "part 1 text"
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp_2parts", "status": "completed", "output": []}
+            }),
+        ];
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let budget = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect("two-part done-only stream must succeed");
+        server.abort();
+        assert_eq!(result.payload.output.len(), 1);
+        if let OutputItem::Message(msg) = &result.payload.output[0] {
+            assert_eq!(msg.content.len(), 2);
+            assert_eq!(msg.content[0].text, "part 0 text ");
+            assert_eq!(msg.content[1].text, "part 1 text");
+        } else {
+            panic!("expected OutputItem::Message");
+        }
+    }
+
+    #[tokio::test]
     async fn shared_budget_draws_down_across_stream_rounds() {
         let (_, events) = synthetic_events(400 * 1024, 64 * 1024);
         let budget = ExecutorResponseBudget::with_limit(500 * 1024);

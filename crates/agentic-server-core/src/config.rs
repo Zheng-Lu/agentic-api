@@ -29,6 +29,8 @@ pub const DEFAULT_MAX_UPSTREAM_JSON_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_UPSTREAM_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_STREAM_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
+pub const MIN_WIRE_HEADROOM_BYTES: usize = 64 * 1024;
+
 pub const MAX_RETAINED_RESPONSE_BYTES_ENV: &str = "AGENTIC_MAX_RETAINED_RESPONSE_BYTES";
 pub const MAX_UPSTREAM_JSON_BYTES_ENV: &str = "AGENTIC_MAX_UPSTREAM_JSON_BYTES";
 pub const MAX_UPSTREAM_SSE_LINE_BYTES_ENV: &str = "AGENTIC_MAX_UPSTREAM_SSE_LINE_BYTES";
@@ -57,12 +59,26 @@ impl ResponsesConfig {
     /// Validates internal consistency between configured limits.
     ///
     /// # Errors
-    /// Returns [`Error::Config`] when streaming delivery limit cannot admit the retained response.
+    /// Returns [`Error::Config`] when streaming delivery, upstream line, or JSON limits
+    /// cannot admit the retained response plus wire headroom.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.max_stream_event_bytes < self.max_retained_bytes {
+        let required = self.max_retained_bytes.saturating_add(MIN_WIRE_HEADROOM_BYTES);
+        if self.max_stream_event_bytes < required {
             return Err(Error::Config(format!(
-                "max_stream_event_bytes ({}) cannot be smaller than max_retained_bytes ({})",
-                self.max_stream_event_bytes, self.max_retained_bytes
+                "max_stream_event_bytes ({}) cannot be smaller than max_retained_bytes ({}) plus headroom ({})",
+                self.max_stream_event_bytes, self.max_retained_bytes, required
+            )));
+        }
+        if self.max_upstream_sse_line_bytes < required {
+            return Err(Error::Config(format!(
+                "max_upstream_sse_line_bytes ({}) cannot be smaller than max_retained_bytes ({}) plus headroom ({})",
+                self.max_upstream_sse_line_bytes, self.max_retained_bytes, required
+            )));
+        }
+        if self.max_upstream_json_bytes < required {
+            return Err(Error::Config(format!(
+                "max_upstream_json_bytes ({}) cannot be smaller than max_retained_bytes ({}) plus headroom ({})",
+                self.max_upstream_json_bytes, self.max_retained_bytes, required
             )));
         }
         Ok(())
@@ -478,5 +494,28 @@ mod tests {
         let url = default_database_url_in(&home).expect("database URL");
         assert!(url.contains("agentic%20api"));
         assert!(url.contains("state%3F%23%25"));
+    }
+
+    #[test]
+    fn responses_config_validation() {
+        let valid = ResponsesConfig {
+            max_retained_bytes: 1024 * 1024,
+            max_upstream_json_bytes: 2 * 1024 * 1024,
+            max_upstream_sse_line_bytes: 2 * 1024 * 1024,
+            max_stream_event_bytes: 2 * 1024 * 1024,
+        };
+        assert!(valid.validate().is_ok());
+
+        let mut invalid_stream = valid;
+        invalid_stream.max_stream_event_bytes = 1024 * 1024;
+        assert!(invalid_stream.validate().is_err());
+
+        let mut invalid_sse = valid;
+        invalid_sse.max_upstream_sse_line_bytes = 1024 * 1024;
+        assert!(invalid_sse.validate().is_err());
+
+        let mut invalid_json = valid;
+        invalid_json.max_upstream_json_bytes = 1024 * 1024;
+        assert!(invalid_json.validate().is_err());
     }
 }
