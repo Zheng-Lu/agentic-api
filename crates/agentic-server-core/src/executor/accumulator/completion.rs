@@ -1,5 +1,7 @@
 //! Typed authoritative completion merging for active accumulator items.
 
+use indexmap::IndexMap;
+
 use crate::events::EventPayload;
 use crate::types::io::output::McpListTools;
 use crate::types::io::{
@@ -17,10 +19,10 @@ pub(super) trait MergeDone<Context = (), Completed = Self> {
     fn merge_done(&mut self, done: &Completed, context: Context);
 }
 
-impl MergeDone<&mut String> for OutputMessage {
-    fn merge_done(&mut self, done: &Self, text: &mut String) {
+impl MergeDone<&mut IndexMap<u32, (String, bool)>> for OutputMessage {
+    fn merge_done(&mut self, done: &Self, parts: &mut IndexMap<u32, (String, bool)>) {
         self.clone_from(done);
-        text.clear();
+        parts.clear();
     }
 }
 

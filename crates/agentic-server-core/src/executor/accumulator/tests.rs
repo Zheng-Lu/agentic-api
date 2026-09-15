@@ -404,6 +404,36 @@ fn test_process_event_response_created_empty_id_no_overwrite() {
 }
 
 #[test]
+fn test_empty_id_response_created_allows_subsequent_created() {
+    let mut acc = ResponseAccumulator::new("resp_keep".into(), None);
+    let empty_frame = EventFrame {
+        event_type: SSEEventType::ResponseCreated,
+        payload: EventPayload::Response {
+            id: String::new(),
+            status: "in_progress".into(),
+            usage: None,
+        },
+        wire: WireEvent::new("test"),
+    };
+    acc.process_event(&empty_frame);
+    assert_eq!(acc.response_id, "resp_keep");
+    assert_eq!(acc.stream_lifecycle, StreamLifecycle::AwaitingCreated);
+
+    let real_frame = EventFrame {
+        event_type: SSEEventType::ResponseCreated,
+        payload: EventPayload::Response {
+            id: "resp_real".into(),
+            status: "in_progress".into(),
+            usage: None,
+        },
+        wire: WireEvent::new("test"),
+    };
+    acc.process_event(&real_frame);
+    assert_eq!(acc.response_id, "resp_real");
+    assert_eq!(acc.stream_lifecycle, StreamLifecycle::Created);
+}
+
+#[test]
 fn test_process_event_text_delta_accumulates() {
     let mut acc = ResponseAccumulator::new("resp_1".into(), None);
 

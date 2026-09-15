@@ -202,6 +202,7 @@ fn extract_text_done(json: &Value) -> EventPayload {
         text: json_str(json, "text"),
         item_id: json_str(json, "item_id"),
         output_index: json_output_index(json),
+        content_index: json_u32(json, "content_index"),
     }
 }
 

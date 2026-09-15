@@ -532,10 +532,10 @@ mod tests {
             home.path().join("config.toml"),
             concat!(
                 "[responses]\n",
-                "max_retained_bytes = 4194304\n",
-                "max_upstream_json_bytes = 8388608\n",
-                "max_upstream_sse_line_bytes = 2097152\n",
-                "max_stream_event_bytes = 524288\n",
+                "max_retained_bytes = 2097152\n",
+                "max_upstream_json_bytes = 4194304\n",
+                "max_upstream_sse_line_bytes = 4194304\n",
+                "max_stream_event_bytes = 4194304\n",
             ),
         )
         .expect("write config");
@@ -545,25 +545,25 @@ mod tests {
             .expect("existing config");
         assert_eq!(
             config.responses.max_retained_bytes.map(std::num::NonZeroUsize::get),
-            Some(4_194_304)
+            Some(2_097_152)
         );
         assert_eq!(
             config
                 .responses
                 .max_upstream_json_bytes
                 .map(std::num::NonZeroUsize::get),
-            Some(8_388_608)
+            Some(4_194_304)
         );
         assert_eq!(
             config
                 .responses
                 .max_upstream_sse_line_bytes
                 .map(std::num::NonZeroUsize::get),
-            Some(2_097_152)
+            Some(4_194_304)
         );
         assert_eq!(
             config.responses.max_stream_event_bytes.map(std::num::NonZeroUsize::get),
-            Some(524_288)
+            Some(4_194_304)
         );
     }
 }

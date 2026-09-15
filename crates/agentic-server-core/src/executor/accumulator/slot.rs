@@ -231,16 +231,17 @@ impl SlotMap {
         let Some(slot) = self.slots.get_mut(&index) else {
             return Ok(None);
         };
-        let delta_bytes = delta_retained_bytes(payload);
+        let delta_bytes = if let SlotState::Active(item) = &mut slot.state {
+            item.apply_event(payload)?
+        } else {
+            0
+        };
         if delta_bytes > 0
             && let Some(budget) = budget
         {
             budget.consume(delta_bytes)?;
         }
         slot.retained_bytes += delta_bytes;
-        if let SlotState::Active(item) = &mut slot.state {
-            item.apply_event(payload)?;
-        }
         self.bind_id(index, identity.item_id);
         Ok(Some(index))
     }
@@ -364,22 +365,6 @@ fn initial_added_retained_bytes(identity: ItemIdentity<'_>, payload: &EventPaylo
     bytes
 }
 
-fn delta_retained_bytes(payload: &EventPayload) -> usize {
-    match payload {
-        EventPayload::TextDelta { delta, .. }
-        | EventPayload::FunctionCallArgsDelta { delta, .. }
-        | EventPayload::CustomToolCallInputDelta { delta, .. }
-        | EventPayload::ReasoningTextDelta { delta, .. }
-        | EventPayload::ReasoningSummaryTextDelta { delta, .. } => delta.len(),
-        EventPayload::ShellCallCommand { update, .. } => match update {
-            ShellCommandUpdate::Added(cmd) => RETAINED_CONTAINER_OVERHEAD_BYTES + cmd.len(),
-            ShellCommandUpdate::Delta(delta) => delta.len(),
-            ShellCommandUpdate::Done(_) => 0,
-        },
-        _ => 0,
-    }
-}
-
 fn invalid(message: impl Into<String>) -> ExecutorError {
     ExecutorError::InvalidRequest(message.into())
 }
@@ -405,14 +390,17 @@ fn semantically_equal(left: &OutputItem, right: &OutputItem) -> bool {
 pub(super) enum ActiveItem {
     Message {
         item: OutputMessage,
-        text: String,
+        parts: IndexMap<u32, (String, bool)>,
     },
     Reasoning {
         item: ReasoningOutput,
+        content_streamed: HashMap<u32, usize>,
+        summary_streamed: HashMap<u32, usize>,
     },
     FunctionCall {
         item: FunctionToolCall,
         arguments: String,
+        streamed_args: bool,
     },
     ToolSearchCall {
         item: ToolSearchCall,
@@ -420,6 +408,7 @@ pub(super) enum ActiveItem {
     CustomToolCall {
         item: CustomToolCall,
         input: String,
+        streamed_input: bool,
     },
     ShellCall {
         item: ShellCall,
@@ -470,13 +459,18 @@ impl ActiveItem {
             }),
             SSEItemType::Reasoning => ReasoningOutput::try_from(payload)
                 .ok()
-                .map(|item| ActiveItem::Reasoning { item }),
+                .map(|item| ActiveItem::Reasoning {
+                    item,
+                    content_streamed: HashMap::new(),
+                    summary_streamed: HashMap::new(),
+                }),
             SSEItemType::FunctionCall => {
                 FunctionToolCall::try_from(payload)
                     .ok()
                     .map(|item| ActiveItem::FunctionCall {
                         item,
                         arguments: String::with_capacity(128),
+                        streamed_args: false,
                     })
             }
             SSEItemType::ToolSearchCall => ToolSearchCall::try_from(payload)
@@ -488,11 +482,12 @@ impl ActiveItem {
                     .map(|item| ActiveItem::CustomToolCall {
                         item,
                         input: String::with_capacity(256),
+                        streamed_input: false,
                     })
             }
             SSEItemType::Message => OutputMessage::try_from(payload).ok().map(|item| ActiveItem::Message {
                 item,
-                text: String::with_capacity(256),
+                parts: IndexMap::new(),
             }),
             SSEItemType::WebSearchCall => Some(ActiveItem::WebSearchCall { item: None }),
             SSEItemType::Compaction => CompactionItem::try_from(payload)
@@ -531,17 +526,23 @@ impl ActiveItem {
             },
             OutputItem::Message(item) => Self::Message {
                 item,
-                text: String::new(),
+                parts: IndexMap::new(),
             },
-            OutputItem::Reasoning(item) => Self::Reasoning { item },
+            OutputItem::Reasoning(item) => Self::Reasoning {
+                item,
+                content_streamed: HashMap::new(),
+                summary_streamed: HashMap::new(),
+            },
             OutputItem::FunctionCall(item) => Self::FunctionCall {
                 item,
                 arguments: String::new(),
+                streamed_args: true,
             },
             OutputItem::ToolSearchCall(item) => Self::ToolSearchCall { item },
             OutputItem::CustomToolCall(item) => Self::CustomToolCall {
                 item,
                 input: String::new(),
+                streamed_input: true,
             },
             OutputItem::WebSearchCall(item) => Self::WebSearchCall { item: Some(item) },
             OutputItem::McpCall(item) => Self::McpCall { item },
@@ -551,91 +552,219 @@ impl ActiveItem {
         })
     }
 
+    fn apply_shell_call(
+        item: &mut ShellCall,
+        command_stream: &mut Option<Vec<bool>>,
+        buffer: &mut String,
+        payload: &EventPayload,
+    ) -> ExecutorResult<usize> {
+        let EventPayload::ShellCallCommand {
+            command_index, update, ..
+        } = payload
+        else {
+            return Ok(0);
+        };
+        let index = *command_index as usize;
+        let done = command_stream.as_deref().unwrap_or_default();
+        match update {
+            ShellCommandUpdate::Added(command) => {
+                if index != done.len() || item.action.commands.len() != done.len() || done.last() == Some(&false) {
+                    return Err(invalid("shell command added out of order"));
+                }
+                item.action.commands.push(String::new());
+                buffer.clone_from(command);
+                command_stream.get_or_insert_with(Vec::new).push(false);
+                Ok(RETAINED_CONTAINER_OVERHEAD_BYTES + command.len())
+            }
+            ShellCommandUpdate::Delta(delta) => {
+                if done.get(index) != Some(&false) {
+                    return Err(invalid("shell command delta has no active command"));
+                }
+                buffer.push_str(delta);
+                Ok(delta.len())
+            }
+            ShellCommandUpdate::Done(command) => {
+                if done.get(index) != Some(&false) || *buffer != *command {
+                    return Err(invalid(
+                        "shell command done is repeated or contradicts streamed command",
+                    ));
+                }
+                item.apply_done(payload, buffer);
+                command_stream.as_mut().expect("active command stream")[index] = true;
+                Ok(0)
+            }
+        }
+    }
+
+    fn apply_message(parts: &mut IndexMap<u32, (String, bool)>, payload: &EventPayload) -> usize {
+        match payload {
+            EventPayload::TextDelta {
+                delta, content_index, ..
+            } => {
+                let part = parts.entry(*content_index).or_insert_with(|| (String::new(), false));
+                part.1 = true;
+                part.0.push_str(delta);
+                delta.len()
+            }
+            EventPayload::TextDone {
+                text: done_text,
+                content_index,
+                ..
+            } => {
+                let part = parts.entry(*content_index).or_insert_with(|| (String::new(), false));
+                if part.1 {
+                    0
+                } else {
+                    let additional = done_text.len().saturating_sub(part.0.len());
+                    part.0.clone_from(done_text);
+                    additional
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn apply_reasoning(
+        item: &mut ReasoningOutput,
+        content_streamed: &mut HashMap<u32, usize>,
+        summary_streamed: &mut HashMap<u32, usize>,
+        payload: &EventPayload,
+    ) -> usize {
+        match payload {
+            EventPayload::ReasoningTextDelta {
+                delta, content_index, ..
+            } => {
+                *content_streamed.entry(*content_index).or_default() += delta.len();
+                delta.len()
+            }
+            EventPayload::ReasoningTextDone {
+                text, content_index, ..
+            } => {
+                let streamed = content_streamed.remove(content_index).unwrap_or(0);
+                let additional = text.len().saturating_sub(streamed);
+                item.apply_done(payload, &mut String::new());
+                additional
+            }
+            EventPayload::ReasoningSummaryTextDelta {
+                delta, summary_index, ..
+            } => {
+                *summary_streamed.entry(*summary_index).or_default() += delta.len();
+                delta.len()
+            }
+            EventPayload::ReasoningSummaryTextDone {
+                text, summary_index, ..
+            } => {
+                let streamed = summary_streamed.remove(summary_index).unwrap_or(0);
+                let additional = text.len().saturating_sub(streamed);
+                item.apply_done(payload, &mut String::new());
+                additional
+            }
+            _ => 0,
+        }
+    }
+
+    fn apply_function_call(
+        item: &mut FunctionToolCall,
+        arguments: &mut String,
+        streamed_args: &mut bool,
+        payload: &EventPayload,
+    ) -> usize {
+        match payload {
+            EventPayload::FunctionCallArgsDelta { delta, .. } => {
+                *streamed_args = true;
+                arguments.push_str(delta);
+                delta.len()
+            }
+            EventPayload::FunctionCallArgsDone {
+                arguments: done_args,
+                name,
+                call_id,
+                ..
+            } => {
+                let additional_args = if *streamed_args {
+                    done_args.len().saturating_sub(arguments.len())
+                } else {
+                    done_args.len()
+                };
+                let additional_name = if item.name.is_empty() { name.len() } else { 0 };
+                let additional_cid = if item.call_id.is_empty() {
+                    call_id.as_ref().map_or(0, String::len)
+                } else {
+                    0
+                };
+                item.apply_done(payload, arguments);
+                additional_args + additional_name + additional_cid
+            }
+            _ => 0,
+        }
+    }
+
+    fn apply_custom_tool_call(
+        item: &mut CustomToolCall,
+        input: &mut String,
+        streamed_input: &mut bool,
+        payload: &EventPayload,
+    ) -> usize {
+        match payload {
+            EventPayload::CustomToolCallInputDelta { delta, .. } => {
+                *streamed_input = true;
+                input.push_str(delta);
+                delta.len()
+            }
+            EventPayload::CustomToolCallInputDone { input: done_input, .. } => {
+                let additional_input = if *streamed_input {
+                    done_input.len().saturating_sub(input.len())
+                } else {
+                    done_input.len()
+                };
+                item.apply_done(payload, input);
+                additional_input
+            }
+            _ => 0,
+        }
+    }
+
     /// Folds a resolved event; the accumulator checks identity and lifecycle first.
-    pub(super) fn apply_event(&mut self, payload: &EventPayload) -> ExecutorResult<()> {
+    pub(super) fn apply_event(&mut self, payload: &EventPayload) -> ExecutorResult<usize> {
         match self {
             Self::ShellCall {
                 item,
                 command_stream,
-                command: buffer,
-            } => {
-                if let EventPayload::ShellCallCommand {
-                    command_index, update, ..
-                } = payload
-                {
-                    let index = *command_index as usize;
-                    let done = command_stream.as_deref().unwrap_or_default();
-                    match update {
-                        ShellCommandUpdate::Added(command) => {
-                            if index != done.len()
-                                || item.action.commands.len() != done.len()
-                                || done.last() == Some(&false)
-                            {
-                                return Err(invalid("shell command added out of order"));
-                            }
-                            item.action.commands.push(String::new());
-                            buffer.clone_from(command);
-                            command_stream.get_or_insert_with(Vec::new).push(false);
-                        }
-                        ShellCommandUpdate::Delta(delta) => {
-                            if done.get(index) != Some(&false) {
-                                return Err(invalid("shell command delta has no active command"));
-                            }
-                            buffer.push_str(delta);
-                        }
-                        ShellCommandUpdate::Done(command) => {
-                            if done.get(index) != Some(&false) || *buffer != *command {
-                                return Err(invalid(
-                                    "shell command done is repeated or contradicts streamed command",
-                                ));
-                            }
-                            item.apply_done(payload, buffer);
-                            command_stream.as_mut().expect("active command stream")[index] = true;
-                        }
-                    }
-                }
-            }
-            Self::Message { text, .. } => match payload {
-                EventPayload::TextDelta { delta, .. } => {
-                    text.push_str(delta);
-                }
-                EventPayload::TextDone { text: done_text, .. } if text.len() < done_text.len() => {
-                    text.clone_from(done_text);
-                }
-                _ => {}
-            },
-            Self::Reasoning { item } => {
-                if matches!(
-                    payload,
-                    EventPayload::ReasoningTextDone { .. } | EventPayload::ReasoningSummaryTextDone { .. }
-                ) {
-                    item.apply_done(payload, &mut String::new());
-                }
-            }
-            Self::FunctionCall { item, arguments } => match payload {
-                EventPayload::FunctionCallArgsDelta { delta, .. } => arguments.push_str(delta),
-                EventPayload::FunctionCallArgsDone { .. } => item.apply_done(payload, arguments),
-                _ => {}
-            },
-            Self::CustomToolCall { item, input } => match payload {
-                EventPayload::CustomToolCallInputDelta { delta, .. } => input.push_str(delta),
-                EventPayload::CustomToolCallInputDone { .. } => item.apply_done(payload, input),
-                _ => {}
-            },
+                command,
+            } => Self::apply_shell_call(item, command_stream, command, payload),
+            Self::Message { parts, .. } => Ok(Self::apply_message(parts, payload)),
+            Self::Reasoning {
+                item,
+                content_streamed,
+                summary_streamed,
+            } => Ok(Self::apply_reasoning(item, content_streamed, summary_streamed, payload)),
+            Self::FunctionCall {
+                item,
+                arguments,
+                streamed_args,
+            } => Ok(Self::apply_function_call(item, arguments, streamed_args, payload)),
+            Self::CustomToolCall {
+                item,
+                input,
+                streamed_input,
+            } => Ok(Self::apply_custom_tool_call(item, input, streamed_input, payload)),
             Self::ToolSearchCall { .. }
             | Self::WebSearchCall { .. }
             | Self::McpCall { .. }
             | Self::McpListTools { .. }
-            | Self::Compaction { .. } => {}
+            | Self::Compaction { .. } => Ok(0),
         }
-        Ok(())
     }
 
     pub(super) fn finalize(self) -> Option<OutputItem> {
         match self {
             Self::ShellCall { item, .. } => Some(OutputItem::ShellCall(item)),
-            Self::Reasoning { item } => Some(OutputItem::Reasoning(item)),
-            Self::FunctionCall { mut item, arguments } => {
+            Self::Reasoning { item, .. } => Some(OutputItem::Reasoning(item)),
+            Self::FunctionCall {
+                mut item,
+                arguments,
+                streamed_args: _,
+            } => {
                 if !arguments.is_empty() && item.arguments.is_empty() {
                     item.arguments = arguments;
                 }
@@ -643,14 +772,21 @@ impl ActiveItem {
                 Some(OutputItem::FunctionCall(item))
             }
             Self::ToolSearchCall { item } => Some(OutputItem::ToolSearchCall(item)),
-            Self::Message { mut item, text } => {
-                if !text.is_empty() {
-                    item.content.push(OutputTextContent::new(text));
+            Self::Message { mut item, mut parts } => {
+                parts.sort_keys();
+                for (_, (text, _)) in parts {
+                    if !text.is_empty() {
+                        item.content.push(OutputTextContent::new(text));
+                    }
                 }
                 item.status = MessageStatus::Completed;
                 Some(OutputItem::Message(item))
             }
-            Self::CustomToolCall { mut item, input } => {
+            Self::CustomToolCall {
+                mut item,
+                input,
+                streamed_input: _,
+            } => {
                 if item.input.is_empty() {
                     item.input = input;
                 }
@@ -734,13 +870,13 @@ fn apply_output_item_done(
 ) {
     match (active, done_item) {
         (ActiveItem::ShellCall { item, .. }, Some(OutputItem::ShellCall(done))) => item.merge_done(done, ()),
-        (ActiveItem::Message { item, text }, Some(OutputItem::Message(done))) => item.merge_done(done, text),
-        (ActiveItem::Reasoning { item }, Some(OutputItem::Reasoning(done))) => item.merge_done(done, payload),
-        (ActiveItem::FunctionCall { item, arguments }, Some(OutputItem::FunctionCall(done))) => {
+        (ActiveItem::Message { item, parts }, Some(OutputItem::Message(done))) => item.merge_done(done, parts),
+        (ActiveItem::Reasoning { item, .. }, Some(OutputItem::Reasoning(done))) => item.merge_done(done, payload),
+        (ActiveItem::FunctionCall { item, arguments, .. }, Some(OutputItem::FunctionCall(done))) => {
             item.merge_done(done, arguments);
         }
         (ActiveItem::ToolSearchCall { item }, Some(OutputItem::ToolSearchCall(done))) => item.merge_done(done, ()),
-        (ActiveItem::CustomToolCall { item, input }, Some(OutputItem::CustomToolCall(done))) => {
+        (ActiveItem::CustomToolCall { item, input, .. }, Some(OutputItem::CustomToolCall(done))) => {
             item.merge_done(done, input);
         }
         (ActiveItem::WebSearchCall { item }, Some(OutputItem::WebSearchCall(done))) => item.merge_done(done, item_id),
@@ -748,10 +884,10 @@ fn apply_output_item_done(
         (ActiveItem::McpListTools { item }, Some(OutputItem::McpListTools(done))) => item.merge_done(done, ()),
         (ActiveItem::Compaction { item }, Some(OutputItem::Compaction(done))) => item.merge_done(done, ()),
         (ActiveItem::ShellCall { item, command, .. }, None) => item.apply_done(payload, command),
-        (ActiveItem::Reasoning { item }, None) => item.apply_done(payload, &mut String::new()),
-        (ActiveItem::FunctionCall { item, arguments }, None) => item.apply_done(payload, arguments),
+        (ActiveItem::Reasoning { item, .. }, None) => item.apply_done(payload, &mut String::new()),
+        (ActiveItem::FunctionCall { item, arguments, .. }, None) => item.apply_done(payload, arguments),
         (ActiveItem::ToolSearchCall { item }, None) => item.apply_done(payload, &mut String::new()),
-        (ActiveItem::CustomToolCall { item, input }, None) => item.apply_done(payload, input),
+        (ActiveItem::CustomToolCall { item, input, .. }, None) => item.apply_done(payload, input),
         (ActiveItem::McpCall { item }, None) => item.apply_done(payload, &mut String::new()),
         (ActiveItem::McpListTools { item }, None) => item.apply_done(payload, &mut String::new()),
         (ActiveItem::Compaction { item }, None) => item.apply_done(payload, &mut String::new()),
