@@ -3,11 +3,12 @@
 //! `mod.rs` owns the OpenAI-facing adapter: the [`WebSearchHandler`], the
 //! private [`WebSearchProvider`] contract, the typed result shape every
 //! provider normalizes into, and the mapping to public `web_search_call`
-//! output items. [`args`] parses the model's arguments; provider modules
-//! ([`you`], [`brave`]) shape requests and map responses.
+//! output items (see [`output`]). [`args`] parses the model's arguments;
+//! provider modules ([`you`], [`brave`]) shape requests and map responses.
 
 pub(crate) mod args;
 pub(crate) mod brave;
+pub(crate) mod output;
 pub(crate) mod you;
 
 use std::collections::HashMap;
@@ -20,18 +21,18 @@ use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
 use tokio::sync::Semaphore;
 
 use self::args::{MAX_WEB_SEARCH_QUERIES, WebSearchArguments};
 use self::brave::BraveSearchProvider;
+pub(crate) use self::output::{output_item, started_output_item};
 use self::you::{YOU_API_BASE_URL, YOU_API_KEY, YouSearchProvider};
 use super::handler::MAX_GATEWAY_TOOL_OUTPUT_BYTES;
 use super::handler::{GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput};
 use super::ownership::GatewayBinding;
 use super::registry::{ToolEntry, ToolType};
 use crate::config::{DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS, WebSearchProviderConfig, WebSearchProviderKind};
-use crate::types::io::output::{FunctionToolCall, WebSearchCall, WebSearchCallStatus, WebSearchSource};
+use crate::types::io::output::{FunctionToolCall, WebSearchCallStatus};
 use crate::types::io::{FunctionTool, OutputItem};
 use crate::types::tools::WebSearchToolParam;
 
@@ -128,36 +129,6 @@ pub(crate) fn web_search_function_tool() -> FunctionTool {
         })),
         strict: Some(false),
     }
-}
-
-#[must_use]
-pub(crate) fn output_item(
-    call: &FunctionToolCall,
-    output: &ToolOutput,
-    status: WebSearchCallStatus,
-) -> Option<OutputItem> {
-    let parsed_output = serde_json::from_str::<Value>(&output.output).ok();
-    let queries = parsed_output
-        .as_ref()
-        .and_then(queries_from_value)
-        .or_else(|| queries_from_arguments(&call.arguments))
-        .unwrap_or_else(|| vec![String::new()]);
-    let sources = parsed_output.as_ref().map(sources_from_output).unwrap_or_default();
-    WebSearchCall::try_new(call_output_id(call), status, queries, sources)
-        .map(OutputItem::WebSearchCall)
-        .ok()
-}
-
-#[must_use]
-pub(crate) fn started_output_item(call: &FunctionToolCall) -> Option<OutputItem> {
-    WebSearchCall::try_new(
-        call_output_id(call),
-        WebSearchCallStatus::InProgress,
-        queries_from_arguments(&call.arguments).unwrap_or_else(|| vec![String::new()]),
-        Vec::new(),
-    )
-    .map(OutputItem::WebSearchCall)
-    .ok()
 }
 
 #[derive(Debug, Clone)]
@@ -543,56 +514,6 @@ impl GatewayExecutor for WebSearchHandler {
     }
 }
 
-fn clean_json_str(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-}
-
-fn call_output_id(call: &FunctionToolCall) -> String {
-    if let Some(suffix) = call.id.strip_prefix("fc_").filter(|suffix| !suffix.is_empty()) {
-        return format!("ws_{suffix}");
-    }
-    if let Some(suffix) = call.call_id.strip_prefix("call_").filter(|suffix| !suffix.is_empty()) {
-        return format!("ws_{suffix}");
-    }
-    crate::utils::uuid7_str("ws_")
-}
-
-fn queries_from_value(value: &Value) -> Option<Vec<String>> {
-    let queries: Vec<String> = value
-        .get("queries")?
-        .as_array()?
-        .iter()
-        .filter_map(|item| clean_json_str(Some(item)))
-        .collect();
-    (!queries.is_empty()).then_some(queries)
-}
-
-fn queries_from_arguments(arguments: &str) -> Option<Vec<String>> {
-    let args = serde_json::from_str::<Value>(arguments).ok()?;
-    queries_from_value(&args).or_else(|| clean_json_str(args.get("query")).map(|query| vec![query]))
-}
-
-fn sources_from_output(output: &Value) -> Vec<WebSearchSource> {
-    ["web", "news"]
-        .into_iter()
-        .filter_map(|section| output.get("results")?.get(section)?.as_array())
-        .flat_map(|results| results.iter())
-        .filter_map(source_from_result)
-        .collect()
-}
-
-fn source_from_result(result: &Value) -> Option<WebSearchSource> {
-    let url = clean_json_str(result.get("url"))?;
-    Some(WebSearchSource {
-        url,
-        title: clean_json_str(result.get("title")),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -739,7 +660,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let body: Value = serde_json::from_str(&output.output).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&output.output).unwrap();
         assert_eq!(output.call_id, "call_search");
         assert_eq!(body["query"], "potato");
         assert_eq!(body["queries"], serde_json::json!(["potato"]));
@@ -760,7 +681,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let body: Value = serde_json::from_str(&output.output).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&output.output).unwrap();
         assert_eq!(body["query"], "potato");
         assert_eq!(body["queries"], serde_json::json!(["potato", "tomato"]));
         assert_eq!(body["results"]["web"].as_array().unwrap().len(), 2);
