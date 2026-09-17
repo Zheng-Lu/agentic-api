@@ -429,6 +429,20 @@ kubectl create secret generic agentic-api-secrets \
   --from-literal=brave-api-key="$BRAVE_API_KEY"
 ```
 
+To keep search inside the cluster, point the gateway at a self-hosted
+[SearXNG](https://docs.searxng.org/) Service instead. No Secret is needed; the base URL is
+mandatory, and the instance must enable the JSON format (`search.formats: [html, json]` in
+its `settings.yml`). If the instance runs with `server.limiter: true`, add the gateway's
+Pod or Service CIDR to `botdetection.ip_lists.pass_ip` in its `limiter.toml`, because the
+gateway never sends `Accept-Encoding: gzip` and would otherwise be rejected with `429`:
+
+```yaml
+            - name: AGENTIC_WEB_SEARCH_PROVIDER
+              value: searxng
+            - name: AGENTIC_WEB_SEARCH_BASE_URL
+              value: http://searxng.agentic-api.svc.cluster.local:8080
+```
+
 Do not commit API keys to the manifest or source tree.
 
 ## Optional: deploy with llm-d

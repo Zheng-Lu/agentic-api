@@ -6,6 +6,19 @@ All notable changes to Agentic API are documented here.
 
 ### Added
 
+- Added SearXNG as a selectable backend for the gateway-owned `web_search` tool (#326, Phase 3 of #291). Select it
+  with `AGENTIC_WEB_SEARCH_PROVIDER=searxng` or `[web_search] provider = "searxng"` and point
+  `AGENTIC_WEB_SEARCH_BASE_URL` or `[web_search] base_url` at a self-hosted instance; the endpoint is mandatory and
+  the server refuses to start without it. No API key is needed; `SEARXNG_API_KEY` (or the variable named by
+  `api_key_env`) is sent as a `Bearer` token only when set. Web and news results come from one
+  `format=json&categories=general,news` request per query, split by category. The gateway adapts the shared tool
+  contract: `allowed_domains` / `blocked_domains` and the model's `include_domains` / `exclude_domains` are enforced
+  client-side on a label boundary, `count` is applied client-side after filtering, `freshness` maps to `time_range`
+  (date ranges are ignored), `language` is normalized to SearXNG's `xx` / `xx-YY` form, `safesearch` maps to
+  `0` / `1` / `2`, and `country` plus the You.com-specific arguments are ignored. A `403` is reported as the JSON
+  format being disabled, and a `429` explains SearXNG's bot-detection limiter, which rejects the gateway's
+  `Accept-Encoding`-free requests unless its address is on `pass_ip`; neither is retried. Each SearXNG `metadata[]`
+  entry carries `"provider": "searxng"`. Concurrency inherits `max_concurrent_gateway_calls`.
 - Added typed per-model input-modality overrides to `config.toml`
   (`[models."<served-model-id>"] input_modalities = ["text", "image"]`), validated at startup:
   unknown modality names, empty lists, duplicates, and image-only lists are rejected with the
