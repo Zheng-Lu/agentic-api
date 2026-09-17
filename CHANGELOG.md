@@ -27,6 +27,14 @@ All notable changes to Agentic API are documented here.
 
 ### Changed
 
+- Rust `agentic_core::config::Config` struct literals must now provide `responses: ResponsesConfig::default()`
+  (or validated custom limits). `ExecutionContext::new` keeps its signature and defaults; use
+  `ExecutionContext::with_responses_config` to override them. `ExecuteRequest::with_max_stream_event_bytes` and
+  `GatewayStreamAccumulator::with_max_stream_event_bytes` add explicit delivery limits; existing constructors and
+  `call_inference` remain available, with `inference::call_inference_limited` exposing a custom SSE-line limit.
+- Response-size failures now use `ExecutorError::ResourceLimitExceeded { limit, max_bytes }`; `ResourceLimit` is
+  re-exported from `agentic_core::executor`. Callers classifying size failures should handle this typed variant
+  instead of inspecting error messages (#304).
 - Modeled the Codex model catalog and the upstream model listing as typed Rust structs instead of
   untyped JSON, and reported an undecodable upstream `/v1/models` payload as `502` rather than
   serving it as an empty catalog (#252).
