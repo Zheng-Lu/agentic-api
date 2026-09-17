@@ -1,3 +1,7 @@
+mod content;
+
+pub use content::{InputContent, InputFileContent, InputImageContent, InputTextContent, RefusalContent};
+
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
@@ -8,60 +12,7 @@ use crate::types::tools::{ResponsesTool, ToolSearchExecution, ToolSearchStatus};
 use crate::utils::common::deserialize_from_value;
 
 use super::output::{CustomToolCall, FunctionToolCall, McpListTools, ReasoningOutput, ToolSearchCall};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct InputTextContent {
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct InputImageContent {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct InputFileContent {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_data: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filename: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-/// Content item inside a message input.
-///
-/// Uses an internally-tagged enum — serde consumes `"type"` for the variant
-/// discriminant so the inner structs must NOT redeclare a `type_` field.
-/// `output_text` and `reasoning_text` reuse `InputTextContent` since they
-/// carry only a `text` field; they are preserved so vLLM sees the full history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum InputContent {
-    InputText(InputTextContent),
-    InputImage(InputImageContent),
-    /// Preserved on the wire; support is validated after the routing decision.
-    InputFile(InputFileContent),
-    /// Assistant output text in rehydrated history.
-    OutputText(InputTextContent),
-    /// Reasoning step text in rehydrated history.
-    ReasoningText(InputTextContent),
-    /// Any other content type — drop silently.
-    #[serde(other)]
-    Unknown,
-}
+use super::shell::{ShellCall, ShellCallOutputMessage, ShellCallStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -205,6 +156,7 @@ mod openapi_schemas {
                 )
                 .item(tagged_ref("input_file", "InputFileContent"))
                 .item(tagged_text_variant("output_text"))
+                .item(tagged_ref("refusal", "RefusalContent"))
                 .item(tagged_text_variant("reasoning_text"))
                 .into()
         }
@@ -255,6 +207,8 @@ mod openapi_schemas {
                 .item(tagged_ref("tool_search_output", "ToolSearchOutputMessage"))
                 .item(tagged_ref("custom_tool_call", "CustomToolCall"))
                 .item(tagged_ref("custom_tool_call_output", "CustomToolCallOutputMessage"))
+                .item(tagged_ref("shell_call", "ShellCall"))
+                .item(tagged_ref("shell_call_output", "ShellCallOutputMessage"))
                 .item(tagged_ref("reasoning", "ReasoningOutput"))
                 .item(tagged_ref("mcp_list_tools", "McpListTools"))
                 .item(tagged_ref("compaction", "CompactionItem"))
@@ -341,6 +295,36 @@ impl From<CustomToolCall> for InputFunctionToolCall {
             namespace: None,
             arguments: serde_json::json!({ "input": call.input }).to_string(),
             status: call.status,
+        }
+    }
+}
+
+impl From<ShellCall> for InputFunctionToolCall {
+    fn from(call: ShellCall) -> Self {
+        Self {
+            id: call.id.as_deref().and_then(function_call_item_id),
+            call_id: call.call_id,
+            name: "shell".to_owned(),
+            namespace: None,
+            // The action contains only JSON-compatible values and string map keys.
+            arguments: serde_json::to_string(&call.action).expect("shell action serializes to JSON"),
+            status: match call.status {
+                Some(ShellCallStatus::Completed) => Some(MessageStatus::Completed),
+                Some(ShellCallStatus::InProgress) => Some(MessageStatus::InProgress),
+                Some(ShellCallStatus::Incomplete) | None => None,
+            },
+        }
+    }
+}
+
+impl From<ShellCallOutputMessage> for FunctionToolResultMessage {
+    fn from(output: ShellCallOutputMessage) -> Self {
+        Self {
+            call_id: output.call_id,
+            // Command outputs contain only JSON-compatible values and string map keys.
+            output: serde_json::to_string(&output.output)
+                .expect("shell outputs serialize to JSON")
+                .into(),
         }
     }
 }
@@ -449,6 +433,10 @@ pub enum InputItem {
     CustomToolCall(CustomToolCall),
     #[serde(rename = "custom_tool_call_output")]
     CustomToolCallOutput(CustomToolCallOutputMessage),
+    #[serde(rename = "shell_call")]
+    ShellCall(ShellCall),
+    #[serde(rename = "shell_call_output")]
+    ShellCallOutput(ShellCallOutputMessage),
     #[serde(rename = "reasoning")]
     Reasoning(ReasoningOutput),
     /// Internal history record used by gateway orchestration to remember that
@@ -471,8 +459,10 @@ impl<'de> Deserialize<'de> for InputItem {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = Value::deserialize(deserializer)?;
-        let item = match value.get("type").and_then(Value::as_str) {
+        let mut value = Value::deserialize(deserializer)?;
+        // Consume the enum discriminator before a flattened payload can retain it.
+        let kind = value.as_object_mut().and_then(|object| object.remove("type"));
+        let item = match kind.as_ref().and_then(Value::as_str) {
             None | Some("message") => deserialize_from_value(value).map(Self::Message),
             Some("function_call") => deserialize_from_value(value).map(Self::FunctionCall),
             Some("function_call_output") => deserialize_from_value(value).map(Self::FunctionCallOutput),
@@ -480,6 +470,8 @@ impl<'de> Deserialize<'de> for InputItem {
             Some("tool_search_output") => deserialize_from_value(value).map(Self::ToolSearchOutput),
             Some("custom_tool_call") => deserialize_from_value(value).map(Self::CustomToolCall),
             Some("custom_tool_call_output") => deserialize_from_value(value).map(Self::CustomToolCallOutput),
+            Some("shell_call") => deserialize_from_value(value).map(Self::ShellCall),
+            Some("shell_call_output") => deserialize_from_value(value).map(Self::ShellCallOutput),
             Some("reasoning") => deserialize_from_value(value).map(Self::Reasoning),
             Some("mcp_list_tools") => deserialize_from_value(value).map(Self::McpListTools),
             Some("compaction") => deserialize_from_value(value).map(Self::Compaction),
@@ -610,9 +602,9 @@ impl ResponsesInput {
                     id: None,
                     role: "assistant".to_owned(),
                     status: None,
-                    content: InputMessageContent::Parts(vec![InputContent::OutputText(InputTextContent {
-                        text: compaction.encrypted_content.clone(),
-                    })]),
+                    content: InputMessageContent::Parts(vec![InputContent::OutputText(InputTextContent::new(
+                        compaction.encrypted_content.clone(),
+                    ))]),
                 }),
                 other => other.clone(),
             })
@@ -625,7 +617,11 @@ fn function_call_item_id(item_id: &str) -> Option<String> {
     if item_id.is_empty() {
         return None;
     }
-    if let Some(suffix) = item_id.strip_prefix("ctc_").filter(|suffix| !suffix.is_empty()) {
+    if let Some(suffix) = item_id
+        .strip_prefix("ctc_")
+        .or_else(|| item_id.strip_prefix("sh_"))
+        .filter(|suffix| !suffix.is_empty())
+    {
         return Some(format!("fc_{suffix}"));
     }
     Some(item_id.to_owned())
@@ -914,6 +910,104 @@ mod tests {
     }
 
     #[test]
+    fn structured_function_tool_output_preserves_image_array() {
+        let content = serde_json::json!([
+            {"type": "input_text", "text": "attached local image path: diagram.png"},
+            {"type": "input_image", "image_url": "data:image/png;base64,abc"}
+        ]);
+        let item: InputItem = serde_json::from_value(serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call_view_image_1",
+            "output": content
+        }))
+        .expect("valid structured function-tool output");
+
+        let InputItem::FunctionCallOutput(output) = &item else {
+            panic!("expected function-tool output");
+        };
+        assert!(matches!(output.output, ToolCallOutput::Content(_)));
+
+        let value = serde_json::to_value(&item).expect("output serializes");
+        assert_eq!(value["output"], content, "structured output must not be stringified");
+    }
+
+    #[test]
+    fn unmodeled_message_content_part_keeps_its_type_name() {
+        let input: ResponsesInput = serde_json::from_value(serde_json::json!([{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "before"},
+                {"type": "input_audio", "audio_url": "https://example.com/clip.wav"},
+                {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "low"}
+            ]
+        }]))
+        .expect("an unmodeled part must not fail deserialization");
+
+        let ResponsesInput::Items(items) = &input else {
+            panic!("expected items");
+        };
+        let InputItem::Message(message) = &items[0] else {
+            panic!("expected message item");
+        };
+        let InputMessageContent::Parts(parts) = &message.content else {
+            panic!("expected message parts");
+        };
+        assert!(
+            matches!(parts.as_slice(), [InputContent::InputText(_), InputContent::Unknown(kind), InputContent::InputImage(_)]
+                if kind == "input_audio"),
+            "the unmodeled part must keep its position and its type name"
+        );
+        assert!(
+            serde_json::to_value(&input).is_err(),
+            "an unmodeled part must never serialize into a synthetic part"
+        );
+    }
+
+    #[test]
+    fn extension_fields_on_modeled_parts_round_trip() {
+        // The typed path must forward a known part exactly as the client sent
+        // it, unmodeled fields included, like the raw proxy path does.
+        let parts = serde_json::json!([
+            {"type": "input_text", "text": "look", "x_future_text": true},
+            {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "low", "x_future_field": "kept"},
+            {"type": "output_text", "text": "seen", "annotations": [], "logprobs": []},
+            {"type": "refusal", "refusal": "no", "x_reason": "policy"}
+        ]);
+        let message: InputMessage = serde_json::from_value(serde_json::json!({"role": "user", "content": parts}))
+            .expect("modeled parts with extension fields deserialize");
+        assert_eq!(
+            serde_json::to_value(&message).expect("message serializes")["content"],
+            parts,
+            "extension fields must survive the typed round trip"
+        );
+
+        let output: ToolCallOutput = serde_json::from_value(serde_json::json!([
+            {"type": "input_image", "image_url": "data:image/png;base64,abc", "x_future_field": "kept"}
+        ]))
+        .expect("structured tool output deserializes");
+        assert_eq!(
+            serde_json::to_value(&output).expect("output serializes")[0]["x_future_field"],
+            "kept",
+            "tool-output image parts keep extension fields too"
+        );
+    }
+
+    #[test]
+    fn message_content_part_without_a_type_is_rejected() {
+        let error = serde_json::from_value::<InputContent>(serde_json::json!({"text": "no type"}))
+            .expect_err("a part without a type has no wire meaning");
+        assert!(error.to_string().contains("missing a string `type`"), "{error}");
+    }
+
+    #[test]
+    fn refusal_content_round_trips_in_assistant_history() {
+        let part = serde_json::json!({"type": "refusal", "refusal": "I can't help with that."});
+        let content: InputContent = serde_json::from_value(part.clone()).expect("refusal is a modeled part");
+        assert!(matches!(&content, InputContent::Refusal(refusal) if refusal.refusal == "I can't help with that."));
+        assert_eq!(serde_json::to_value(&content).expect("refusal serializes"), part);
+    }
+
+    #[test]
     fn custom_tool_output_rejects_unsupported_shapes() {
         for output in [
             serde_json::json!({"result": "not a supported top-level object"}),
@@ -1068,5 +1162,57 @@ mod tests {
         let public_value = serde_json::to_value(input).expect("public input");
         assert_eq!(public_value[0]["type"], "custom_tool_call");
         assert_eq!(public_value[1]["type"], "custom_tool_call_output");
+    }
+
+    #[test]
+    fn shell_call_and_output_parse_as_typed_input_items() {
+        let input: ResponsesInput = serde_json::from_value(serde_json::json!([
+            {
+                "type": "shell_call",
+                "id": "sh_1",
+                "call_id": "call_1",
+                "action": {"commands": ["pwd"], "timeout_ms": 1000},
+                "status": "completed"
+            },
+            {
+                "type": "shell_call_output",
+                "call_id": "call_1",
+                "max_output_length": 4096,
+                "output": [{
+                    "stdout": "/workspace\n",
+                    "stderr": "",
+                    "outcome": {"type": "exit", "exit_code": 0}
+                }],
+                "status": "completed"
+            }
+        ]))
+        .expect("shell history");
+
+        let ResponsesInput::Items(items) = &input else {
+            panic!("expected item input");
+        };
+        assert!(matches!(items[0], InputItem::ShellCall(_)));
+        assert!(matches!(items[1], InputItem::ShellCallOutput(_)));
+
+        let borrowed = serde_json::to_value(Vec::<InputItem>::from(&input)).unwrap();
+        let owned = serde_json::to_value(Vec::<InputItem>::from(input.clone())).unwrap();
+        let prepared = ResponsesInput::Items(Vec::from(&input));
+        let model = serde_json::to_value(prepared.model_input()).unwrap();
+        assert_eq!(borrowed, owned);
+        assert_eq!(borrowed, model);
+        assert_eq!(model[0]["type"], "function_call");
+        assert_eq!(model[0]["id"], "fc_1");
+        assert_eq!(model[0]["name"], "shell");
+        assert_eq!(model[0]["call_id"], model[1]["call_id"]);
+        assert_eq!(model[1]["type"], "function_call_output");
+        let action: Value = serde_json::from_str(model[0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(action, serde_json::json!({"commands": ["pwd"], "timeout_ms": 1000}));
+        let output: Value = serde_json::from_str(model[1]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output[0]["outcome"]["exit_code"], 0);
+
+        let serialized = serde_json::to_value(input).expect("shell history serializes");
+        assert_eq!(serialized[0]["type"], "shell_call");
+        assert_eq!(serialized[1]["type"], "shell_call_output");
+        assert_eq!(serialized[1]["output"][0]["outcome"]["exit_code"], 0);
     }
 }

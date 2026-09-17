@@ -95,7 +95,7 @@ struct CodexModelInfo {
     web_search_tool_type: &'static str,
     truncation_policy: TruncationPolicy,
     supports_parallel_tool_calls: bool,
-    /// Image detail hints are never advertised; the gateway does not relay them upstream.
+    /// Original-detail support is not inferred from image input capability.
     supports_image_detail_original: bool,
     input_modalities: InputModalities,
     effective_context_window_percent: u8,

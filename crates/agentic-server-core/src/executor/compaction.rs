@@ -1,9 +1,13 @@
+mod context;
+
+use context::item_has_meaningful_context;
+
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::persist::persist_prepared_turn;
 use crate::executor::prepare::prepare_request_tools;
 use crate::executor::rehydrate::rehydrate_conversation;
 use crate::executor::request::{ExecutionContext, RequestContext};
-use crate::executor::upstream::fetch_blocking_payload;
+use crate::executor::upstream::{agent_pipeline, fetch_blocking_payload};
 use crate::tool::ToolSearchState;
 use crate::types::event::MessageStatus;
 use crate::types::io::input::latest_compaction_window;
@@ -128,45 +132,6 @@ fn response_output_text(output: &[OutputItem]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn value_has_content(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Null => false,
-        serde_json::Value::String(text) => !text.trim().is_empty(),
-        serde_json::Value::Array(values) => values.iter().any(value_has_content),
-        serde_json::Value::Object(values) => values.values().any(value_has_content),
-        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
-    }
-}
-
-fn item_has_meaningful_context(item: &InputItem) -> bool {
-    match item {
-        InputItem::Message(message) => match &message.content {
-            InputMessageContent::Text(text) => !text.trim().is_empty(),
-            InputMessageContent::Parts(parts) => parts.iter().any(|part| match part {
-                InputContent::InputText(text) | InputContent::OutputText(text) | InputContent::ReasoningText(text) => {
-                    !text.text.trim().is_empty()
-                }
-                InputContent::InputImage(image) => image.image_url.as_deref().is_some_and(|url| !url.trim().is_empty()),
-                // Message files are rejected during typed input validation.
-                InputContent::InputFile(_) | InputContent::Unknown => false,
-            }),
-        },
-        InputItem::FunctionCall(call) => !call.name.trim().is_empty() || !call.arguments.trim().is_empty(),
-        InputItem::FunctionCallOutput(output) => output.output.has_content(),
-        InputItem::ToolSearchCall(call) => !call.call_id.trim().is_empty() || value_has_content(&call.arguments),
-        InputItem::ToolSearchOutput(output) => !output.call_id.trim().is_empty() || !output.tools.is_empty(),
-        InputItem::CustomToolCall(call) => !call.name.trim().is_empty() || !call.input.trim().is_empty(),
-        InputItem::CustomToolCallOutput(output) => output.output.has_content(),
-        InputItem::Reasoning(reasoning) => {
-            reasoning.content.iter().any(|content| !content.text.trim().is_empty())
-                || reasoning.summary.iter().any(value_has_content)
-                || reasoning.encrypted_content.as_ref().is_some_and(value_has_content)
-        }
-        InputItem::Compaction(compaction) => !compaction.encrypted_content.trim().is_empty(),
-        InputItem::McpListTools(_) | InputItem::CompactionTrigger | InputItem::Unknown => false,
-    }
-}
-
 fn completed_summary_text(response: &ResponsePayload) -> ExecutorResult<String> {
     if response.status != "completed" || response.error.is_some() {
         let details = response
@@ -203,9 +168,13 @@ fn add_message_content(estimate: &mut InputTokenEstimate, content: &InputMessage
                         estimate.add_tokens(ESTIMATED_CONTENT_PART_OVERHEAD_TOKENS);
                         estimate.add_text(&text.text);
                     }
+                    InputContent::Refusal(refusal) => {
+                        estimate.add_tokens(ESTIMATED_CONTENT_PART_OVERHEAD_TOKENS);
+                        estimate.add_text(&refusal.refusal);
+                    }
                     InputContent::InputImage(_) => estimate.add_tokens(ESTIMATED_IMAGE_TOKENS),
                     InputContent::InputFile(file) => add_file_content(estimate, file),
-                    InputContent::Unknown => estimate.add_tokens(ESTIMATED_CONTENT_PART_OVERHEAD_TOKENS),
+                    InputContent::Unknown(_) => estimate.add_tokens(ESTIMATED_CONTENT_PART_OVERHEAD_TOKENS),
                 }
             }
         }
@@ -292,6 +261,13 @@ fn add_input_item(estimate: &mut InputTokenEstimate, item: &InputItem) {
             estimate.add_text(&output.call_id);
             estimate.add_optional_text(output.name.as_deref());
             add_tool_call_output(estimate, &output.output);
+        }
+        InputItem::ShellCall(_) | InputItem::ShellCallOutput(_) => {
+            // Shell items carry textual commands and outputs, without image payloads.
+            match serialize_to_value(item) {
+                Ok(value) => estimate.add_json_value(&value),
+                Err(_) => estimate.add_tokens(u64::MAX),
+            }
         }
         InputItem::Reasoning(reasoning) => {
             estimate.add_text(&reasoning.id);
@@ -408,8 +384,11 @@ pub(crate) async fn compact_items(
         response_id: uuid7_str("resp_"),
         conversation_id: None,
         conversation_version: None,
+        continuation: None,
     };
-    let response = fetch_blocking_payload(&ctx, exec_ctx, auth, &crate::tool::ToolRegistry::default(), None).await?;
+    let mut agent = agent_pipeline(ctx, None, None);
+    let response =
+        fetch_blocking_payload(&mut agent, exec_ctx, auth, &crate::tool::ToolRegistry::default(), None).await?;
     let summary = completed_summary_text(&response)?;
 
     Ok((
@@ -458,6 +437,9 @@ pub(crate) async fn maybe_compact_context(
     let (compacted, usage) = compact_items(&model, input, instructions.as_deref(), exec_ctx, auth).await?;
     ctx.enriched_request.input = ResponsesInput::Items(compacted.clone());
     ctx.new_input_items = compacted;
+    if let Some(continuation) = &mut ctx.continuation {
+        continuation.mark_history_replaced();
+    }
     Ok(Some(usage))
 }
 
@@ -550,9 +532,9 @@ mod tests {
 
     fn inline_image(encoded_bytes: usize) -> InputImageContent {
         InputImageContent {
-            file_id: None,
             image_url: Some(format!("data:image/png;base64,{}", "A".repeat(encoded_bytes))),
             detail: Some("auto".to_owned()),
+            ..InputImageContent::default()
         }
     }
 
@@ -594,6 +576,7 @@ mod tests {
             response_id: "resp_test".to_owned(),
             conversation_id: None,
             conversation_version: None,
+            continuation: None,
         }
     }
 
@@ -611,7 +594,7 @@ mod tests {
     async fn mock_execution_context(response_store: ResponseStore) -> (ExecutionContext, tokio::task::JoinHandle<()>) {
         let app = Router::new().route(
             "/v1/responses",
-            post(|| async {
+            post(|_body: axum::body::Bytes| async {
                 axum::Json(serde_json::json!({
                     "id": "resp_upstream",
                     "object": "response",
@@ -827,6 +810,29 @@ mod tests {
     }
 
     #[test]
+    fn an_image_referenced_by_file_id_is_meaningful_context() {
+        let image_by = |content: InputImageContent| {
+            InputItem::Message(InputMessage {
+                id: None,
+                role: "user".to_owned(),
+                status: None,
+                content: InputMessageContent::Parts(vec![InputContent::InputImage(content)]),
+            })
+        };
+
+        assert!(super::item_has_meaningful_context(&image_message(1)));
+        assert!(super::item_has_meaningful_context(&image_by(InputImageContent {
+            file_id: Some("file_diagram".to_owned()),
+            ..InputImageContent::default()
+        })));
+        assert!(!super::item_has_meaningful_context(&image_by(InputImageContent {
+            file_id: Some("  ".to_owned()),
+            image_url: Some(String::new()),
+            ..InputImageContent::default()
+        })));
+    }
+
+    #[test]
     fn each_image_adds_the_fixed_image_budget() {
         let estimate_with_images = |count| {
             let parts = (0..count).map(|_| InputContent::InputImage(inline_image(1))).collect();
@@ -921,6 +927,27 @@ mod tests {
                     "call_id": "call_1",
                     "output": [{"type": "input_text", "text": long_text}]
                 }]),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn shell_commands_and_outputs_increase_token_estimates() {
+        let long_text = "shell context ".repeat(256);
+        assert_text_growth([
+            (
+                "shell commands",
+                serde_json::json!([{"type": "shell_call", "call_id": "c1", "action": {"commands": ["x"]}}]),
+                serde_json::json!([{"type": "shell_call", "call_id": "c1", "action": {"commands": [long_text]}}]),
+            ),
+            (
+                "shell output",
+                serde_json::json!([{"type": "shell_call_output", "call_id": "c1", "output": [
+                    {"stdout": "x", "stderr": "", "outcome": {"type": "exit", "exit_code": 0}}
+                ]}]),
+                serde_json::json!([{"type": "shell_call_output", "call_id": "c1", "output": [
+                    {"stdout": long_text, "stderr": long_text, "outcome": {"type": "exit", "exit_code": 0}}
+                ]}]),
             ),
         ]);
     }

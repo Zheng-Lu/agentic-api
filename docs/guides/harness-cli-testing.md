@@ -31,7 +31,10 @@ while verifying [issue #190](https://github.com/vllm-project/agentic-api/issues/
 
 CI pins Claude Code 2.1.245 and Codex 0.149.1 and runs both real CLIs through the attach commands against recorded
 Qwen/vLLM streams. The Claude job verifies a gateway-owned web-search round trip; the Codex job verifies a completed
-Responses answer. Run the same checks locally with `bash scripts/claude-code-smoke.sh` and
+Responses answer and a real PNG attachment through both `agentic harness codex` and `agentic run codex`.
+The image checks use the committed Qwen2.5-VL response recording, compare the upstream image bytes with the attached
+PNG, and verify that the same attachment is absent with an explicit text-only catalog. They exercise the actual pinned
+CLI and gateway, without contacting a live model or claiming fresh vision inference. Run the same checks locally with `bash scripts/claude-code-smoke.sh` and
 `bash scripts/codex-smoke.sh` after building both binaries with `cargo build -p agentic-server --bins`.
 
 ## CLI behavior worth knowing

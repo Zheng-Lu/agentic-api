@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use agentic_core::McpServerEntry;
-use agentic_core::config::CONFIG_FILE_NAME;
+use agentic_core::config::{CONFIG_FILE_NAME, WebSearchProviderKind};
 use agentic_core::error::Error;
 use agentic_server::model_capabilities::{InputModalities, ModelCapabilities};
 use serde::{Deserialize, Serialize};
@@ -12,15 +12,26 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct WebSearchFileConfig {
+    /// Search backend (`you` or `brave`); unset selects You.com.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<WebSearchProviderKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Environment variable holding the provider's API key; unset uses the
+    /// provider's conventional variable (`YOU_API_KEY`, `BRAVE_API_KEY`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// Ceiling on concurrent provider requests within one batched search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_queries: Option<NonZeroUsize>,
 }
 
 impl WebSearchFileConfig {
     fn is_empty(&self) -> bool {
-        self.base_url.is_none() && self.api_key_env.is_none()
+        self.provider.is_none()
+            && self.base_url.is_none()
+            && self.api_key_env.is_none()
+            && self.max_concurrent_queries.is_none()
     }
 }
 
@@ -34,6 +45,19 @@ pub(crate) struct McpFileConfig {
 impl McpFileConfig {
     fn is_empty(&self) -> bool {
         self.allowed_hosts.is_empty()
+    }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ServerFileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_request_body_size_bytes: Option<NonZeroUsize>,
+}
+
+impl ServerFileConfig {
+    fn is_empty(&self) -> bool {
+        self.max_request_body_size_bytes.is_none()
     }
 }
 
@@ -88,6 +112,8 @@ pub(crate) struct FileConfig {
     pub web_search: WebSearchFileConfig,
     #[serde(skip_serializing_if = "McpFileConfig::is_empty")]
     pub mcp: McpFileConfig,
+    #[serde(skip_serializing_if = "ServerFileConfig::is_empty")]
+    pub server: ServerFileConfig,
     #[serde(skip_serializing_if = "ToolsFileConfig::is_empty")]
     pub tools: ToolsFileConfig,
     #[serde(skip_serializing_if = "MessagesGatewayFileConfig::is_empty")]
@@ -273,12 +299,13 @@ impl FileConfig {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::num::NonZeroUsize;
 
     use agentic_core::McpServerEntry;
     use agentic_server::model_capabilities::{InputModalities, UpstreamCapabilities};
     use tempfile::tempdir;
 
-    use super::{FileConfig, McpFileConfig, WebSearchFileConfig};
+    use super::{FileConfig, McpFileConfig, ServerFileConfig, WebSearchFileConfig, WebSearchProviderKind};
 
     #[test]
     fn missing_config_file_uses_defaults() {
@@ -294,11 +321,16 @@ mod tests {
         let defaults = FileConfig {
             llm_api_base: Some("http://127.0.0.1:5050".to_owned()),
             web_search: WebSearchFileConfig {
+                provider: Some(WebSearchProviderKind::You),
                 base_url: Some("https://api.ydc-index.io".to_owned()),
                 api_key_env: Some("YOU_API_KEY".to_owned()),
+                max_concurrent_queries: None,
             },
             mcp: McpFileConfig {
                 allowed_hosts: vec!["mcp.example.com".to_owned()],
+            },
+            server: ServerFileConfig {
+                max_request_body_size_bytes: std::num::NonZeroUsize::new(20 * 1024 * 1024),
             },
             ..FileConfig::default()
         };
@@ -309,8 +341,12 @@ mod tests {
         assert_eq!(config.llm_api_base.as_deref(), Some("http://127.0.0.1:5050"));
         assert!(contents.contains("llm_api_base = \"http://127.0.0.1:5050\""));
         assert!(contents.contains("[web_search]"));
+        assert!(contents.contains("provider = \"you\""));
         assert!(contents.contains("api_key_env = \"YOU_API_KEY\""));
+        assert!(!contents.contains("max_concurrent_queries"));
         assert!(contents.contains("allowed_hosts = [\"mcp.example.com\"]"));
+        assert!(contents.contains("[server]"));
+        assert!(contents.contains("max_request_body_size_bytes = 20971520"));
         assert!(!contents.contains("YOU_API_KEY ="));
         assert!(!contents.contains("[mcp_servers]"));
         assert!(!contents.contains("[models"));
@@ -338,7 +374,9 @@ mod tests {
 
         assert_eq!(config.llm_api_base.as_deref(), Some("http://127.0.0.1:8000/v1"));
         assert_eq!(config.database_url.as_deref(), Some("sqlite:///tmp/agentic.db"));
+        assert_eq!(config.web_search.provider, None);
         assert_eq!(config.web_search.api_key_env.as_deref(), Some("YOU_API_KEY"));
+        assert_eq!(config.web_search.max_concurrent_queries, None);
         assert_eq!(config.mcp.allowed_hosts, vec!["mcp.example.com"]);
         assert!(matches!(config.mcp_servers["remote"], McpServerEntry::Http { .. }));
         assert_eq!(
@@ -515,6 +553,72 @@ mod tests {
                 .map(std::num::NonZeroUsize::get),
             Some(3)
         );
+    }
+
+    #[test]
+    fn rejects_zero_max_request_body_size() {
+        let home = tempdir().expect("temp home");
+        fs::write(
+            home.path().join("config.toml"),
+            "[server]\nmax_request_body_size_bytes = 0\n",
+        )
+        .expect("write config");
+
+        let error = FileConfig::load(home.path()).expect_err("zero request size must fail");
+        assert!(error.to_string().contains("max_request_body_size_bytes"));
+    }
+
+    #[test]
+    fn accepts_positive_max_request_body_size() {
+        let home = tempdir().expect("temp home");
+        fs::write(
+            home.path().join("config.toml"),
+            "[server]\nmax_request_body_size_bytes = 1048576\n",
+        )
+        .expect("write config");
+
+        let config = FileConfig::load(home.path())
+            .expect("positive request size must parse")
+            .expect("existing config");
+        assert_eq!(
+            config
+                .server
+                .max_request_body_size_bytes
+                .map(std::num::NonZeroUsize::get),
+            Some(1_048_576)
+        );
+    }
+
+    #[test]
+    fn web_search_provider_settings_round_trip_and_reject_invalid_values() {
+        let home = tempdir().expect("temp home");
+        fs::write(
+            home.path().join("config.toml"),
+            "[web_search]\nprovider = \"brave\"\napi_key_env = \"MY_BRAVE_KEY\"\nmax_concurrent_queries = 2\n",
+        )
+        .expect("write config");
+        let config = FileConfig::load(home.path())
+            .expect("load config")
+            .expect("existing config");
+        assert_eq!(config.web_search.provider, Some(WebSearchProviderKind::Brave));
+        assert_eq!(config.web_search.api_key_env.as_deref(), Some("MY_BRAVE_KEY"));
+        assert_eq!(config.web_search.base_url, None);
+        assert_eq!(config.web_search.max_concurrent_queries.map(NonZeroUsize::get), Some(2));
+        let rendered = toml::to_string(&config).expect("serialize config");
+        assert!(rendered.contains("provider = \"brave\""));
+        assert!(rendered.contains("max_concurrent_queries = 2"));
+
+        fs::write(home.path().join("config.toml"), "[web_search]\nprovider = \"bing\"\n").expect("write config");
+        let error = FileConfig::load(home.path()).expect_err("unknown provider must fail");
+        assert!(error.to_string().contains("provider"), "{error}");
+
+        fs::write(
+            home.path().join("config.toml"),
+            "[web_search]\nmax_concurrent_queries = 0\n",
+        )
+        .expect("write config");
+        let error = FileConfig::load(home.path()).expect_err("zero concurrency must fail");
+        assert!(error.to_string().contains("max_concurrent_queries"), "{error}");
     }
 
     #[test]

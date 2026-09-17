@@ -10,6 +10,8 @@
 //!   * intermediate `message_delta`/`message_stop` (the per-round terminals)
 //!     suppressed; the final round's terminal is forwarded once.
 //!
+//! Each `message_stop` ends its upstream round without waiting for HTTP EOF.
+//!
 //! Structurally the Anthropic-native analogue of the Responses `GatewayStreamAccumulator`
 //! (#119/#132); kept deliberately parallel for a future consolidation. Reuses
 //! only the neutral tool layer via [`crate::types::messages::tool_seam`].
@@ -21,6 +23,7 @@ use async_stream::stream;
 use futures::StreamExt;
 use serde_json::{Value, json};
 
+use crate::events::{ClassifiedSseLine, SseLine};
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::inference::{BoxStream, response_lines, send_request};
 use crate::executor::messages_context::MessagesRequestContext;
@@ -60,6 +63,7 @@ pub async fn run_messages_stream(
         first_body,
         None,
         Some(upstream.headers()),
+        exec_ctx.streaming_timeout,
     )
     .await?;
     let response_headers = processed_response_headers(first_response.headers());
@@ -82,6 +86,7 @@ pub async fn run_messages_stream(
                     body,
                     None,
                     Some(upstream.headers()),
+                    exec_ctx.streaming_timeout,
                 )
                 .await
                 {
@@ -103,11 +108,17 @@ pub async fn run_messages_stream(
                 if acc.has_upstream_error() {
                     return;
                 }
+                if acc.has_completed_round() {
+                    break;
+                }
             }
+            // Release an upstream body that can remain open after its terminal,
+            // including before awaiting gateway tool execution for the next round.
+            drop(response_stream);
 
             // Round finished. Continue only for a pure gateway-tool round; a
-            // client-owned tool_use (or any non-tool_use stop) is terminal.
-            if !acc.should_continue_loop() {
+            // client-executed function tool makes the round terminal.
+            if !acc.should_continue_loop(&ctx) {
                 for out in acc.finish() {
                     yield out;
                 }
@@ -163,6 +174,7 @@ struct BufferedBlock {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RoundState {
     Active,
+    Completed,
     UpstreamError,
 }
 
@@ -221,15 +233,13 @@ struct MessagesStreamAccumulator {
     /// the full turn — `thinking`/`text`/`signature` + gateway `tool_use` — can
     /// be reconstructed for the next round's history (F3). Cleared each round.
     blocks: BTreeMap<u64, BufferedBlock>,
-    /// Did this round end with `stop_reason: tool_use`?
-    ended_on_tool_use: bool,
     /// Did this round surface a client-owned `tool_use`? If so the loop cannot
     /// continue server-side (the client must supply that tool's result), so it
     /// is terminal — matching the non-streaming path's E7 handling.
     has_client_tool_use: bool,
     /// Buffered terminal `message_delta` from the final round (emitted by `finish`).
     final_message_delta: Option<Value>,
-    /// Whether this round is still active or terminated with an upstream error.
+    /// Whether this round is active, complete, or terminated with an upstream error.
     round_state: RoundState,
     /// Operator-configured client-tool → gateway-executor aliases, so a client
     /// tool like Claude Code's `WebSearch` is classified gateway-owned (and
@@ -245,7 +255,6 @@ impl MessagesStreamAccumulator {
             index_map: HashMap::new(),
             suppressed_indices: HashSet::new(),
             blocks: BTreeMap::new(),
-            ended_on_tool_use: false,
             has_client_tool_use: false,
             final_message_delta: None,
             round_state: RoundState::Active,
@@ -257,7 +266,6 @@ impl MessagesStreamAccumulator {
         self.index_map.clear();
         self.suppressed_indices.clear();
         self.blocks.clear();
-        self.ended_on_tool_use = false;
         self.has_client_tool_use = false;
         self.round_state = RoundState::Active;
         // F6: clear the previous round's terminal so a clean-EOF round can't
@@ -294,24 +302,39 @@ impl MessagesStreamAccumulator {
     /// The loop should continue only when the round asked for a gateway tool AND
     /// did not also surface a client-owned tool (which the client must handle,
     /// making the round terminal — E7).
-    fn should_continue_loop(&self) -> bool {
-        self.ended_on_tool_use && self.gateway_call_count() > 0 && !self.has_client_tool_use
+    fn should_continue_loop(&self, ctx: &MessagesRequestContext) -> bool {
+        let stop_reason = self
+            .final_message_delta
+            .as_ref()
+            .and_then(|event| event["delta"]["stop_reason"].as_str());
+        // Preserve clean-EOF behavior for ordinary tool_use rounds. The named
+        // end_turn compatibility case requires an explicit message_stop.
+        (self.has_completed_round() || stop_reason == Some("tool_use"))
+            && self.gateway_call_count() > 0
+            && !self.has_client_tool_use
+            && ctx.is_tool_call_stop(
+                stop_reason,
+                self.blocks
+                    .values()
+                    .filter(|block| block.is_gateway_tool)
+                    .filter_map(|block| block.block["name"].as_str()),
+            )
     }
 
     fn has_upstream_error(&self) -> bool {
         self.round_state == RoundState::UpstreamError
     }
 
+    fn has_completed_round(&self) -> bool {
+        self.round_state == RoundState::Completed
+    }
+
     /// Translate one upstream SSE line into zero or more client SSE lines.
     fn push(&mut self, line: &str) -> Vec<String> {
-        let Some(data) = line.strip_prefix("data: ") else {
+        let ClassifiedSseLine::Data(data) = SseLine::parse(line) else {
             return Vec::new();
         };
-        let data = data.trim();
-        if data == "[DONE]" {
-            return Vec::new();
-        }
-        let Ok(mut event) = serde_json::from_str::<Value>(data) else {
+        let Ok(mut event) = deserialize_from_str::<Value>(data.as_str()) else {
             return Vec::new();
         };
         match event.get("type").and_then(Value::as_str) {
@@ -321,7 +344,6 @@ impl MessagesStreamAccumulator {
             Some("content_block_stop") => self.on_block_stop(&mut event),
             Some("message_delta") => {
                 // Buffer as the (possibly) final terminal; suppress mid-loop.
-                self.ended_on_tool_use = event["delta"]["stop_reason"].as_str() == Some("tool_use");
                 self.final_message_delta = Some(event);
                 Vec::new()
             }
@@ -329,8 +351,12 @@ impl MessagesStreamAccumulator {
                 self.round_state = RoundState::UpstreamError;
                 vec![sse("error", &event)]
             }
-            // `message_stop` (per-round terminal) is suppressed; `finish` emits
-            // the single client-visible terminal. Everything else is dropped.
+            Some("message_stop") => {
+                self.round_state = RoundState::Completed;
+                // `finish` emits the single client-visible terminal at loop end.
+                Vec::new()
+            }
+            // Unknown events do not end the round.
             _ => Vec::new(),
         }
     }
@@ -413,7 +439,12 @@ impl MessagesStreamAccumulator {
     /// Emit the terminal `message_delta` + `message_stop` once, at loop end.
     fn finish(&mut self) -> Vec<String> {
         let mut out = Vec::new();
-        if let Some(delta) = self.final_message_delta.take() {
+        if let Some(mut delta) = self.final_message_delta.take() {
+            // A completed client call requires client action, even when vLLM
+            // labels a named call end_turn. Do not hide truncation or clean EOF.
+            if self.has_client_tool_use && self.has_completed_round() && delta["delta"]["stop_reason"] == "end_turn" {
+                delta["delta"]["stop_reason"] = json!("tool_use");
+            }
             out.push(sse("message_delta", &delta));
         }
         out.push(sse("message_stop", &json!({"type": "message_stop"})));
@@ -489,6 +520,8 @@ async fn execute_gateway_calls(
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     fn line(v: &Value) -> String {
@@ -498,6 +531,119 @@ mod tests {
     /// Accumulator with the default gateway map (built-in `web_search` only).
     fn acc() -> MessagesStreamAccumulator {
         MessagesStreamAccumulator::new(tool_seam::GatewayToolMap::default())
+    }
+
+    fn context() -> MessagesRequestContext {
+        MessagesRequestContext::from_value(json!({"model":"test", "max_tokens":64, "messages":[]})).unwrap()
+    }
+
+    #[test]
+    fn client_terminal_normalization_preserves_metadata_and_requires_completion() {
+        for completed in [false, true] {
+            for reason in ["end_turn", "tool_use", "max_tokens", "stop_sequence", "future"] {
+                let mut acc = acc();
+                acc.push(&line(
+                    &json!({"type":"content_block_start", "index":0, "content_block":{
+                        "type":"tool_use", "id":"client", "name":"client_echo", "input":{}
+                    }}),
+                ));
+                acc.push(&line(&json!({"type":"content_block_stop", "index":0})));
+                let mut terminal = json!({"type":"message_delta", "delta":{
+                    "stop_reason":reason, "stop_sequence":null, "extension":{"value":1}
+                }, "usage":{"output_tokens":7}, "provider_extension":[1,2]});
+                acc.push(&line(&terminal));
+                if completed {
+                    acc.push(&line(&json!({"type":"message_stop"})));
+                }
+                assert!(!acc.should_continue_loop(&context()));
+                if completed && reason == "end_turn" {
+                    terminal["delta"]["stop_reason"] = json!("tool_use");
+                }
+                assert_eq!(
+                    acc.finish(),
+                    vec![
+                        sse("message_delta", &terminal),
+                        sse("message_stop", &json!({"type":"message_stop"}))
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn named_end_turn_requires_completion_matching_gateway_and_no_client_tool() {
+        for (name, stop, completed, client_tool, expected) in [
+            ("web_search", "end_turn", true, false, true),
+            ("web_search", "end_turn", false, false, false),
+            ("client_echo", "end_turn", true, false, false),
+            ("web_search", "max_tokens", true, false, false),
+            ("web_search", "stop_sequence", true, false, false),
+            ("web_search", "end_turn", true, true, false),
+        ] {
+            let ctx = MessagesRequestContext::from_value(json!({
+                "model":"test", "max_tokens":64, "messages":[], "tool_choice":{"type":"tool", "name":name}
+            }))
+            .unwrap();
+            let mut acc = acc();
+            acc.push(&line(
+                &json!({"type":"content_block_start", "index":0, "content_block":{
+                    "type":"tool_use", "id":"search", "name":"web_search", "input":{"query":"proof"}
+                }}),
+            ));
+            acc.push(&line(&json!({"type":"content_block_stop", "index":0})));
+            if client_tool {
+                acc.push(&line(
+                    &json!({"type":"content_block_start", "index":1, "content_block":{
+                        "type":"tool_use", "id":"client", "name":"client_echo", "input":{}
+                    }}),
+                ));
+                acc.push(&line(&json!({"type":"content_block_stop", "index":1})));
+            }
+            acc.push(&line(&json!({"type":"message_delta", "delta":{"stop_reason":stop}})));
+            if completed {
+                acc.push(&line(&json!({"type":"message_stop"})));
+            }
+            assert_eq!(
+                acc.should_continue_loop(&ctx),
+                expected,
+                "{name}, {stop}, {completed}, {client_tool}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn messages_bridge_accepts_optional_data_space() {
+        for prefix in ["data:", "data: "] {
+            let mut acc = acc();
+            acc.begin_round();
+            let events = [
+                json!({"type": "message_start", "message": {"id": "m"}}),
+                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hello"}}),
+                json!({"type": "content_block_stop", "index": 0}),
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+                json!({"type": "message_stop"}),
+            ];
+            let mut body = String::new();
+            for event in &events {
+                write!(body, "{prefix}{event}\n\n").expect("write SSE event");
+            }
+            write!(body, "{prefix}[DONE]\n\n").expect("write SSE termination marker");
+            let response = reqwest::Response::from(http::Response::new(body));
+            let mut lines = Box::pin(response_lines(response, std::time::Duration::ZERO));
+            let mut output = Vec::new();
+            while let Some(line) = lines.next().await {
+                output.extend(acc.push(&line.expect("valid SSE transport")));
+            }
+            output.extend(acc.finish());
+
+            let output = output.join("");
+            assert_eq!(output.matches("event: message_start").count(), 1, "{prefix:?}");
+            assert_eq!(output.matches("event: content_block_delta").count(), 1, "{prefix:?}");
+            assert_eq!(output.matches("event: message_stop").count(), 1, "{prefix:?}");
+            assert!(output.contains(r#""text":"hello""#), "{prefix:?}");
+            assert!(output.contains("end_turn"), "{prefix:?}");
+        }
     }
 
     // A single non-tool round: message_start forwarded once, blocks pass through
@@ -519,7 +665,7 @@ mod tests {
             &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
         )));
         out.extend(acc.push(&line(&json!({"type": "message_stop"}))));
-        assert!(!acc.should_continue_loop(), "text-only round is terminal");
+        assert!(!acc.should_continue_loop(&context()), "text-only round is terminal");
         out.extend(acc.finish());
         let s = out.join("");
         assert_eq!(s.matches("event: message_start").count(), 1);
@@ -552,7 +698,10 @@ mod tests {
         out.extend(acc.push(&line(&json!({"type": "message_stop"}))));
 
         let s = out.join("");
-        assert!(acc.should_continue_loop(), "pure gateway-tool round continues the loop");
+        assert!(
+            acc.should_continue_loop(&context()),
+            "pure gateway-tool round continues the loop"
+        );
         assert!(!s.contains("tool_use"), "gateway tool_use must not surface: {s}");
         assert!(!s.contains("message_stop"), "intermediate terminal suppressed");
         assert!(s.contains("thinking"), "thinking forwarded");
@@ -613,7 +762,7 @@ mod tests {
         );
         // The loop must terminate despite a gateway call being present.
         assert!(
-            !acc.should_continue_loop(),
+            !acc.should_continue_loop(&context()),
             "mixed round is terminal — loop must not continue"
         );
     }

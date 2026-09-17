@@ -129,3 +129,7 @@ PY
   --api responses \
   --model "$MODEL" \
   --capture "$capture_path"
+
+# Exercise image capability propagation with the same pinned CLI, including a
+# text-only negative control. The image response replays the committed vision cassette.
+"$PYTHON_BIN" scripts/codex_image_smoke.py

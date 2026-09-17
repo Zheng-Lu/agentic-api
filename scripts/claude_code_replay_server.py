@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import threading
 from dataclasses import dataclass
@@ -127,7 +128,9 @@ def validate_capture(records: list[dict[str, Any]], expected_model: str | None =
     assert searches[0].get("query"), "expected a non-empty search query"
 
 
-def validate_responses_capture(records: list[dict[str, Any]], expected_model: str) -> None:
+def validate_responses_capture(
+    records: list[dict[str, Any]], expected_model: str, *, expected_images: list[Path] | None = None
+) -> None:
     responses = [record["body"] for record in records if record["kind"] == "responses"]
     transports = [record["body"] for record in records if record["kind"] == "responses_transport"]
     assert len(responses) == 1, f"expected one Responses request, got {len(responses)}"
@@ -138,6 +141,25 @@ def validate_responses_capture(records: list[dict[str, Any]], expected_model: st
     assert request.get("model") == expected_model, f"expected requested model {expected_model!r}, got {request.get('model')!r}"
     assert request.get("stream") is True, "expected Codex to request a streaming response"
     assert request.get("input"), "expected a non-empty Responses input"
+
+    if expected_images is not None:
+        items = request["input"]
+        images = [
+            part for item in (items if isinstance(items, list) else [])
+            if item.get("type", "message") == "message" and item.get("role") == "user"
+            for part in (item["content"] if isinstance(item.get("content"), list) else [])
+            if part.get("type") == "input_image"
+        ]
+        assert len(images) == len(expected_images), (
+            f"expected {len(expected_images)} user image attachments, got {len(images)}"
+        )
+        for image, expected in zip(images, expected_images):
+            url = image.get("image_url", "")
+            prefix = "data:image/png;base64,"
+            assert url.startswith(prefix), "expected an inline PNG image attachment"
+            assert base64.b64decode(url[len(prefix):], validate=True) == expected.read_bytes(), (
+                f"image attachment bytes differ from {expected}"
+            )
 
 
 @dataclass
@@ -297,7 +319,13 @@ def parse_args() -> argparse.Namespace:
     assert_capture.add_argument("--capture", required=True, type=Path)
     assert_capture.add_argument("--api", choices=("messages", "responses"), default="messages")
     assert_capture.add_argument("--model", required=True)
-    return parser.parse_args()
+    images = assert_capture.add_mutually_exclusive_group()
+    images.add_argument("--expect-image", type=Path, action="append", help="Require these exact PNG attachments in order")
+    images.add_argument("--expect-no-images", action="store_true", help="Require no user image attachments")
+    args = parser.parse_args()
+    if args.command == "assert-capture" and args.api != "responses" and (args.expect_image or args.expect_no_images):
+        parser.error("image assertions require --api responses")
+    return args
 
 
 def main() -> None:
@@ -305,7 +333,8 @@ def main() -> None:
     if args.command == "assert-capture":
         records = load_capture(args.capture)
         if args.api == "responses":
-            validate_responses_capture(records, args.model)
+            expected_images = [] if args.expect_no_images else args.expect_image
+            validate_responses_capture(records, args.model, expected_images=expected_images)
             responses = sum(record["kind"] == "responses" for record in records)
             transports = sum(record["kind"] == "responses_transport" for record in records)
             print(f"capture valid: responses={responses} transports={transports}")
