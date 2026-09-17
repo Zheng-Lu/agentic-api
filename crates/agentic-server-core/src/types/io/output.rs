@@ -797,28 +797,51 @@ pub trait ApplyDone {
     fn apply_done(&mut self, payload: &EventPayload, buffer: &mut String);
 }
 
-impl ApplyDone for ReasoningOutput {
-    fn apply_done(&mut self, payload: &EventPayload, buffer: &mut String) {
+/// Where a reasoning text or summary completion inserted its part.
+///
+/// Returned by [`ReasoningOutput::apply_part_done`] so a caller can measure exactly
+/// the part that the completion retained without re-deriving the insertion rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningPartDone {
+    /// A `reasoning_text.done` part was inserted into `content` at this index.
+    Content(usize),
+    /// A `reasoning_summary_text.done` part was inserted into `summary` at this index.
+    Summary(usize),
+}
+
+impl ReasoningOutput {
+    /// Applies `reasoning_text.done` / `reasoning_summary_text.done`.
+    ///
+    /// Empty text inserts nothing and returns `None`; any other payload kind is
+    /// ignored. This is the single completion rule for reasoning parts; the
+    /// `ApplyDone` implementation delegates here.
+    pub fn apply_part_done(&mut self, payload: &EventPayload) -> Option<ReasoningPartDone> {
         match payload {
             EventPayload::ReasoningTextDone {
                 text, content_index, ..
-            } => {
-                buffer.clear();
-                if !text.is_empty() {
-                    insert_at_part_index(&mut self.content, *content_index, ReasoningTextContent::new(text));
-                }
-            }
+            } if !text.is_empty() => Some(ReasoningPartDone::Content(insert_at_part_index(
+                &mut self.content,
+                *content_index,
+                ReasoningTextContent::new(text),
+            ))),
             EventPayload::ReasoningSummaryTextDone {
                 text, summary_index, ..
-            } => {
+            } if !text.is_empty() => Some(ReasoningPartDone::Summary(insert_at_part_index(
+                &mut self.summary,
+                *summary_index,
+                serde_json::json!({"type": "summary_text", "text": text}),
+            ))),
+            _ => None,
+        }
+    }
+}
+
+impl ApplyDone for ReasoningOutput {
+    fn apply_done(&mut self, payload: &EventPayload, buffer: &mut String) {
+        match payload {
+            EventPayload::ReasoningTextDone { .. } | EventPayload::ReasoningSummaryTextDone { .. } => {
                 buffer.clear();
-                if !text.is_empty() {
-                    insert_at_part_index(
-                        &mut self.summary,
-                        *summary_index,
-                        serde_json::json!({"type": "summary_text", "text": text}),
-                    );
-                }
+                self.apply_part_done(payload);
             }
             EventPayload::OutputItemDone { item, .. } => {
                 let Some(raw_item) = item.as_object() else {
@@ -841,11 +864,13 @@ impl ApplyDone for ReasoningOutput {
     }
 }
 
-fn insert_at_part_index<T>(parts: &mut Vec<T>, part_index: u32, part: T) {
+/// Inserts `part` and returns the index it now occupies.
+fn insert_at_part_index<T>(parts: &mut Vec<T>, part_index: u32, part: T) -> usize {
     // Part indexes address a contiguous wire array. Clamp malformed sparse
     // indexes instead of manufacturing placeholder parts that never arrived.
     let index = usize::try_from(part_index).unwrap_or(usize::MAX).min(parts.len());
     parts.insert(index, part);
+    index
 }
 
 impl ApplyDone for FunctionToolCall {

@@ -22,7 +22,7 @@ use crate::executor::response_budget::{
     ExecutorResponseBudget, RETAINED_CONTAINER_OVERHEAD_BYTES, RetainedAccount, RetainedSize,
 };
 use crate::types::event::MessageStatus;
-use crate::types::io::output::McpListTools;
+use crate::types::io::output::{McpListTools, ReasoningPartDone};
 use crate::types::io::{
     ApplyDone, CompactionItem, CustomToolCall, FunctionToolCall, McpCall, OutputItem, OutputMessage, OutputTextContent,
     ReasoningOutput, ShellCall, ToolSearchCall, WebSearchCall,
@@ -69,6 +69,13 @@ fn part_mut<'a>(
         account.charge(budget, RETAINED_CONTAINER_OVERHEAD_BYTES)?;
     }
     Ok(parts.entry(index).or_default())
+}
+
+/// Bytes previously charged for `index`, now superseded by its completed part.
+fn release_streamed(counters: &mut HashMap<u32, usize>, index: u32) -> usize {
+    counters
+        .remove(&index)
+        .map_or(0, |bytes| RETAINED_CONTAINER_OVERHEAD_BYTES + bytes)
 }
 
 /// Record streamed bytes for `index`, charging the container of a new index.
@@ -161,21 +168,26 @@ impl ReasoningState {
         }
     }
 
-    /// Retained bytes of every field a text or summary completion can change.
-    fn text_retained_bytes(&self) -> usize {
-        self.item
-            .content
-            .iter()
-            .map(RetainedSize::retained_bytes)
-            .sum::<usize>()
-            + self
-                .item
-                .summary
-                .iter()
-                .map(RetainedSize::retained_bytes)
-                .sum::<usize>()
-            + streamed_counter_bytes(&self.content_streamed)
-            + streamed_counter_bytes(&self.summary_streamed)
+    /// Charge exactly the part a completion inserted, net of the streamed
+    /// counter it supersedes. Only that part is measured, so completing N parts
+    /// costs O(N) overall; the whole item is measured once, at finalization.
+    fn charge_part_done(
+        &mut self,
+        payload: &EventPayload,
+        released: usize,
+        account: &mut RetainedAccount,
+        budget: Budget<'_>,
+    ) -> ExecutorResult<()> {
+        let inserted = match self.item.apply_part_done(payload) {
+            Some(ReasoningPartDone::Content(index)) => {
+                self.item.content.get(index).map_or(0, RetainedSize::retained_bytes)
+            }
+            Some(ReasoningPartDone::Summary(index)) => {
+                self.item.summary.get(index).map_or(0, RetainedSize::retained_bytes)
+            }
+            None => 0,
+        };
+        account.charge(budget, inserted.saturating_sub(released))
     }
 
     fn apply(
@@ -192,16 +204,12 @@ impl ReasoningState {
                 delta, summary_index, ..
             } => count_streamed(&mut self.summary_streamed, *summary_index, delta, account, budget),
             EventPayload::ReasoningTextDone { content_index, .. } => {
-                account.grow(budget, self, Self::text_retained_bytes, |state| {
-                    state.content_streamed.remove(content_index);
-                    state.item.apply_done(payload, &mut String::new());
-                })
+                let released = release_streamed(&mut self.content_streamed, *content_index);
+                self.charge_part_done(payload, released, account, budget)
             }
             EventPayload::ReasoningSummaryTextDone { summary_index, .. } => {
-                account.grow(budget, self, Self::text_retained_bytes, |state| {
-                    state.summary_streamed.remove(summary_index);
-                    state.item.apply_done(payload, &mut String::new());
-                })
+                let released = release_streamed(&mut self.summary_streamed, *summary_index);
+                self.charge_part_done(payload, released, account, budget)
             }
             _ => Ok(()),
         }
@@ -365,7 +373,10 @@ impl ShellCallState {
                         "shell command done is repeated or contradicts streamed command",
                     ));
                 }
-                account.grow(budget, self, Self::retained_bytes, |state| {
+                // Only the completed command and the streaming buffer can change.
+                let affected =
+                    |state: &Self| state.item.action.commands.get(index).map_or(0, String::len) + state.command.len();
+                account.grow(budget, self, affected, |state| {
                     state.item.apply_done(payload, &mut state.command);
                     if let Some(done) = state.command_stream.as_mut() {
                         done[index] = true;

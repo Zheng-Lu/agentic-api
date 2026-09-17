@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use super::*;
 use crate::executor::error::ResourceLimit;
 use crate::executor::response_budget::{ExecutorResponseBudget, RETAINED_CONTAINER_OVERHEAD_BYTES, RetainedSize};
+use crate::types::io::output::ReasoningTextContent;
 
 fn budgeted(limit: usize, validation: Validation) -> (ResponseAccumulator, ExecutorResponseBudget) {
     let budget = ExecutorResponseBudget::with_limit(limit);
@@ -207,8 +208,8 @@ fn repeated_completion_snapshots_charge_once() {
     let after_first_done = budget.used();
     assert_eq!(
         after_first_done - after_deltas,
-        0,
-        "the completion snapshot repeats streamed text and charges nothing new"
+        "output_text".len(),
+        "the completion snapshot repeats streamed text; only the part's type is new"
     );
     feed(&mut acc, &[done.clone(), done]).unwrap();
     assert_eq!(budget.used(), after_first_done, "repeated identical snapshots are free");
@@ -273,10 +274,11 @@ fn reasoning_streamed_indexes_charge_containers_and_reconcile_with_done_text() {
         "content_index": 0, "text": "abcdef"
     })))
     .unwrap();
-    // Container already charged with the first delta; done grows the text by 3.
+    // Two empty indexes keep their containers; index 0's container and 3 streamed
+    // bytes are superseded by the completed part, which is measured exactly once.
     assert_eq!(
         budget.used() - opening,
-        3 * RETAINED_CONTAINER_OVERHEAD_BYTES + "abcdef".len()
+        2 * RETAINED_CONTAINER_OVERHEAD_BYTES + ReasoningTextContent::new("abcdef").retained_bytes()
     );
 }
 
@@ -318,8 +320,8 @@ fn metadata_supplied_only_at_completion_is_charged_at_completion() {
     .unwrap();
     assert_eq!(
         budget.used() - before,
-        annotation.retained_bytes(),
-        "annotations appear only in the completed snapshot and are charged there"
+        annotation.retained_bytes() + "output_text".len(),
+        "annotations and the part's type appear only in the completed snapshot and are charged there"
     );
 }
 
@@ -417,4 +419,104 @@ fn oversized_tool_search_arguments_are_rejected_recursively() {
         .load_json_body(&body)
         .expect_err("nested tool-search arguments past the budget are rejected");
     assert_budget_exceeded(&error);
+}
+
+#[test]
+fn nested_arrays_of_empty_values_are_charged_per_entry_on_both_ingestion_paths() {
+    let annotation = json!({"type": "citations", "spans": vec![""; 100_000]});
+    let item = json!({
+        "id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+        "content": [text_part("small", std::slice::from_ref(&annotation))]
+    });
+
+    let (mut streamed, _) = budgeted(4096, Validation::Lenient);
+    feed(
+        &mut streamed,
+        &[created(), message_added("msg_1"), text_delta("msg_1", 0, "small")],
+    )
+    .unwrap();
+    let error = streamed
+        .process_line(line(&output_item_done(&item)))
+        .expect_err("100,000 empty annotation entries exceed a 4 KiB budget when streamed");
+    assert_budget_exceeded(&error);
+
+    let (mut json_path, _) = budgeted(4096, Validation::Strict);
+    let body = json!({"id": "resp_1", "status": "completed", "output": [item]}).to_string();
+    let error = json_path
+        .load_json_body(&body)
+        .expect_err("100,000 empty annotation entries exceed a 4 KiB budget in JSON");
+    assert_budget_exceeded(&error);
+}
+
+#[test]
+fn unrestricted_role_and_type_strings_are_charged_on_both_ingestion_paths() {
+    let oversized_role = json!({
+        "id": "msg_1", "type": "message", "role": "r".repeat(100_000), "status": "completed",
+        "content": [text_part("small", &[])]
+    });
+    let oversized_part_type = json!({
+        "id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+        "content": [{"type": "t".repeat(100_000), "text": "small", "annotations": []}]
+    });
+
+    for item in [oversized_role, oversized_part_type] {
+        let (mut streamed, _) = budgeted(4096, Validation::Lenient);
+        feed(
+            &mut streamed,
+            &[created(), message_added("msg_1"), text_delta("msg_1", 0, "small")],
+        )
+        .unwrap();
+        let error = streamed
+            .process_line(line(&output_item_done(&item)))
+            .expect_err("an unrestricted 100,000-byte string exceeds a 4 KiB budget when streamed");
+        assert_budget_exceeded(&error);
+
+        let (mut json_path, _) = budgeted(4096, Validation::Strict);
+        let body = json!({"id": "resp_1", "status": "completed", "output": [item]}).to_string();
+        let error = json_path
+            .load_json_body(&body)
+            .expect_err("an unrestricted 100,000-byte string exceeds a 4 KiB budget in JSON");
+        assert_budget_exceeded(&error);
+    }
+
+    let oversized_reasoning_status = json!({
+        "id": "rs_1", "type": "reasoning", "status": "s".repeat(100_000), "summary": [], "content": []
+    });
+    let (mut json_path, _) = budgeted(4096, Validation::Strict);
+    let body = json!({"id": "resp_1", "status": "completed", "output": [oversized_reasoning_status]}).to_string();
+    let error = json_path
+        .load_json_body(&body)
+        .expect_err("an unrestricted reasoning status exceeds a 4 KiB budget");
+    assert_budget_exceeded(&error);
+}
+
+#[test]
+fn sequential_reasoning_part_completions_charge_each_part_exactly_once() {
+    // Each completion measures only the part it inserted; the whole item is
+    // measured once at finalization, where it must agree with the running total.
+    let parts = 4_000_u32;
+    let (mut acc, budget) = budgeted(1 << 24, Validation::Lenient);
+    let added = json!({
+        "type": "response.output_item.added", "output_index": 0,
+        "item": {"id": "rs_1", "type": "reasoning", "summary": [], "content": [], "status": "in_progress"}
+    });
+    feed(&mut acc, &[created(), added]).unwrap();
+    let opening = budget.used();
+    for content_index in 0..parts {
+        acc.process_line(line(&json!({
+            "type": "response.reasoning_text.done", "output_index": 0, "item_id": "rs_1",
+            "content_index": content_index, "text": "x"
+        })))
+        .unwrap();
+    }
+    let expected_parts = usize::try_from(parts).unwrap() * ReasoningTextContent::new("x").retained_bytes();
+    assert_eq!(budget.used() - opening, expected_parts);
+
+    feed(&mut acc, &[completed(&[])]).unwrap();
+    let output = finished_output(acc);
+    assert_eq!(
+        budget.used(),
+        RETAINED_CONTAINER_OVERHEAD_BYTES + "resp_1".len() + output[0].retained_bytes(),
+        "finalization finds nothing left to reconcile"
+    );
 }

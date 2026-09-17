@@ -183,16 +183,33 @@ doesn't wait for upgraded connections, `AppState` carries a separate
 `WebSocketTracker` so shutdown can drain in-flight sessions.
 
 Executor streams propagate downstream backpressure through a bounded event channel.
-Upstream SSE lines are capped at 256 KiB, while normalized events are capped at 1 MiB.
-Each request also shares a 1 MiB response budget across MCP discovery, upstream rounds,
-and normalized gateway tool output, so a slow consumer cannot turn a fixed event-count
-buffer into unbounded retained memory. MCP discovery participates in the same 16-permit
-materialization window as gateway calls and is capped at 64 server declarations and
-128 discovered tools per request.
-The WebSocket transport queues only serialized, size-checked events, capped at
-1 MiB each including routing metadata, in its 64-entry outbound queue. Local
-completion validates both lifecycle events before persistence. Authentication is
-rechecked at request dispatch so queued work cannot start after identity expiry.
+Four independent `[responses]` limits bound the bytes in flight for one request, each
+owned by the stage that can measure it (defaults in `config.rs`; validation requires
+every wire limit to exceed the retained budget by proportional headroom):
+
+- `max_upstream_sse_line_bytes` — one upstream SSE line, enforced by the transport
+  (`inference.rs`) with a linear scan across chunks.
+- `max_upstream_json_bytes` — one non-streaming upstream body, enforced by the transport.
+- `max_retained_bytes` — the logical bytes a request retains across MCP discovery,
+  every upstream round, and gateway tool output. Synchronous ingestion charges it for
+  what output items actually keep (text, arguments, nested JSON, one container per
+  part), so it is invariant to upstream chunking; raw wire bytes never touch it. See
+  the `accumulator/` section for the accounting contract.
+- `max_stream_event_bytes` — one serialized client event, enforced by the relay
+  (`gateway_accumulator.rs`) for every forwarded and synthesized frame and by the
+  engine for the terminal `response.completed` frame, which is checked before the
+  response is persisted or a session checkpoint is published.
+
+MCP discovery participates in the same 16-permit materialization window as gateway
+calls and is capped at 64 server declarations and 128 discovered tools per request.
+The WebSocket transport queues only serialized, size-checked events in its 64-entry
+outbound queue. Its per-event ceiling is the same `max_stream_event_bytes`, so the
+queue holds at most 64 such events; the exact `stream_id` routing member plus a fixed
+slack is subtracted and passed to the executor as the effective transport limit
+(`ExecuteRequest::with_max_stream_event_bytes`), so a frame the socket cannot deliver
+is rejected by the executor before persistence rather than after. Local completion
+validates both lifecycle events before persistence. Authentication is rechecked at
+request dispatch so queued work cannot start after identity expiry.
 Errors are modeled by a dedicated `WsError` enum (`handler/websocket/error.rs`) rather
 than reusing the HTTP JSON-error path, since some failure modes (a dead socket) must
 not attempt to write a response.
@@ -476,8 +493,9 @@ call inference, run the tool loop, persist. `agentic-server` never reaches past 
   they do not remain pending at this boundary.
 - **`upstream.rs`** — the narrow adapter between inference transport and the pipeline.
   It builds `UpstreamRequest`s, snapshots registry classification facts into an owned
-  `TranslationContext`, charges the request-wide response budget, and passes each live
-  JSON or SSE body to `AgentPipeline`.
+  `TranslationContext`, threads the request-wide response budget into the round, and
+  passes each live JSON or SSE body to `AgentPipeline`. It charges nothing itself: wire
+  bytes are bounded by the transport and retained bytes by ingestion.
 - **`inference.rs`** — `call_inference()`: the raw HTTP/SSE transport to vLLM. No
   parsing beyond splitting `data: ...` lines and stopping at `[DONE]`.
 - **`pipeline.rs`, `pipeline/`** — `AgentPipeline`, the request-owned entry point for
@@ -585,17 +603,47 @@ The boundary contract is one owner and one path per concern:
 
 `ResponseAccumulator` owns validation, response lifecycle, typed output slots, delta
 folding, terminal error/incomplete state, usage, and final `ResponsePayload` assembly.
-`slot.rs` contains the typed active/completed slot model and `json.rs` contains strict
-JSON response-shape validation. Both JSON and SSE ultimately use the same finalization
-state.
+`slot.rs` owns identity and lifecycle: `SlotMap` resolves output indexes and item IDs,
+enforces active/completed transitions, rejects index reuse and conflicting repeated
+completion, and dispatches to the per-kind state in the private `active.rs`. `json.rs`
+contains strict JSON response-shape validation. Both JSON and SSE ultimately use the
+same finalization state.
 
 Output items are constructed through their `TryFrom<&EventPayload>` implementations in
-`types/io/output.rs`. Active slots fold deltas in place and use the type's `ApplyDone`
-implementation when its completion event arrives. For an already parsed output-item
-completion, the private `MergeDone` implementations in `accumulator/completion.rs`
-merge the concrete item with its retained fields and buffers. `slot.rs` dispatches
-to those implementations after validating identity and lifecycle. Finalization
-promotes each completed typed item once and preserves validated output-index order.
+`types/io/output.rs`. `active.rs` holds one state struct per streaming kind
+(`MessageState`, `ReasoningState`, `FunctionCallState`, `CustomToolCallState`,
+`ShellCallState`) that owns its buffers and applies its own incremental and completion
+updates; `ActiveItem` keeps the exhaustive enum dispatch. Completion uses the type's
+`ApplyDone` implementation for a raw completion event and the private `MergeDone`
+implementations in `accumulator/completion.rs` for an already parsed output item.
+There is one completion policy: the active state never re-derives what a merge will
+keep. Finalization promotes each completed typed item once and preserves validated
+output-index order.
+
+Retained-byte accounting for `max_retained_bytes` lives inside these same operations
+(`executor/response_budget.rs`):
+
+- `RetainedSize` is the single measurement of what an item keeps in memory: every
+  `String`, `Vec`, map, and JSON field plus a fixed container overhead per item,
+  content part, command, and JSON value. A field is omitted only when its owning type
+  enforces its bound (an enum status); strings that merely carry a wire vocabulary
+  (`role`, `type`) are counted. `ResponseAccumulator` uses it for JSON bodies and for
+  the opening `output_item.added` snapshot.
+- `RetainedAccount` is the only way a slot's charge changes: `charge` for growth known
+  before the state grows (a delta, a new part or index container — charged even when
+  the delta is empty), `grow` for a mutation whose growth is measured around the one
+  `ApplyDone`/`MergeDone` call that performs it, and `reconcile` to bring the account
+  up to the comprehensive measurement of the completed item at `output_item.done` and
+  at finalization. Reconciliation never refunds.
+- Deltas are charged by their own length. Completion updates measure only the part
+  they touch: a message part by content index, a function or custom call's buffer and
+  metadata, the shell command at its index, and the reasoning part reported by
+  `ReasoningOutput::apply_part_done`. Whole-item measurement happens once per item,
+  so completing N parts costs O(N).
+
+Repeated identical completion snapshots are free; a conflicting repeat is rejected.
+Gateway tool outputs are charged to the same budget by `gateway.rs` when they are
+produced, not when they are echoed in a later upstream round.
 
 The pipeline's streaming entry is `process_line(ClassifiedSseLine)`. It normalizes and
 validates a data line, applies the event to the slot keyed by its validated output
@@ -605,8 +653,11 @@ folded arguments. `finish` applies SSE end-of-stream policy; `finalize` preserve
 status loaded from a complete JSON body.
 
 When adding an output-item kind, extend its typed construction and completion logic in
-`types/io/output.rs`, the slot variants in `accumulator/slot.rs`, and the exhaustive
-transition and finalization matches in `accumulator/mod.rs`.
+`types/io/output.rs`, add its `RetainedSize` implementation in
+`executor/response_budget.rs`, add its state and `ActiveItem` variant in
+`accumulator/active.rs` (charging any incremental growth there), and extend the
+exhaustive transition and finalization matches in `accumulator/mod.rs`. Adding a
+variable-sized field to an existing kind is a `RetainedSize` change only.
 
 #### `translate/` — tool-specific public-shape translation
 
@@ -1045,7 +1096,9 @@ router, reusing the same core logic in-process.
 | Feed response output into the next inference round | `types/io/output.rs::OutputItem::to_input_item`; use `executor/gateway.rs::append_output_items_to_input` only to append those converted items |
 | Change continuation history visibility | `storage/types/item.rs::into_input_items` → `types/io/output.rs::to_input_item` (preservation) → `types/io/input.rs::model_input` (upstream visibility) |
 | Add a CRUD operation beyond persist/rehydrate | `executor/modes/conversation.rs` or `modes/response.rs`, backed by `storage/conversation.rs` / `storage/response.rs` |
-| Change how output items are assembled from a stream | `executor/accumulator/` — extend the typed slot and transition matches through the existing `RoundIngestion` path |
+| Change how output items are assembled from a stream | `executor/accumulator/` — extend the per-kind state in `active.rs` and the transition matches through the existing `RoundIngestion` path |
+| Change what counts toward the retained response budget | `executor/response_budget.rs::RetainedSize` for the measurement; `accumulator/active.rs` only if a new incremental event grows state |
+| Change a client-facing event or transport size limit | `config.rs::ResponsesConfig` (defaults, validation) and the stage that enforces it: `inference.rs` (upstream), `gateway_accumulator.rs` (relay), `handler/websocket/responses.rs` (socket) |
 | Add a new Responses/Messages wire field | `types/io/` or `types/messages/` — shape only, no behavior |
 
 ## Further reading
