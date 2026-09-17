@@ -32,6 +32,13 @@ All notable changes to Agentic API are documented here.
   text/image ordering, multiple images per turn, client-executed `view_image` tool output, `previous_response_id`
   continuation, `conversation_id` rehydration, stateless `store: false` proxying, and compaction of retained
   image-bearing user messages, over both the HTTP and WebSocket transports.
+- Recorded paired image cassettes — client → OpenAI as the reference and client → gateway → vLLM serving
+  `Qwen/Qwen2.5-VL-3B-Instruct` — for a text-and-image message, two interleaved images, a `previous_response_id`
+  follow-up, and a client-executed tool returning an image through a structured `function_call_output`, each
+  streaming and non-streaming. Replay coverage compares request shape, completed-response structure, the streaming
+  event lifecycle, and the history the gateway forwards on continuation; model wording is never compared (#253).
+  The cassette recorder accepts `--input-file` for the first of several turns and sends a tool handler's list of
+  content parts as a structured output array.
 
 ### Changed
 
