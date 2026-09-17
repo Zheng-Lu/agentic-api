@@ -18,8 +18,8 @@ use tracing::{debug, warn};
 
 use agentic_core::ResponseUsage;
 use agentic_core::executor::{
-    BoxStream, ExecuteRequest, ExecutorError, RequestContext, ResourceLimit, ResponseSession, ResponseSessionGroup,
-    persist_turn, rehydrate_in_session,
+    BoxStream, ExecuteRequest, ExecutorError, RequestContext, ResponseSession, ResponseSessionGroup, persist_turn,
+    rehydrate_in_session,
 };
 use agentic_core::types::request_response::RequestPayload;
 use agentic_core::utils::common::utcnow_str;
@@ -29,110 +29,25 @@ use super::error::WsError;
 use crate::app::AppState;
 use crate::auth::AuthenticatedPrincipal;
 
+mod event;
+use event::{StreamId, WsEventLimit, WsOutboundEvent};
+#[cfg(test)]
+use event::{WS_MAX_STREAM_ID_CHARS, WS_ROUTING_SLACK_BYTES, attach_stream_id, ws_routing_overhead};
+
 type WsSender = SplitSink<WebSocket, Message>;
 
 /// Outbound events queued ahead of the socket writer. Each entry is bounded by
 /// the configured `max_stream_event_bytes`, so the queue holds at most
 /// `WS_OUTBOUND_BUFFER * max_stream_event_bytes` serialized bytes.
 const WS_OUTBOUND_BUFFER: usize = 64;
-/// Slack reserved beyond the exact `stream_id` member for re-serialization of
-/// a parsed executor frame (number formatting, key order) so the executor's
-/// own frame check remains a sufficient guard for the WebSocket envelope.
-const WS_ROUTING_SLACK_BYTES: usize = 256;
 const WS_MAX_OUTSTANDING_REQUESTS: usize = 64;
 const WS_MAX_OUTSTANDING_BYTES: usize = 12 * 1024 * 1024;
-const WS_MAX_STREAM_ID_CHARS: usize = 256;
 // Retained state is bounded separately from queued requests and outbound events.
 // Limits cover serialized checkpoints, including pinned parents and replacements.
 const WS_MAX_SESSION_LANES: usize = 128;
 const WS_MAX_CHECKPOINT_ITEMS: usize = 32_768;
 const WS_MAX_CHECKPOINT_BYTES: usize = 16 * 1024 * 1024;
 const WS_MAX_RETAINED_BYTES: usize = 32 * 1024 * 1024;
-
-/// Maximum serialized size of one outbound WebSocket event, including routing
-/// metadata. Derived from the gateway's configured `max_stream_event_bytes` so
-/// the socket can deliver every frame the executor is allowed to produce.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct WsEventLimit(usize);
-
-impl WsEventLimit {
-    fn from_state(state: &AppState) -> Self {
-        Self(state.exec_ctx.responses_config.max_stream_event_bytes)
-    }
-
-    fn bytes(self) -> usize {
-        self.0
-    }
-
-    /// The limit the executor must apply to its own frames so that, once the
-    /// `stream_id` routing member is attached, the event still fits this
-    /// transport. Validated by the executor before persistence or checkpoint
-    /// publication, so an undeliverable terminal frame never leaves a stored
-    /// response behind.
-    fn executor_limit(self, stream_id: Option<&StreamId>) -> usize {
-        self.0.saturating_sub(ws_routing_overhead(stream_id))
-    }
-}
-
-/// Bytes the WebSocket envelope adds to an executor frame: the serialized
-/// `"stream_id":<json string>,` member plus re-serialization slack.
-fn ws_routing_overhead(stream_id: Option<&StreamId>) -> usize {
-    let member = stream_id.map_or(0, |stream_id| {
-        let value = serde_json::to_string(stream_id.as_str()).map_or(stream_id.as_str().len() * 2 + 2, |s| s.len());
-        "\"stream_id\":".len() + value + 1
-    });
-    member + WS_ROUTING_SLACK_BYTES
-}
-
-/// Serialized and size-checked before entering the bounded outbound queue.
-struct WsOutboundEvent(String);
-
-impl WsOutboundEvent {
-    fn new(value: Value, stream_id: Option<&StreamId>, limit: WsEventLimit) -> Result<Self, WsError> {
-        let value = attach_stream_id(value, stream_id)?;
-        let text = serde_json::to_string(&value).map_err(WsError::SerializeJson)?;
-        if text.len() > limit.bytes() {
-            return Err(WsError::from(ExecutorError::ResourceLimitExceeded {
-                limit: ResourceLimit::StreamEvent,
-                max_bytes: limit.bytes(),
-            }));
-        }
-        Ok(Self(text))
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
-#[serde(try_from = "String")]
-struct StreamId(String);
-
-impl StreamId {
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for StreamId {
-    type Error = String;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        let character_count = value.chars().count();
-        if (1..=WS_MAX_STREAM_ID_CHARS).contains(&character_count) {
-            Ok(Self(value))
-        } else {
-            Err(format!(
-                "stream_id must contain between 1 and {WS_MAX_STREAM_ID_CHARS} characters"
-            ))
-        }
-    }
-}
-
-impl TryFrom<&str> for StreamId {
-    type Error = String;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::try_from(value.to_owned())
-    }
-}
 
 struct WsRequest {
     payload: RequestPayload,
@@ -869,20 +784,6 @@ async fn forward_ws_stream_chunk(
         queue_ws_json(outbound_tx, value, stream_id, event_limit).await?;
     }
     Ok(())
-}
-
-fn attach_stream_id(mut value: Value, stream_id: Option<&StreamId>) -> Result<Value, WsError> {
-    let event = value.as_object_mut().ok_or_else(|| {
-        WsError::from(ExecutorError::StreamError(
-            "upstream WebSocket event must be a JSON object".to_owned(),
-        ))
-    })?;
-    if let Some(stream_id) = stream_id {
-        event.insert("stream_id".to_owned(), Value::String(stream_id.as_str().to_owned()));
-    } else {
-        event.remove("stream_id");
-    }
-    Ok(value)
 }
 
 async fn queue_ws_json(

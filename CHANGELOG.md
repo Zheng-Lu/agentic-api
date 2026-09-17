@@ -4,11 +4,43 @@ All notable changes to Agentic API are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Added Brave Search as a selectable backend for the gateway-owned `web_search` tool (#294, Phase 2 of #291).
+  Select it with `AGENTIC_WEB_SEARCH_PROVIDER=brave` or `[web_search] provider = "brave"` and supply `BRAVE_API_KEY`;
+  the endpoint defaults to `https://api.search.brave.com` and can be overridden with `AGENTIC_WEB_SEARCH_BASE_URL`
+  or `[web_search] base_url`. Web and news results come from one request per query. The gateway adapts the shared
+  tool contract: `allowed_domains` / `blocked_domains` and the model's `include_domains` / `exclude_domains` are
+  enforced client-side on a label boundary, `count` is clamped to Brave's maximum of 20, `freshness` is rendered in
+  Brave syntax, `language` maps to `search_lang`, and the You.com-specific `livecrawl`, `livecrawl_formats`,
+  `crawl_timeout`, and `boost_domains` arguments are ignored. Rejected credentials and HTTP 429 responses fail the
+  `web_search_call` without an automatic retry, naming the key variable or the upstream `Retry-After` value and never
+  echoing the secret. Each Brave `metadata[]` entry carries `"provider": "brave"`.
+- Added `[web_search] max_concurrent_queries` and `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES` to cap concurrent
+  provider requests inside one batched search. Brave defaults to `1` for its free-plan rate limit; You.com keeps
+  inheriting `max_concurrent_gateway_calls`. The effective ceiling is the smallest of the gateway limit, this
+  override, and the provider's own ceiling.
+
+### Changed
+
+- `WebSearchProviderConfig` is now `#[non_exhaustive]` and gains `provider` and `max_concurrent_queries` fields;
+  construct it with `WebSearchProviderConfig::new(api_key, base_url)` plus the `with_provider` and
+  `with_max_concurrent_queries` builders. Downstream crates that built it with a struct literal must switch to the
+  constructor; field reads and `Default` are unchanged. `WebSearchProviderKind` gains a `Brave` variant, `FromStr`
+  (case-insensitive), `default_base_url`, `default_max_concurrent_queries`, and `config_name`;
+  `WebSearchHandler::from_config` builds the handler for the selected provider and `GatewayExecutors::from_config`
+  uses it. With `provider` unset, You.com behavior, configuration, and model-facing output are unchanged; a generated
+  `config.toml` now records `provider = "you"` and leaves `api_key_env` unset so provider switches select the matching
+  default credential variable.
+
 ### Fixed
 
+- Accounted for unrestricted output role/type/status strings, empty web-search query entries, pending or late-bound
+  item identities, and terminal error details in response limits. Kept reasoning-part and shell-command completion
+  accounting linear for sequential multipart streams (#304).
 - Charged the Responses retained-byte budget for logical output (text, arguments, annotations, nested JSON, and one
-  container per content part) instead of raw upstream SSE line bytes, so fine-grained chunking, coarse chunking, and
-  non-streaming JSON consume identical budget, and empty or done-only parts are charged as they arrive (#288, #304).
+  structural charge per retained entry, including empty JSON values) instead of raw upstream SSE line bytes, so fine-grained
+  chunking, coarse chunking, and non-streaming JSON consume identical budget, and empty or done-only parts are charged as they arrive (#288, #304).
 - Replaced the fixed 1 MiB Responses WebSocket event ceiling with the configured `max_stream_event_bytes`; the
   executor now validates the terminal `response.completed` event against the WebSocket transport limit, including
   `stream_id` routing metadata, before persisting the response or publishing a session checkpoint (#304).
@@ -97,6 +129,17 @@ All notable changes to Agentic API are documented here.
   stream, and bounded concurrency across streams (#240).
 - Added compile-time OpenAPI 3.1 schema generation and checked-in schema validation for the HTTP API (#229).
 - Added pinned SGLang conformance recordings, replay coverage, and launch and recording guidance (#267).
+- Verified image preservation through the Responses gateway end to end (#253): integration coverage for mixed
+  text/image ordering, multiple images per turn, client-executed `view_image` tool output, `previous_response_id`
+  continuation, `conversation_id` rehydration, stateless `store: false` proxying, and compaction of retained
+  image-bearing user messages, over both the HTTP and WebSocket transports.
+- Recorded paired image cassettes — client → OpenAI as the reference and client → gateway → vLLM serving
+  `Qwen/Qwen2.5-VL-3B-Instruct` — for a text-and-image message, two interleaved images, a `previous_response_id`
+  follow-up, and a client-executed tool returning an image through a structured `function_call_output`, each
+  streaming and non-streaming. Replay coverage compares request shape, completed-response structure, the streaming
+  event lifecycle, and the history the gateway forwards on continuation; model wording is never compared (#253).
+  The cassette recorder accepts `--input-file` for the first of several turns and sends a tool handler's list of
+  content parts as a structured output array.
 
 ### Changed
 
@@ -112,6 +155,8 @@ All notable changes to Agentic API are documented here.
   architecture (#246).
 - Updated the execution architecture documentation to match the current scheduler and llm-d backend (#270).
 - Preserved the typed `ignore_eos` extension when forwarding Responses requests to vLLM (#268).
+- Modeled `refusal` as an assistant-history content part so OpenAI-style history replays through the typed
+  Responses executor instead of being rejected as unmodeled (#253).
 
 ### Fixed
 
@@ -123,6 +168,12 @@ All notable changes to Agentic API are documented here.
 - Required a healthy packaged gateway before `agentic-api doctor --mode local` reports success (#223).
 - Rebuilt workspace crates after `cargo-chef` dependency cooking so container binaries carry current source and package
   metadata (#208, #209).
+- Rejected message content the typed Responses executor cannot convey — unmodeled part types and empty part arrays,
+  alongside the existing `input_file` rejection — with a `400` naming the offending part, instead of forwarding a
+  synthetic `{"type": "unknown"}` part or silently dropping it. Modeled parts keep their unmodeled extension fields
+  through the typed path, so a message is never mutated in transit, never means something different on the typed
+  path than on the raw `store: false` path, and is never persisted with content the client did not send (#253).
+- Counted an image referenced by `file_id` as retained context during compaction, matching inline images (#253).
 - Hardened split execution with atomic duplicate persistence, strict relayed-response validation, independent secret
   validation, bounded hydrate and persist payloads, stable error envelopes, and graceful shutdown error propagation
   (#235).

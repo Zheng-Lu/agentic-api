@@ -18,6 +18,7 @@ use crate::types::io::{
     CompactionItem, CustomToolCall, FunctionToolCall, McpCall, McpCallError, OutputItem, OutputMessage,
     OutputTextContent, ReasoningOutput, ShellCall, ToolSearchCall, WebSearchAction, WebSearchCall,
 };
+use crate::types::request_response::IncompleteDetails;
 #[cfg(test)]
 use crate::types::request_response::ResponsePayload;
 
@@ -134,10 +135,9 @@ impl RetainedAccount {
 /// Bytes an item keeps in executor memory once retained.
 ///
 /// Counts every variable-sized field (identifiers, text, arguments, nested
-/// JSON) plus [`RETAINED_CONTAINER_OVERHEAD_BYTES`] per container. Fixed-vocabulary
-/// fields (`type`, `role`, `status`) are not counted: they are bounded by the
-/// enum they encode and would make in-progress and completed snapshots of the
-/// same item measure differently.
+/// JSON) plus [`RETAINED_CONTAINER_OVERHEAD_BYTES`] per container or JSON value.
+/// Only fields represented by bounded enums are excluded. String-valued types,
+/// roles, and statuses are measured even when their usual vocabulary is fixed.
 pub(in crate::executor) trait RetainedSize {
     fn retained_bytes(&self) -> usize;
 }
@@ -153,20 +153,18 @@ fn sum_retained<'a, T: RetainedSize + 'a>(items: impl IntoIterator<Item = &'a T>
 impl RetainedSize for Value {
     /// Approximates the serialized footprint of arbitrary JSON without serializing it.
     fn retained_bytes(&self) -> usize {
-        match self {
-            Value::Null => 4,
-            Value::Bool(_) => 5,
-            Value::Number(_) => 8,
-            Value::String(text) => text.len(),
-            Value::Array(items) => RETAINED_CONTAINER_OVERHEAD_BYTES + sum_retained(items),
-            Value::Object(map) => {
-                RETAINED_CONTAINER_OVERHEAD_BYTES
-                    + map
-                        .iter()
-                        .map(|(key, value)| key.len() + value.retained_bytes())
-                        .sum::<usize>()
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + match self {
+                Value::Null => 4,
+                Value::Bool(_) => 5,
+                Value::Number(_) => 8,
+                Value::String(text) => text.len(),
+                Value::Array(items) => sum_retained(items),
+                Value::Object(map) => map
+                    .iter()
+                    .map(|(key, value)| key.len() + value.retained_bytes())
+                    .sum::<usize>(),
             }
-        }
     }
 }
 
@@ -176,15 +174,21 @@ impl<T: RetainedSize> RetainedSize for Option<T> {
     }
 }
 
+impl RetainedSize for IncompleteDetails {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES + opt_len(self.reason.as_ref())
+    }
+}
+
 impl RetainedSize for OutputTextContent {
     fn retained_bytes(&self) -> usize {
-        RETAINED_CONTAINER_OVERHEAD_BYTES + self.text.len() + sum_retained(&self.annotations)
+        RETAINED_CONTAINER_OVERHEAD_BYTES + self.type_.len() + self.text.len() + sum_retained(&self.annotations)
     }
 }
 
 impl RetainedSize for OutputMessage {
     fn retained_bytes(&self) -> usize {
-        RETAINED_CONTAINER_OVERHEAD_BYTES + self.id.len() + sum_retained(&self.content)
+        RETAINED_CONTAINER_OVERHEAD_BYTES + self.id.len() + self.role.len() + sum_retained(&self.content)
     }
 }
 
@@ -225,7 +229,7 @@ impl RetainedSize for ShellCall {
 
 impl RetainedSize for ReasoningTextContent {
     fn retained_bytes(&self) -> usize {
-        RETAINED_CONTAINER_OVERHEAD_BYTES + self.text.len()
+        RETAINED_CONTAINER_OVERHEAD_BYTES + self.type_.len() + self.text.len()
     }
 }
 
@@ -233,6 +237,7 @@ impl RetainedSize for ReasoningOutput {
     fn retained_bytes(&self) -> usize {
         RETAINED_CONTAINER_OVERHEAD_BYTES
             + self.id.len()
+            + opt_len(self.status.as_ref())
             + self.encrypted_content.retained_bytes()
             + sum_retained(&self.content)
             + sum_retained(&self.summary)
@@ -249,8 +254,13 @@ impl RetainedSize for WebSearchAction {
     fn retained_bytes(&self) -> usize {
         match self {
             Self::Search(search) => {
-                search.query.len()
-                    + search.queries.iter().map(String::len).sum::<usize>()
+                search.type_.len()
+                    + search.query.len()
+                    + search
+                        .queries
+                        .iter()
+                        .map(|query| RETAINED_CONTAINER_OVERHEAD_BYTES + query.len())
+                        .sum::<usize>()
                     + search
                         .sources
                         .iter()
@@ -274,11 +284,13 @@ impl RetainedSize for WebSearchCall {
 impl RetainedSize for McpToolExecutionError {
     fn retained_bytes(&self) -> usize {
         RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.type_.len()
             + self
                 .content
                 .iter()
                 .map(|content| {
                     RETAINED_CONTAINER_OVERHEAD_BYTES
+                        + content.type_.len()
                         + content.text.len()
                         + content.annotations.retained_bytes()
                         + content.meta.retained_bytes()
@@ -366,6 +378,8 @@ pub(in crate::executor) fn retained_response_parts_bytes(response_id: &str, outp
 #[cfg(test)]
 pub(in crate::executor) fn retained_response_bytes(response: &ResponsePayload) -> usize {
     retained_response_parts_bytes(&response.id, &response.output)
+        + response.incomplete_details.retained_bytes()
+        + response.error.retained_bytes()
 }
 
 #[cfg(test)]
@@ -412,7 +426,11 @@ mod tests {
         // `query` mirrors the first entry of `queries` and is retained separately.
         assert_eq!(
             retained_output_item_bytes(&ws_search),
-            RETAINED_CONTAINER_OVERHEAD_BYTES + "ws_1".len() + "query1".len() + ("query1".len() + "q2".len())
+            RETAINED_CONTAINER_OVERHEAD_BYTES * 3
+                + "search".len()
+                + "ws_1".len()
+                + "query1".len()
+                + ("query1".len() + "q2".len())
         );
 
         let ws_open = OutputItem::WebSearchCall(WebSearchCall {
@@ -472,7 +490,10 @@ mod tests {
             retained_output_item_bytes(&reasoning),
             RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "rs_1".len()
+                + "completed".len()
+                + RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "encrypted_blob".len()
+                + "reasoning_text".len()
                 + RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "thought".len()
         );
@@ -489,6 +510,8 @@ mod tests {
             retained_output_item_bytes(&OutputItem::Message(message)),
             RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "msg_1".len()
+                + "assistant".len()
+                + "output_text".len()
                 + RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "body".len()
                 + annotation.retained_bytes()

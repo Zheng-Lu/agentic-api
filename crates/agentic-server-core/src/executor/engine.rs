@@ -5,10 +5,15 @@
 //! primary entry point; [`execute`] is a convenience shim for callers that don't
 //! need per-request configuration.
 
+mod streaming;
+#[cfg(test)]
+use streaming::panicked_stream_chunks;
+use streaming::run_stream;
+
 use std::sync::Arc;
 
-use async_stream::stream;
 use either::Either;
+#[cfg(test)]
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -18,9 +23,11 @@ use super::gateway::{
     append_tool_outputs, compaction_event_plans, emit_gateway_completed_events, emit_gateway_start_events,
     emit_response_start_events, execute_and_emit_output_calls, has_client_owned_calls, public_output_items,
 };
-use super::gateway_accumulator::{GatewayStreamAccumulator, STREAM_EVENT_BUFFER, StreamEvent, error_sse_chunk};
+#[cfg(test)]
+use super::gateway_accumulator::{GatewayStreamAccumulator, STREAM_EVENT_BUFFER, StreamEvent};
 use crate::events::EventFrame;
-use crate::executor::error::{ExecutorError, ExecutorResult};
+use crate::executor::error::ExecutorResult;
+#[cfg(test)]
 use crate::executor::inference::DONE_MARKER;
 use crate::executor::persist::persist_if_needed;
 use crate::executor::pipeline::{AgentPipeline, emit_deferred_stream_events};
@@ -109,38 +116,6 @@ fn add_usage(total: ResponseUsage, usage: ResponseUsage) -> ResponseUsage {
 fn accumulate_usage(total: &mut Option<ResponseUsage>, usage: Option<ResponseUsage>) {
     if let Some(usage) = usage {
         *total = Some(total.map_or(usage, |current| add_usage(current, usage)));
-    }
-}
-
-struct AbortOnDrop<T> {
-    handle: tokio::task::JoinHandle<T>,
-}
-
-impl<T> AbortOnDrop<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self { handle }
-    }
-}
-
-impl<T> std::ops::Deref for AbortOnDrop<T> {
-    type Target = tokio::task::JoinHandle<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.handle
-    }
-}
-
-impl<T> std::ops::DerefMut for AbortOnDrop<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.handle
-    }
-}
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        if !self.handle.is_finished() {
-            self.handle.abort();
-        }
     }
 }
 
@@ -555,178 +530,6 @@ async fn run_blocking(
     Ok(payload)
 }
 
-/// `max_stream_event_bytes` is the effective limit for one serialized client
-/// event on the transport that will deliver this stream. The terminal
-/// `response.completed` frame is validated against it before the response is
-/// persisted or a session checkpoint is published, so a frame the transport
-/// cannot deliver never leaves a stored response behind.
-fn run_stream(
-    ctx: RequestContext,
-    tool_search_state: Option<ToolSearchState>,
-    exec_ctx: Arc<ExecutionContext>,
-    auth: Option<String>,
-    max_stream_event_bytes: usize,
-) -> BoxStream {
-    Box::pin(stream! {
-        let failure_context = StreamFailureContext::from(&ctx);
-        let (event_tx, mut event_rx) = mpsc::channel(STREAM_EVENT_BUFFER);
-        let exec_ctx_for_run = Arc::clone(&exec_ctx);
-        let event_tx_for_run = event_tx.clone();
-        let mut agent = agent_pipeline_with_limits(
-            ctx,
-            tool_search_state,
-            Some(event_tx_for_run),
-            max_stream_event_bytes,
-        );
-        let mut run_handle = AbortOnDrop::new(tokio::spawn(async move {
-            let result = run_until_gateway_tools_complete(
-                &mut agent,
-                exec_ctx_for_run.as_ref(),
-                auth.as_deref(),
-                true,
-            )
-            .await;
-            let (ctx, stream_accumulator) = agent.into_parts();
-            (result.map(|(payload, metadata)| (payload, ctx, metadata)), stream_accumulator)
-        }));
-
-        let mut next_sequence_number = 0;
-        loop {
-            tokio::select! {
-                Some(event) = event_rx.recv() => {
-                    yield consume_stream_event(event, &mut next_sequence_number);
-                }
-                result = &mut run_handle.handle => {
-                    match result {
-                        Err(e) => {
-                            for chunk in panicked_stream_chunks(&e, &mut event_rx, &mut next_sequence_number) {
-                                yield chunk;
-                            }
-                        }
-                        Ok((Err(e), mut stream_accumulator)) => {
-                            while let Ok(event) = event_rx.try_recv() {
-                                yield consume_stream_event(event, &mut next_sequence_number);
-                            }
-                            if e.is_invalid_upstream_tool_search() {
-                                let payload = failure_context.failed_payload(&e);
-                                match stream_accumulator.terminal_response_chunk(&payload) {
-                                    Ok(chunk) => yield chunk,
-                                    Err(serialize_error) => {
-                                        yield GatewayStreamAccumulator::executor_error_chunk_at(
-                                            &serialize_error,
-                                            next_sequence_number,
-                                        );
-                                    }
-                                }
-                            } else {
-                                yield GatewayStreamAccumulator::executor_error_chunk_at(&e, next_sequence_number);
-                            }
-                            yield DONE_MARKER.to_string();
-                        }
-                        Ok((Ok((payload, ctx, tool_search_metadata)), stream_accumulator)) => {
-                            while let Ok(event) = event_rx.try_recv() {
-                                yield consume_stream_event(event, &mut next_sequence_number);
-                            }
-                            // Codex may close its WebSocket as soon as it receives
-                            // `response.completed`. Persist before exposing that
-                            // event so a custom call/output continuation cannot be
-                            // cancelled by the client disconnect.
-                            let ch = exec_ctx.conv_handler.clone();
-                            let rh = exec_ctx.resp_handler.clone();
-                            let mut terminal_accumulator = stream_accumulator.clone();
-                            let terminal_chunk = terminal_accumulator.terminal_response_chunk(&payload);
-                            match terminal_chunk {
-                                Err(e) => {
-                                    yield GatewayStreamAccumulator::executor_error_chunk_at(&e, next_sequence_number);
-                                }
-                                Ok(chunk) => match persist_if_needed(payload, ctx, tool_search_metadata, ch, rh).await {
-                                    Ok(()) => yield chunk,
-                                    Err(e) => {
-                                        yield GatewayStreamAccumulator::executor_error_chunk_at(
-                                            &e,
-                                            next_sequence_number,
-                                        );
-                                    }
-                                }
-                            }
-                            yield DONE_MARKER.to_string();
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-    })
-}
-
-struct StreamFailureContext {
-    response_id: String,
-    conversation_id: Option<String>,
-    model: String,
-    previous_response_id: Option<String>,
-    instructions: Option<String>,
-}
-
-impl From<&RequestContext> for StreamFailureContext {
-    fn from(ctx: &RequestContext) -> Self {
-        Self {
-            response_id: ctx.response_id.clone(),
-            conversation_id: ctx.conversation_id.clone(),
-            model: ctx.enriched_request.model.clone(),
-            previous_response_id: ctx.original_request.previous_response_id.clone(),
-            instructions: ctx.original_request.instructions.clone(),
-        }
-    }
-}
-
-impl StreamFailureContext {
-    fn failed_payload(&self, error: &ExecutorError) -> ResponsePayload {
-        ResponsePayload {
-            id: self.response_id.clone(),
-            object: "response".to_owned(),
-            created_at: utcnow_str(),
-            model: self.model.clone(),
-            status: "failed".to_owned(),
-            output: Vec::new(),
-            usage: None,
-            incomplete_details: None,
-            error: Some(serde_json::json!({
-                "message": error.error_message(),
-                "type": error.error_type(),
-                "code": error.error_code(),
-            })),
-            previous_response_id: self.previous_response_id.clone(),
-            conversation_id: self.conversation_id.clone(),
-            instructions: self.instructions.clone(),
-            tools: None,
-            tool_choice: None,
-        }
-    }
-}
-
-fn consume_stream_event(event: StreamEvent, next_sequence_number: &mut u64) -> String {
-    *next_sequence_number = event.sequence_number.saturating_add(1);
-    event.content
-}
-
-fn stream_task_failure_chunk(error: &tokio::task::JoinError, sequence_number: u64) -> String {
-    error_sse_chunk(&format!("stream task failed: {error}"), sequence_number)
-}
-
-fn panicked_stream_chunks(
-    error: &tokio::task::JoinError,
-    event_rx: &mut mpsc::Receiver<StreamEvent>,
-    next_sequence_number: &mut u64,
-) -> Vec<String> {
-    let mut chunks = Vec::new();
-    while let Ok(event) = event_rx.try_recv() {
-        chunks.push(consume_stream_event(event, next_sequence_number));
-    }
-    chunks.push(stream_task_failure_chunk(error, *next_sequence_number));
-    chunks.push(DONE_MARKER.to_owned());
-    chunks
-}
-
 /// Create a new conversation and return its data.
 ///
 /// Exposes the conversation-creation step as a standalone function so callers
@@ -734,7 +537,7 @@ fn panicked_stream_chunks(
 /// conversation before submitting response turns.
 ///
 /// # Errors
-/// Returns [`ExecutorError`] if the conversation store is unavailable.
+/// Returns [`crate::executor::error::ExecutorError`] if the conversation store is unavailable.
 pub async fn create_conversation(exec_ctx: &ExecutionContext) -> ExecutorResult<crate::ConversationData> {
     exec_ctx.conv_handler.create().await
 }
@@ -803,7 +606,7 @@ impl ExecuteRequest {
     /// a complete SSE frame ready to forward to the client.
     ///
     /// # Errors
-    /// Returns [`ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
+    /// Returns [`crate::executor::error::ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
     pub async fn run(self) -> ExecutorResult<Either<ResponsePayload, BoxStream>> {
         debug!(
             model = %self.payload.model,
@@ -850,7 +653,7 @@ impl ExecuteRequest {
 /// Thin shim over [`ExecuteRequest`] for callers that don't need per-request auth override.
 ///
 /// # Errors
-/// Returns [`ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
+/// Returns [`crate::executor::error::ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
 pub async fn execute(
     request: RequestPayload,
     exec_ctx: Arc<ExecutionContext>,

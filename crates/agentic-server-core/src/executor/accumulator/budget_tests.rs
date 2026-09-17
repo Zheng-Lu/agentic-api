@@ -226,7 +226,7 @@ fn empty_multipart_entries_are_charged_and_exhaust_the_budget_promptly() {
     let (mut acc, budget) = budgeted(limit, Validation::Lenient);
     feed(&mut acc, &[created(), message_added("msg_1")]).unwrap();
     let opening = budget.used();
-    let affordable = (limit - opening) / RETAINED_CONTAINER_OVERHEAD_BYTES;
+    let affordable = (limit - opening) / (RETAINED_CONTAINER_OVERHEAD_BYTES + "output_text".len());
 
     let mut rejected_at = None;
     for content_index in 0..100_000_u32 {
@@ -276,7 +276,7 @@ fn reasoning_streamed_indexes_charge_containers_and_reconcile_with_done_text() {
     // Container already charged with the first delta; done grows the text by 3.
     assert_eq!(
         budget.used() - opening,
-        3 * RETAINED_CONTAINER_OVERHEAD_BYTES + "abcdef".len()
+        3 * RETAINED_CONTAINER_OVERHEAD_BYTES + "reasoning_text".len() + "abcdef".len()
     );
 }
 
@@ -417,4 +417,290 @@ fn oversized_tool_search_arguments_are_rejected_recursively() {
         .load_json_body(&body)
         .expect_err("nested tool-search arguments past the budget are rejected");
     assert_budget_exceeded(&error);
+}
+
+fn reject_item_on_both_paths(item: &Value) {
+    let (mut streamed, _) = budgeted(4096, Validation::Lenient);
+    let mut added = item.clone();
+    added["status"] = json!("in_progress");
+    let error = feed(
+        &mut streamed,
+        &[
+            created(),
+            json!({"type":"response.output_item.added", "output_index":0, "item":added}),
+            output_item_done(item),
+        ],
+    )
+    .expect_err("oversized retained item must fail during SSE completion");
+    assert_budget_exceeded(&error);
+    let (mut json_path, _) = budgeted(4096, Validation::Lenient);
+    let body = json!({"id":"resp_1", "status":"completed", "output":[item]}).to_string();
+    let error = json_path
+        .load_json_body(&body)
+        .expect_err("oversized retained item must fail during JSON ingestion");
+    assert_budget_exceeded(&error);
+}
+
+#[test]
+fn nested_empty_json_values_exhaust_retained_budget_on_both_paths() {
+    for annotation in [json!(vec![""; 100_000]), json!({"nested":[vec![""; 100_000]]})] {
+        reject_item_on_both_paths(&json!({
+            "id":"msg_1", "type":"message", "role":"assistant", "status":"completed",
+            "content":[text_part("small", &[annotation])]
+        }));
+    }
+}
+
+#[test]
+fn unrestricted_retained_strings_exhaust_budget_on_both_paths() {
+    let huge = "x".repeat(100_000);
+    for item in [
+        json!({"id":"msg_1","type":"message","role":huge,"status":"completed","content":[]}),
+        json!({"id":"msg_1","type":"message","role":"assistant","status":"completed",
+            "content":[{"type":huge,"text":"","annotations":[]}]}),
+        json!({"id":"rs_1","type":"reasoning","status":huge,"content":[],"summary":[]}),
+        json!({"id":"rs_1","type":"reasoning","content":[{"type":huge,"text":""}],"summary":[]}),
+        json!({"id":"mcp_1","type":"mcp_call","server_label":"s","name":"tool","arguments":"{}",
+            "error":{"type":huge,"content":[]}}),
+        json!({"id":"mcp_1","type":"mcp_call","server_label":"s","name":"tool","arguments":"{}",
+            "error":{"type":"mcp_tool_execution_error","content":[{"type":huge,"text":""}]}}),
+    ] {
+        reject_item_on_both_paths(&item);
+    }
+}
+
+#[test]
+#[ignore = "manual scaling measurement: run with --ignored --nocapture"]
+fn reasoning_completion_accounting_scaling() {
+    for count in [4_000, 8_000, 16_000] {
+        let (mut acc, _) = budgeted(16 << 20, Validation::Lenient);
+        feed(
+            &mut acc,
+            &[
+                created(),
+                json!({"type":"response.output_item.added","output_index":0,
+            "item":{"id":"rs_1","type":"reasoning","content":[],"summary":[]}}),
+            ],
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        for index in 0..count {
+            acc.process_line(line(&json!({"type":"response.reasoning_text.done","output_index":0,
+                "item_id":"rs_1","content_index":index,"text":"x"})))
+                .unwrap();
+        }
+        eprintln!("reasoning completion: {count} parts in {:?}", started.elapsed());
+        let output = finished_output(acc);
+        let OutputItem::Reasoning(item) = &output[0] else {
+            panic!("reasoning item")
+        };
+        assert_eq!(item.content.len(), usize::try_from(count).unwrap());
+    }
+}
+
+#[test]
+fn empty_web_search_queries_exhaust_budget_on_both_paths() {
+    reject_item_on_both_paths(&json!({"id":"ws_1", "type":"web_search_call", "status":"completed",
+        "action":{"type":"search", "query":"", "queries":vec![""; 100_000]}}));
+}
+
+#[test]
+fn reasoning_completion_accounts_for_sparse_repeated_and_empty_parts() {
+    for (delta_kind, done_kind, index_field) in [
+        (
+            "response.reasoning_text.delta",
+            "response.reasoning_text.done",
+            "content_index",
+        ),
+        (
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "summary_index",
+        ),
+    ] {
+        let (mut acc, budget) = budgeted(1 << 20, Validation::Lenient);
+        feed(
+            &mut acc,
+            &[
+                created(),
+                json!({"type":"response.output_item.added","output_index":0,
+            "item":{"id":"rs_1","type":"reasoning","content":[],"summary":[]}}),
+            ],
+        )
+        .unwrap();
+        for index in [0, 2, 1, 1, u32::MAX] {
+            let delta = json!({"type":delta_kind,"output_index":0,"item_id":"rs_1",index_field:index,"delta":"x"});
+            let done = json!({"type":done_kind,"output_index":0,"item_id":"rs_1",index_field:index,"text":"xyz"});
+            feed(&mut acc, &[delta, done]).unwrap();
+            let slot = acc.slots.get(OutputIndex::new(0)).unwrap();
+            let SlotState::Active(state) = &slot.state else {
+                panic!("active reasoning")
+            };
+            assert_eq!(
+                budget.used(),
+                RETAINED_CONTAINER_OVERHEAD_BYTES + "resp_1".len() + state.retained_bytes(),
+                "completion measures only its actual inserted part, including sparse and repeated indexes"
+            );
+        }
+        let before_empty = budget.used();
+        let delta = json!({"type":delta_kind,"output_index":0,"item_id":"rs_1",index_field:1,"delta":""});
+        let done = json!({"type":done_kind,"output_index":0,"item_id":"rs_1",index_field:1,"text":""});
+        feed(&mut acc, &[delta, done.clone(), done]).unwrap();
+        assert_eq!(
+            budget.used(),
+            before_empty + RETAINED_CONTAINER_OVERHEAD_BYTES,
+            "empty completion does not add a part or refund its already charged counter"
+        );
+        let output = finished_output(acc);
+        let OutputItem::Reasoning(item) = &output[0] else {
+            panic!("reasoning item")
+        };
+        assert_eq!(item.content.len() + item.summary.len(), 5);
+    }
+}
+
+#[test]
+fn pending_web_search_identity_exhausts_budget_before_insertion() {
+    let (mut acc, _) = budgeted(4096, Validation::Lenient);
+    feed(&mut acc, &[created()]).unwrap();
+    let error = acc
+        .process_line(line(&json!({"type":"response.output_item.added","output_index":0,
+        "item":{"id":"w".repeat(100_000),"type":"web_search_call","status":"in_progress"}})))
+        .expect_err("pending identity must be charged even before the web search action arrives");
+    assert_budget_exceeded(&error);
+    assert_eq!(acc.slots.len(), 0, "the oversized identity was never retained");
+}
+
+#[test]
+fn late_bound_identity_exhausts_budget_before_binding() {
+    let (mut acc, _) = budgeted(4096, Validation::Lenient);
+    feed(&mut acc, &[created(), message_added("")]).unwrap();
+    let error = acc
+        .process_line(line(&text_delta(&"m".repeat(100_000), 0, "")))
+        .expect_err("a late-bound identity must be charged");
+    assert_budget_exceeded(&error);
+    assert!(acc.slots.get(OutputIndex::new(0)).unwrap().item_id.is_none());
+}
+
+#[test]
+fn terminal_details_exhaust_retained_budget_on_json_and_sse_paths() {
+    for details in [
+        json!({"error":{"message":"e".repeat(100_000)}}),
+        json!({"error":{"extra":vec!["";100_000]}}),
+        json!({"incomplete_details":{"reason":"r".repeat(100_000)}}),
+    ] {
+        let mut response = json!({"id":"resp_1","status":"incomplete","output":[]});
+        response
+            .as_object_mut()
+            .unwrap()
+            .extend(details.as_object().unwrap().clone());
+        let (mut json_path, _) = budgeted(4096, Validation::Lenient);
+        let json_result = json_path.load_json_body(&response.to_string());
+        let (mut acc, _) = budgeted(4096, Validation::Lenient);
+        feed(&mut acc, &[created()]).unwrap();
+        let stream_result = acc.process_line(line(&json!({"type":"response.incomplete","response":response})));
+        assert!(
+            json_result.is_err() && stream_result.is_err(),
+            "both paths must reject terminal details: JSON={json_result:?}, SSE={stream_result:?}"
+        );
+        assert_budget_exceeded(&json_result.unwrap_err());
+        assert_budget_exceeded(&stream_result.unwrap_err());
+    }
+}
+
+fn shell_command(kind: &str, index: u32, command: &str) -> Value {
+    json!({"type":kind,"output_index":0,"item_id":"sh_1","command_index":index,"command":command})
+}
+
+fn shell_added() -> Value {
+    json!({"type":"response.output_item.added","output_index":0,
+        "item":{"id":"sh_1","type":"shell_call","call_id":"call_1","action":{"commands":[],"extra_schema":{"nested":vec!["extra";1000]}}}})
+}
+
+#[test]
+fn shell_completion_accounts_once_and_keeps_lifecycle_validation() {
+    let (mut acc, budget) = budgeted(1 << 20, Validation::Lenient);
+    feed(&mut acc, &[created(), shell_added()]).unwrap();
+    for (index, command) in [(0, ""), (1, "echo hi"), (2, "")] {
+        let added = shell_command("response.shell_call_command.added", index, command);
+        let done = shell_command("response.shell_call_command.done", index, command);
+        feed(&mut acc, &[added]).unwrap();
+        let before = budget.used();
+        feed(&mut acc, std::slice::from_ref(&done)).unwrap();
+        assert_eq!(budget.used(), before, "completion moves already charged command text");
+        assert!(
+            acc.process_line(line(&done)).is_err(),
+            "duplicate completion stays invalid"
+        );
+        assert!(
+            acc.process_line(line(&shell_command("response.shell_call_command.done", 99, "")))
+                .is_err(),
+            "out-of-range completion stays invalid"
+        );
+    }
+    let output = finished_output(acc);
+    assert_eq!(
+        budget.used(),
+        RETAINED_CONTAINER_OVERHEAD_BYTES + "resp_1".len() + output[0].retained_bytes()
+    );
+}
+
+#[test]
+#[ignore = "manual scaling measurement: run with --ignored --nocapture"]
+fn shell_completion_accounting_scaling() {
+    for count in [4_000, 8_000, 16_000] {
+        let (mut acc, _) = budgeted(16 << 20, Validation::Lenient);
+        feed(&mut acc, &[created(), shell_added()]).unwrap();
+        let started = std::time::Instant::now();
+        for index in 0..count {
+            feed(
+                &mut acc,
+                &[
+                    shell_command("response.shell_call_command.added", index, "x"),
+                    shell_command("response.shell_call_command.done", index, "x"),
+                ],
+            )
+            .unwrap();
+        }
+        eprintln!("shell completion: {count} commands in {:?}", started.elapsed());
+        let output = finished_output(acc);
+        let OutputItem::ShellCall(item) = &output[0] else {
+            panic!("shell item")
+        };
+        assert_eq!(item.action.commands.len(), usize::try_from(count).unwrap());
+    }
+}
+
+#[test]
+fn terminal_details_snapshots_charge_once_and_match_json() {
+    let response = json!({"id":"resp_1","status":"incomplete","output":[],
+        "error":{"message":"failed","nested":["",[]]},"incomplete_details":{"reason":"upstream"}});
+    let (mut json_path, json_budget) = budgeted(4096, Validation::Lenient);
+    json_path.load_json_body(&response.to_string()).unwrap();
+    let (mut streamed, streamed_budget) = budgeted(4096, Validation::Lenient);
+    let terminal = json!({"type":"response.incomplete","response":response});
+    feed(&mut streamed, &[created(), terminal.clone(), terminal]).unwrap();
+    assert_eq!(streamed_budget.used(), json_budget.used());
+}
+
+#[test]
+fn pending_identity_is_not_charged_again_at_completion() {
+    let item = json!({"id":"ws_1","type":"web_search_call","status":"completed",
+        "action":{"type":"search","query":"q"}});
+    let (mut acc, budget) = budgeted(4096, Validation::Lenient);
+    feed(
+        &mut acc,
+        &[
+            created(),
+            json!({"type":"response.output_item.added","output_index":0,
+        "item":{"id":"ws_1","type":"web_search_call","status":"in_progress"}}),
+            output_item_done(&item),
+        ],
+    )
+    .unwrap();
+    let output = finished_output(acc);
+    assert_eq!(
+        budget.used(),
+        RETAINED_CONTAINER_OVERHEAD_BYTES + "resp_1".len() + output[0].retained_bytes()
+    );
 }

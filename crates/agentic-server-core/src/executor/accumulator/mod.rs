@@ -16,11 +16,12 @@ use futures::{Stream, StreamExt};
 
 use crate::events::{
     ClassifiedSseLine, EventFrame, EventPayload, SSEEventType, SSEItemType, SseLine, ValidatedFrame,
-    expected_item_type, normalize_sse_data_checked, output_item_identity, validate_frame,
+    normalize_sse_data_checked, output_item_identity, validate_frame,
 };
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::response_budget::{
-    ExecutorResponseBudget, RETAINED_CONTAINER_OVERHEAD_BYTES, retained_response_parts_bytes,
+    ExecutorResponseBudget, RETAINED_CONTAINER_OVERHEAD_BYTES, RetainedAccount, RetainedSize,
+    retained_response_parts_bytes,
 };
 use crate::types::event::ResponseStatus;
 use crate::types::io::{FunctionToolCall, OutputItem, ResponseUsage};
@@ -29,12 +30,16 @@ use crate::utils::common::{deserialize_from_str, deserialize_from_value_opt};
 use crate::utils::uuid7_str;
 
 mod active;
+mod active_text;
+mod identity;
+use identity::{invalid_lifecycle, invalid_lifecycle_or_id, invalid_stream, item_identity, output_item_call_id};
 mod completion;
+mod details;
 mod json;
 mod slot;
 
 use active::ActiveItem;
-use slot::{ItemIdentity, OutputIndex, SlotMap, SlotState};
+use slot::{OutputIndex, SlotMap, SlotState};
 
 /// Validation policy selected once for an accumulator's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +130,7 @@ pub struct ResponseAccumulator {
     status: ResponseStatus,
     incomplete_details: Option<IncompleteDetails>,
     error: Option<serde_json::Value>,
+    terminal_details_account: RetainedAccount,
     /// Per-round active and completed items, keyed by validated output index.
     slots: SlotMap,
     strict_call_ids: HashMap<u32, CallIdObservation>,
@@ -153,6 +159,7 @@ impl ResponseAccumulator {
             status: ResponseStatus::InProgress,
             incomplete_details: None,
             error: None,
+            terminal_details_account: RetainedAccount::default(),
             slots: SlotMap::default(),
             strict_call_ids: HashMap::new(),
             stream_lifecycle: StreamLifecycle::AwaitingCreated,
@@ -181,7 +188,9 @@ impl ResponseAccumulator {
 
     pub(super) fn load_json_body(&mut self, body: &str) -> ExecutorResult<()> {
         let acc = Self::read_json(body, self.conversation_id.clone(), self.validation)?;
-        let retained = retained_response_parts_bytes(&acc.response_id, &acc.output);
+        let retained = retained_response_parts_bytes(&acc.response_id, &acc.output)
+            + acc.incomplete_details.retained_bytes()
+            + acc.error.retained_bytes();
         if let Some(budget) = &self.budget {
             budget.consume(retained)?;
         }
@@ -227,6 +236,7 @@ impl ResponseAccumulator {
             status,
             incomplete_details,
             error,
+            terminal_details_account: RetainedAccount::default(),
             slots: SlotMap::default(),
             strict_call_ids: HashMap::new(),
             stream_lifecycle: StreamLifecycle::Terminal,
@@ -338,7 +348,7 @@ impl ResponseAccumulator {
             }
             Validation::Lenient => None,
         };
-        self.capture_terminal_details_if_needed(frame);
+        self.capture_terminal_details_if_needed(frame)?;
         self.process_event_checked(frame, validated.as_ref())
     }
 
@@ -489,27 +499,6 @@ impl ResponseAccumulator {
                 arguments: &item.arguments,
             }),
             _ => None,
-        }
-    }
-
-    fn capture_terminal_details(&mut self, frame: &EventFrame) {
-        let Some(response) = frame.wire.rest.get("response") else {
-            return;
-        };
-
-        self.incomplete_details = response
-            .get("incomplete_details")
-            .cloned()
-            .and_then(deserialize_from_value_opt::<IncompleteDetails>);
-        self.error = response.get("error").filter(|error| !error.is_null()).cloned();
-    }
-
-    fn capture_terminal_details_if_needed(&mut self, frame: &EventFrame) {
-        if matches!(
-            frame.event_type,
-            SSEEventType::ResponseCompleted | SSEEventType::ResponseFailed | SSEEventType::ResponseIncomplete
-        ) {
-            self.capture_terminal_details(frame);
         }
     }
 
@@ -675,73 +664,6 @@ impl ResponseAccumulator {
             tool_choice: None,
         }
     }
-}
-
-fn output_item_call_id(item: &OutputItem) -> Option<&str> {
-    match item {
-        OutputItem::FunctionCall(call) => Some(&call.call_id),
-        OutputItem::ToolSearchCall(call) => Some(&call.call_id),
-        OutputItem::CustomToolCall(call) => Some(&call.call_id),
-        OutputItem::ShellCall(call) => Some(&call.call_id),
-        _ => None,
-    }
-}
-
-fn invalid_lifecycle(event_name: &str) -> ExecutorError {
-    invalid_stream(format!(
-        "upstream stream event '{event_name}' is out of lifecycle order"
-    ))
-}
-
-fn invalid_lifecycle_or_id(event_name: &str) -> ExecutorError {
-    invalid_stream(format!(
-        "upstream stream event '{event_name}' is out of lifecycle order or changes the response id"
-    ))
-}
-
-fn invalid_stream(message: impl Into<String>) -> ExecutorError {
-    ExecutorError::InvalidRequest(message.into())
-}
-
-fn item_identity<'a>(frame: &'a EventFrame, validated: Option<&ValidatedFrame<'a>>) -> Option<ItemIdentity<'a>> {
-    if let Some(item) = validated.and_then(|frame| frame.item.as_ref()) {
-        return Some(ItemIdentity {
-            index: Some(OutputIndex::new(item.output_index)),
-            item_id: (!item.item_id.is_empty()).then_some(item.item_id),
-            item_type: item.item_type,
-        });
-    }
-    let (item_id, item_type) = match &frame.payload {
-        EventPayload::OutputItemAdded { item_id, item_type, .. }
-        | EventPayload::OutputItemDone { item_id, item_type, .. } => (item_id.as_str(), *item_type),
-        payload => {
-            let item_type = expected_item_type(frame.event_type)?;
-            let item_id = match payload {
-                EventPayload::TextDelta { item_id, .. }
-                | EventPayload::TextDone { item_id, .. }
-                | EventPayload::FunctionCallArgsDelta { item_id, .. }
-                | EventPayload::FunctionCallArgsDone { item_id, .. }
-                | EventPayload::CustomToolCallInputDelta { item_id, .. }
-                | EventPayload::CustomToolCallInputDone { item_id, .. }
-                | EventPayload::ReasoningTextDelta { item_id, .. }
-                | EventPayload::ReasoningTextDone { item_id, .. }
-                | EventPayload::ReasoningSummaryTextDelta { item_id, .. }
-                | EventPayload::ReasoningSummaryTextDone { item_id, .. } => item_id.as_str(),
-                _ => frame
-                    .wire
-                    .rest
-                    .get("item_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(""),
-            };
-            (item_id, item_type)
-        }
-    };
-    Some(ItemIdentity {
-        index: frame.output_index().map(OutputIndex::new),
-        item_id: (!item_id.is_empty()).then_some(item_id),
-        item_type,
-    })
 }
 
 #[cfg(test)]

@@ -16,6 +16,9 @@
 //! (#119/#132); kept deliberately parallel for a future consolidation. Reuses
 //! only the neutral tool layer via [`crate::types::messages::tool_seam`].
 
+mod wire;
+use wire::{error_sse, executor_error_sse, sse};
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -24,7 +27,7 @@ use futures::StreamExt;
 use serde_json::{Value, json};
 
 use crate::events::{ClassifiedSseLine, SseLine};
-use crate::executor::error::{ExecutorError, ExecutorResult};
+use crate::executor::error::ExecutorResult;
 use crate::executor::inference::{BoxStream, response_lines, send_request};
 use crate::executor::messages_context::MessagesRequestContext;
 use crate::executor::messages_request::web_search_budget_exhausted_result;
@@ -32,7 +35,7 @@ use crate::executor::request::ExecutionContext;
 use crate::proxy::processed_response_headers;
 use crate::tool::ToolRegistry;
 use crate::types::messages::{GatewayToolResult, tool_seam};
-use crate::utils::common::{deserialize_from_str, serialize_to_string};
+use crate::utils::common::deserialize_from_str;
 
 // Shared with the non-streaming loop so the two Messages loops can't drift.
 use crate::executor::messages_loop::{
@@ -454,32 +457,6 @@ impl MessagesStreamAccumulator {
         out.push(sse("message_stop", &json!({"type": "message_stop"})));
         out
     }
-}
-
-fn sse(event: &str, value: &Value) -> String {
-    let json = serialize_to_string(value).unwrap_or_default();
-    format!("event: {event}\ndata: {json}\n\n")
-}
-
-fn error_sse(message: &str) -> String {
-    let event = json!({"type": "error", "error": {"type": "api_error", "message": message}});
-    let json = serialize_to_string(&event).unwrap_or_default();
-    format!("event: error\ndata: {json}\n\n")
-}
-
-fn executor_error_sse(error: &ExecutorError) -> String {
-    if let ExecutorError::LLMRequest { body, .. } = error
-        && let Ok(value) = deserialize_from_str::<Value>(body)
-        && value.get("type").and_then(Value::as_str) == Some("error")
-    {
-        let data = if body.contains(['\r', '\n']) {
-            serialize_to_string(&value).unwrap_or_else(|_| body.clone())
-        } else {
-            body.clone()
-        };
-        return format!("event: error\ndata: {data}\n\n");
-    }
-    error_sse(&error.to_string())
 }
 
 /// Execute reconstructed gateway calls (concurrent, per-call timeout). Errors

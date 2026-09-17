@@ -10,10 +10,10 @@
 //! [`SlotMap`](super::slot::SlotMap) owns identity and lifecycle and dispatches
 //! here; nothing in this module resolves indexes or IDs.
 
-use std::collections::HashMap;
-
 use indexmap::IndexMap;
 
+pub(super) use super::active_text::StreamedPart;
+use super::active_text::{MessageState, ReasoningState};
 use super::completion::MergeDone;
 use crate::events::types::ShellCommandUpdate;
 use crate::events::{EventPayload, SSEItemType};
@@ -24,196 +24,14 @@ use crate::executor::response_budget::{
 use crate::types::event::MessageStatus;
 use crate::types::io::output::McpListTools;
 use crate::types::io::{
-    ApplyDone, CompactionItem, CustomToolCall, FunctionToolCall, McpCall, OutputItem, OutputMessage, OutputTextContent,
-    ReasoningOutput, ShellCall, ToolSearchCall, WebSearchCall,
+    ApplyDone, CompactionItem, CustomToolCall, FunctionToolCall, McpCall, OutputItem, OutputMessage, ReasoningOutput,
+    ShellCall, ToolSearchCall, WebSearchCall,
 };
 
-type Budget<'a> = Option<&'a ExecutorResponseBudget>;
+pub(super) type Budget<'a> = Option<&'a ExecutorResponseBudget>;
 
 fn invalid(message: &str) -> ExecutorError {
     ExecutorError::InvalidRequest(message.to_owned())
-}
-
-/// Text streamed for one message content part, and whether deltas carried it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct StreamedPart {
-    pub(super) text: String,
-    pub(super) streamed: bool,
-}
-
-/// Bytes retained by a streamed part: its container plus its text.
-impl RetainedSize for StreamedPart {
-    fn retained_bytes(&self) -> usize {
-        RETAINED_CONTAINER_OVERHEAD_BYTES + self.text.len()
-    }
-}
-
-/// Bytes retained by per-index streamed counters that hold no text yet: one
-/// container per index plus the bytes charged for its deltas.
-fn streamed_counter_bytes(counters: &HashMap<u32, usize>) -> usize {
-    counters
-        .values()
-        .map(|bytes| RETAINED_CONTAINER_OVERHEAD_BYTES + bytes)
-        .sum()
-}
-
-/// Return the streamed part for `index`, charging its container before a new
-/// entry exists so an empty part cannot grow the map for free.
-fn part_mut<'a>(
-    parts: &'a mut IndexMap<u32, StreamedPart>,
-    index: u32,
-    account: &mut RetainedAccount,
-    budget: Budget<'_>,
-) -> ExecutorResult<&'a mut StreamedPart> {
-    if !parts.contains_key(&index) {
-        account.charge(budget, RETAINED_CONTAINER_OVERHEAD_BYTES)?;
-    }
-    Ok(parts.entry(index).or_default())
-}
-
-/// Record streamed bytes for `index`, charging the container of a new index.
-fn count_streamed(
-    counters: &mut HashMap<u32, usize>,
-    index: u32,
-    delta: &str,
-    account: &mut RetainedAccount,
-    budget: Budget<'_>,
-) -> ExecutorResult<()> {
-    if !counters.contains_key(&index) {
-        account.charge(budget, RETAINED_CONTAINER_OVERHEAD_BYTES)?;
-    }
-    account.charge(budget, delta.len())?;
-    *counters.entry(index).or_default() += delta.len();
-    Ok(())
-}
-
-#[derive(Clone)]
-pub(super) struct MessageState {
-    pub(super) item: OutputMessage,
-    pub(super) parts: IndexMap<u32, StreamedPart>,
-}
-
-impl MessageState {
-    fn apply(
-        &mut self,
-        payload: &EventPayload,
-        account: &mut RetainedAccount,
-        budget: Budget<'_>,
-    ) -> ExecutorResult<()> {
-        match payload {
-            EventPayload::TextDelta {
-                delta, content_index, ..
-            } => {
-                let part = part_mut(&mut self.parts, *content_index, account, budget)?;
-                account.charge(budget, delta.len())?;
-                part.streamed = true;
-                part.text.push_str(delta);
-            }
-            EventPayload::TextDone {
-                text, content_index, ..
-            } => {
-                let part = part_mut(&mut self.parts, *content_index, account, budget)?;
-                // A done-only part adopts the completed text; a delta-streamed
-                // part already holds it and the snapshot is not charged twice.
-                if !part.streamed {
-                    account.grow(budget, part, |part| part.text.len(), |part| part.text.clone_from(text))?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn finalize(mut self) -> OutputItem {
-        self.parts.sort_keys();
-        for (_, part) in self.parts {
-            if !part.text.is_empty() {
-                self.item.content.push(OutputTextContent::new(part.text));
-            }
-        }
-        self.item.status = MessageStatus::Completed;
-        OutputItem::Message(self.item)
-    }
-}
-
-impl RetainedSize for MessageState {
-    fn retained_bytes(&self) -> usize {
-        self.item.retained_bytes() + self.parts.values().map(RetainedSize::retained_bytes).sum::<usize>()
-    }
-}
-
-/// Reasoning keeps per-index byte counters for streamed deltas and adopts the
-/// completed text from `reasoning_text.done` / `reasoning_summary_text.done`,
-/// which is the authoritative representation of each part.
-#[derive(Clone)]
-pub(super) struct ReasoningState {
-    pub(super) item: ReasoningOutput,
-    content_streamed: HashMap<u32, usize>,
-    summary_streamed: HashMap<u32, usize>,
-}
-
-impl ReasoningState {
-    fn new(item: ReasoningOutput) -> Self {
-        Self {
-            item,
-            content_streamed: HashMap::new(),
-            summary_streamed: HashMap::new(),
-        }
-    }
-
-    /// Retained bytes of every field a text or summary completion can change.
-    fn text_retained_bytes(&self) -> usize {
-        self.item
-            .content
-            .iter()
-            .map(RetainedSize::retained_bytes)
-            .sum::<usize>()
-            + self
-                .item
-                .summary
-                .iter()
-                .map(RetainedSize::retained_bytes)
-                .sum::<usize>()
-            + streamed_counter_bytes(&self.content_streamed)
-            + streamed_counter_bytes(&self.summary_streamed)
-    }
-
-    fn apply(
-        &mut self,
-        payload: &EventPayload,
-        account: &mut RetainedAccount,
-        budget: Budget<'_>,
-    ) -> ExecutorResult<()> {
-        match payload {
-            EventPayload::ReasoningTextDelta {
-                delta, content_index, ..
-            } => count_streamed(&mut self.content_streamed, *content_index, delta, account, budget),
-            EventPayload::ReasoningSummaryTextDelta {
-                delta, summary_index, ..
-            } => count_streamed(&mut self.summary_streamed, *summary_index, delta, account, budget),
-            EventPayload::ReasoningTextDone { content_index, .. } => {
-                account.grow(budget, self, Self::text_retained_bytes, |state| {
-                    state.content_streamed.remove(content_index);
-                    state.item.apply_done(payload, &mut String::new());
-                })
-            }
-            EventPayload::ReasoningSummaryTextDone { summary_index, .. } => {
-                account.grow(budget, self, Self::text_retained_bytes, |state| {
-                    state.summary_streamed.remove(summary_index);
-                    state.item.apply_done(payload, &mut String::new());
-                })
-            }
-            _ => Ok(()),
-        }
-    }
-}
-
-impl RetainedSize for ReasoningState {
-    fn retained_bytes(&self) -> usize {
-        self.item.retained_bytes()
-            + streamed_counter_bytes(&self.content_streamed)
-            + streamed_counter_bytes(&self.summary_streamed)
-    }
 }
 
 #[derive(Clone)]
@@ -365,12 +183,17 @@ impl ShellCallState {
                         "shell command done is repeated or contradicts streamed command",
                     ));
                 }
-                account.grow(budget, self, Self::retained_bytes, |state| {
-                    state.item.apply_done(payload, &mut state.command);
-                    if let Some(done) = state.command_stream.as_mut() {
-                        done[index] = true;
-                    }
-                })
+                account.grow(
+                    budget,
+                    self,
+                    |state| state.item.action.commands[index].len() + state.command.len(),
+                    |state| {
+                        state.item.apply_done(payload, &mut state.command);
+                        if let Some(done) = state.command_stream.as_mut() {
+                            done[index] = true;
+                        }
+                    },
+                )
             }
         }
     }
@@ -464,6 +287,22 @@ impl ActiveItem {
             OutputItem::Compaction(item) => Self::Compaction { item },
             OutputItem::Unknown => return None,
         })
+    }
+
+    /// Identity already included in this typed state's retained measurement.
+    pub(super) fn id(&self) -> Option<&str> {
+        match self {
+            Self::Message(state) => Some(&state.item.id),
+            Self::Reasoning(state) => Some(&state.item.id),
+            Self::FunctionCall(state) => Some(&state.item.id),
+            Self::CustomToolCall(state) => Some(&state.item.id),
+            Self::ShellCall(state) => state.item.id.as_deref(),
+            Self::ToolSearchCall { item } => Some(&item.id),
+            Self::WebSearchCall { item } => item.as_ref().map(|item| item.id.as_str()),
+            Self::McpCall { item } => Some(&item.id),
+            Self::McpListTools { item } => Some(&item.id),
+            Self::Compaction { item } => item.id.as_deref(),
+        }
     }
 
     pub(super) fn item_type(&self) -> SSEItemType {

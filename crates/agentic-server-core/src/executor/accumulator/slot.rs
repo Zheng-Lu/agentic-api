@@ -168,8 +168,20 @@ impl SlotMap {
             .ok_or_else(|| invalid("upstream stream exhausted output indexes"))
     }
 
-    fn insert(&mut self, index: OutputIndex, item_id: Option<&str>, state: SlotState, account: RetainedAccount) {
+    fn insert(
+        &mut self,
+        index: OutputIndex,
+        item_id: Option<&str>,
+        state: SlotState,
+        mut account: RetainedAccount,
+        budget: Option<&ExecutorResponseBudget>,
+    ) -> ExecutorResult<()> {
         if let Some(id) = item_id {
+            // Identity indexes share the logical item ID charge. A pending kind
+            // without its typed item must still pay before the indexes grow.
+            if state.id() != Some(id) {
+                account.charge(budget, id.len())?;
+            }
             self.indexes_by_id.insert(id.to_owned(), index);
         }
         self.slots.insert(
@@ -180,16 +192,26 @@ impl SlotMap {
                 account,
             },
         );
+        Ok(())
     }
 
-    fn bind_id(&mut self, index: OutputIndex, item_id: Option<&str>) {
+    fn bind_id(
+        &mut self,
+        index: OutputIndex,
+        item_id: Option<&str>,
+        budget: Option<&ExecutorResponseBudget>,
+    ) -> ExecutorResult<()> {
         if let Some(id) = item_id
             && let Some(slot) = self.slots.get_mut(&index)
             && slot.item_id.is_none()
         {
+            if slot.state.id() != Some(id) {
+                slot.account.charge(budget, id.len())?;
+            }
             slot.item_id = Some(id.to_owned());
             self.indexes_by_id.insert(id.to_owned(), index);
         }
+        Ok(())
     }
 
     pub(super) fn open(
@@ -207,7 +229,7 @@ impl SlotMap {
             // completed item, and charged before the slot retains it.
             let mut account = RetainedAccount::default();
             account.charge(budget, item.retained_bytes())?;
-            self.insert(index, identity.item_id, SlotState::Active(item), account);
+            self.insert(index, identity.item_id, SlotState::Active(item), account, budget)?;
             return Ok(Some(index));
         }
         Ok(None)
@@ -229,7 +251,7 @@ impl SlotMap {
         if let SlotState::Active(item) = &mut slot.state {
             item.apply_event(payload, &mut slot.account, budget)?;
         }
-        self.bind_id(index, identity.item_id);
+        self.bind_id(index, identity.item_id, budget)?;
         Ok(Some(index))
     }
 
@@ -268,7 +290,7 @@ impl SlotMap {
                     .as_ref()
                     .is_some_and(|candidate| semantically_equal(previous, candidate))
             {
-                self.bind_id(index, identity.item_id);
+                self.bind_id(index, identity.item_id, budget)?;
                 return Ok(None);
             }
             let candidate = slot.state.completion_candidate(
@@ -281,7 +303,7 @@ impl SlotMap {
                     .as_ref()
                     .is_some_and(|candidate| semantically_equal(previous, candidate))
                 {
-                    self.bind_id(index, identity.item_id);
+                    self.bind_id(index, identity.item_id, budget)?;
                     return Ok(None);
                 }
                 return Err(invalid(format!(
@@ -295,11 +317,11 @@ impl SlotMap {
                 // completion, containers of done-only parts) is charged here.
                 let mut account = slot.account;
                 account.reconcile(budget, item.retained_bytes())?;
-                self.bind_id(index, identity.item_id);
                 if let Some(slot) = self.slots.get_mut(&index) {
                     slot.state = SlotState::Done(item);
                     slot.account = account;
                 }
+                self.bind_id(index, identity.item_id, budget)?;
                 return Ok(Some(index));
             }
             return Ok(None);
@@ -323,7 +345,7 @@ impl SlotMap {
             }
             let mut account = RetainedAccount::default();
             account.charge(budget, item.retained_bytes())?;
-            self.insert(index, identity.item_id, SlotState::Done(item), account);
+            self.insert(index, identity.item_id, SlotState::Done(item), account, budget)?;
             return Ok(Some(index));
         }
         Ok(None)
@@ -373,6 +395,13 @@ impl std::fmt::Debug for SlotState {
 }
 
 impl SlotState {
+    fn id(&self) -> Option<&str> {
+        match self {
+            Self::Active(item) => item.id(),
+            Self::Done(item) => item.id(),
+        }
+    }
+
     pub(super) fn item_type(&self) -> Option<SSEItemType> {
         match self {
             Self::Active(item) => Some(item.item_type()),
