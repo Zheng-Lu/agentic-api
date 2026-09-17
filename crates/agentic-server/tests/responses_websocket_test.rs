@@ -329,6 +329,7 @@ fn persistence_disabled_state(llm_url: &str) -> AppState {
         llm_api_base: config.llm_api_base,
         skip_llm_ready_check: config.skip_llm_ready_check,
         openai_api_key: config.openai_api_key,
+        model_capabilities: std::sync::Arc::default(),
         max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
     }
 }
@@ -376,6 +377,7 @@ async fn storage_backed_state_with(
         llm_api_base: config.llm_api_base,
         skip_llm_ready_check: config.skip_llm_ready_check,
         openai_api_key: config.openai_api_key,
+        model_capabilities: std::sync::Arc::default(),
         max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
     };
     StorageBackedState { state, pool, _db: db }
