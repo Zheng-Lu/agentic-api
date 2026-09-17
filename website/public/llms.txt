@@ -4,7 +4,7 @@
 
 vLLM serves the model; Agentic API coordinates the tool loop and state. The project provides Responses and Messages API surfaces, conversation storage, streaming, and WebSocket transport for Responses. Built-in web search and MCP tools can execute on the gateway; client-executed function tools remain in the harness.
 
-Install the released Rust gateway and CLI with `cargo install agentic-server --locked`, then use `agentic run codex` or `agentic run claude` with your upstream and model. The Python distribution is named `agentic-api`; PyPI publication is upcoming. Do not use the reserved 0.0.0 placeholder as a working release. The Python installation guide describes the available wheel artifacts and future PyPI commands.
+Version 0.7.0 is available on PyPI and crates.io. With uv installed, run `uvx --from agentic-api==0.7.0 agentic run codex --upstream http://127.0.0.1:5050` (or `run claude`) without a global install. To start only the gateway, use `uvx --from agentic-api==0.7.0 agentic serve --upstream http://127.0.0.1:5050`. Alternatively, install with `cargo install agentic-server --version 0.7.0 --locked` (Rust and Cargo), then run `agentic`. The Python wheel bundles the Rust executables; serve vLLM separately.
 
 Use a tool-capable model and the appropriate tool-calling configuration. SGLang and NVIDIA Dynamo also have documented, tested upstream configurations. Compatibility depends on the model, serving configuration, and API surface. The separate agentic-llm-d component provides response hydration and persistence for llm-d.
 
@@ -12,8 +12,12 @@ The Markdown guides below track the development branch (`main`). For a released 
 
 ## Getting started
 
+- [Roadmap](https://raw.githubusercontent.com/vllm-project/agentic-api/main/ROADMAP.md): Project goals, near-term priorities, longer-term direction, and non-goals.
+
 - [Project overview and quickstart](https://raw.githubusercontent.com/vllm-project/agentic-api/main/README.md): Architecture, installation, agentic CLI commands, and configuration examples.
-- [Python installation and workflows](https://raw.githubusercontent.com/vllm-project/agentic-api/main/docs/guides/python-installation.md): Wheel artifacts, PyPI publication status, remote and managed-vLLM modes, and diagnostics.
+- [Rust CLI reference](https://vllm-project.github.io/agentic-api/docs/latest/rust-cli.md): Generated commands, options, and defaults for `agentic ...`: run a harness, attach to an existing gateway, serve, and validate. Installed by both Cargo and PyPI.
+- [Python CLI reference](https://vllm-project.github.io/agentic-api/docs/latest/python-cli.md): Generated command-line reference for the Python launcher, `agentic-api ...` (or `python -m agentic_api ...`). The Rust CLI uses `agentic ...` and has separate commands and flags.
+- [Python installation and workflows](https://raw.githubusercontent.com/vllm-project/agentic-api/main/docs/guides/python-installation.md): PyPI installation, remote and managed-vLLM modes, and diagnostics.
 - [Development setup](https://raw.githubusercontent.com/vllm-project/agentic-api/main/docs/developing/getting-started.md): Build from source and run the development checks.
 
 ## APIs and state
@@ -25,6 +29,7 @@ The Markdown guides below track the development branch (`main`). For a released 
 
 ## Harnesses and integrations
 
+- [Codex Desktop](https://raw.githubusercontent.com/vllm-project/agentic-api/main/docs/guides/codex-desktop.md): Tested Linux desktop setup with a separate app profile, local model catalog, shell editing, and the freeform apply_patch limitation.
 - [Codex integration](https://raw.githubusercontent.com/vllm-project/agentic-api/main/docs/design/codex-integration.md): Codex integration design and configuration.
 - [Claude Code integration](https://raw.githubusercontent.com/vllm-project/agentic-api/main/docs/design/claude-code-integration.md): Claude Code integration design and configuration.
 - [MCP gateway integration](https://raw.githubusercontent.com/vllm-project/agentic-api/main/docs/design/mcp-gateway-integration.md): MCP tool discovery, execution, and gateway integration design.
@@ -38,6 +43,9 @@ The Markdown guides below track the development branch (`main`). For a released 
 - [Kubernetes](https://raw.githubusercontent.com/vllm-project/agentic-api/main/docs/deploying/kubernetes.md): Kubernetes deployment and configuration.
 
 ## Optional
+
+- [Community meeting invite](https://zoom-lfx.platform.linuxfoundation.org/meeting/99957052764?password=caffe82c-cdfe-478e-964c-5e1d95c0c72e&invite=true): Open the community meeting invitation on LFX.
+- [Meeting notes](https://docs.google.com/document/d/1zJUfxdloxu9_oBYfbfTtgbz5sSZxwAnqvlnt72T67oU/edit?tab=t.0#heading=h.d5de0vs6frfk): Read the shared community meeting notes.
 
 - [Contributing](https://raw.githubusercontent.com/vllm-project/agentic-api/main/docs/community/index.md): Ways to contribute code, documentation, reviews, and feedback.
 - [Releases](https://github.com/vllm-project/agentic-api/releases): Published versions and release notes.

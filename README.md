@@ -123,7 +123,7 @@ permission checks and disables Codex approvals and sandboxing.
 ### Python distribution
 
 The `agentic-api` wheel packages the Rust gateway and a small Python launcher. This release produces wheel artifacts
-for 0.6.0 as a build-only release: download the wheel for your platform from the release workflow, then install that
+for 0.7.0 as a build-only release: download the wheel for your platform from the release workflow, then install that
 local file. It is not published on PyPI yet.
 
 ```bash
@@ -282,6 +282,9 @@ Configured `allowed_tools` form the maximum tool set; request-provided `allowed_
 override it with `server_url`; otherwise the existing request-declared HTTP MCP flow remains available.
 
 ## 🤖 Codex on your own GPUs
+
+For the desktop UI, see [Codex Desktop with local models](docs/guides/codex-desktop.md). The guide covers a tested
+Linux setup with an isolated app profile, model catalog, and the current `apply_patch` workaround.
 
 Agentic API speaks the Responses wire protocol Codex expects, including WebSockets, so you can run the full Codex experience against open models.
 

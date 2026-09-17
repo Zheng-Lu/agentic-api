@@ -1,13 +1,22 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
-import { Check, Copy, Terminal, Code2, ArrowUpRight } from 'lucide-react';
+import {
+  Check,
+  Copy,
+  Terminal,
+  Monitor,
+  Code2,
+  ArrowUpRight,
+} from 'lucide-react';
 import {
   DEFAULT_INSTALL_METHOD,
   INSTALL_METHODS,
+  PUBLISHED_VERSION,
   type InstallMethod,
   isInstallMethod,
   getLaunchCommands,
+  getServeCommand,
   getLaunchInstructions,
 } from '@/lib/quickstart';
 import { REPO } from '@/lib/site';
@@ -74,8 +83,7 @@ export function Quickstart() {
           {
             name: 'get_launch_instructions',
             title: 'Get agent launch instructions',
-            description:
-              'Read installation and launch instructions for Codex or Claude Code with vLLM. Defaults to the crates.io release; PyPI instructions are for the upcoming release. Returns commands; does not run commands or change configuration.',
+            description: `Read installation and launch instructions for Codex or Claude Code with vLLM. Version ${PUBLISHED_VERSION} is available on crates.io and PyPI; defaults to crates.io. Returns commands; does not run commands or change configuration.`,
             inputSchema: {
               type: 'object',
               properties: {
@@ -128,10 +136,10 @@ export function Quickstart() {
             <li>
               <span>02</span>
               <div>
-                <strong>Install Agentic API</strong>
+                <strong>Get Agentic API</strong>
                 <p>
-                  Get the release from crates.io. A Python package is coming to
-                  PyPI, with source builds available for development.
+                  Run v{PUBLISHED_VERSION} from PyPI with uvx or install from
+                  crates.io, with source builds available for development.
                 </p>
               </div>
             </li>
@@ -185,21 +193,32 @@ export function Quickstart() {
                     method === 'source'
                       ? 'Build from source'
                       : method === 'pypi'
-                        ? 'Install from PyPI — coming soon'
-                        : 'Install from crates.io'
+                        ? `Check the PyPI CLI (v${PUBLISHED_VERSION})`
+                        : `Install from crates.io (v${PUBLISHED_VERSION})`
                   }
                 />
                 <p className="install-note">{details.note}</p>
               </TabsContent>
             ))}
           </Tabs>
+          <CopyCode
+            key={installation + '-serve'}
+            code={getServeCommand(installation)}
+            label="Start the standalone server"
+          />
+          <p className="install-note">
+            The CLI launchers below start the gateway for you.
+          </p>
           <Tabs defaultValue="codex" className="launch-tabs">
             <TabsList
-              className="launch-tab-list"
+              className="launch-tab-list client-tab-list"
               aria-label="Choose your coding agent"
             >
               <TabsTrigger value="codex">
-                <Terminal size={16} /> Codex
+                <Terminal size={16} /> Codex CLI
+              </TabsTrigger>
+              <TabsTrigger value="codex-desktop">
+                <Monitor size={16} /> Codex Desktop
               </TabsTrigger>
               <TabsTrigger value="claude">
                 <Code2 size={16} /> Claude Code
@@ -211,6 +230,26 @@ export function Quickstart() {
                 code={launchCommands.codex}
                 label="Launch Codex"
               />
+            </TabsContent>
+            <TabsContent value="codex-desktop" className="desktop-guide">
+              <p>
+                Use the desktop UI with a local vLLM model. The tested Linux
+                setup keeps your normal session separate and configures Agentic
+                API as the model provider.
+              </p>
+              <p>
+                Shell commands, file writes, and follow-up turns were verified.
+                Freeform <code>apply_patch</code> must be disabled; file editing
+                uses shell commands.
+              </p>
+              <p>
+                <a
+                  className="text-link"
+                  href={`${REPO}/blob/main/docs/guides/codex-desktop.md`}
+                >
+                  Set up Codex Desktop <ArrowUpRight size={16} />
+                </a>
+              </p>
             </TabsContent>
             <TabsContent value="claude">
               <CopyCode

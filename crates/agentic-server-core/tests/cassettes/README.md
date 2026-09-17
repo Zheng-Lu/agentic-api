@@ -217,6 +217,7 @@ turns:
 | `record_messages_tool_choice.py` | Forced `any` and named Messages searches followed by an automatic answer (JSON + SSE) | gateway's upstream traffic to vLLM |
 | `record_image_input_cassettes.sh` | Matching two-turn image-input conversations (streaming + non-streaming) | gateway and OpenAI reference |
 | `record_dynamo_cassettes.sh` | Stateful two-turn and client-executed function tool call cassettes (streaming + non-streaming) | NVIDIA Dynamo frontend |
+| `record_dynamo_messages_cassettes.sh` | Two-round Messages web-search cassettes (streaming + non-streaming), validated before replacement | Existing NVIDIA Dynamo frontend |
 | `record_sglang_cassettes.sh` | Same shared executor scenarios as Dynamo, staged validation and sanitized provenance | SGLang |
 | `record_tool_search_cassettes.sh` | Four-turn mixed function/namespace client tool-search characterization; gateway blocking, HTTP/SSE, and WebSocket acceptance | gateway and OpenAI reference |
 
@@ -228,25 +229,22 @@ history and `tool_choice.type=auto`. The `any` cases retain a `name` extension a
 cases remove `name` and retain `disable_parallel_tool_use=true`. Each exchange ends with the token from the search
 result. Only the local search service is deterministic; the provider responses are captured from vLLM.
 
-vLLM 0.29.0 labels its named calls `end_turn` in both JSON and SSE. The named recordings exercise the gateway's
-compatibility handling for that completed, explicitly selected call as well as the subsequent selector relaxation.
+The local search service omits provider metadata. The gateway still emits one metadata object with the submitted
+query in its model-facing tool output, so these recordings also cover the missing-metadata normalization contract.
+The public `web_search_call` shape is unaffected by this internal metadata.
 
-The recordings use vLLM 0.29.0 and `Qwen/Qwen3-4B` revision
-`1cfa9a7208912126459214e8b04321603b3df60c`, with thinking disabled in each request. Start the provider:
-
-```bash
-vllm serve Qwen/Qwen3-4B --revision 1cfa9a7208912126459214e8b04321603b3df60c \
-    --host 127.0.0.1 --port 8000 --tool-call-parser hermes --enable-auto-tool-choice \
-    --reasoning-parser qwen3 --generation-config vllm --enforce-eager \
-    --max-model-len 4096 --max-num-seqs 4 --gpu-memory-utilization 0.7
-```
+The gateway-search recordings were refreshed with vLLM `0.28.1rc1.dev850+g4be3dcf0f` and
+`RedHatAI/Qwen3-Coder-Next-NVFP4` (cached model revision `27a8f16f463b9a13c91c332c40cf93e09717347e`).
+Use the `qwen3_coder` tool-call parser and enable automatic tool choice when serving this model.
+The recorder sends `temperature=0` and `chat_template_kwargs.enable_thinking=false` in each request.
 
 From the repository root, build the gateway and run the scenario with the usual recorder dependencies:
 
 ```bash
 cargo build -p agentic-server --bin agentic-server
 python crates/agentic-server-core/tests/cassettes/record_messages_tool_choice.py \
-    --binary target/debug/agentic-server --vllm http://127.0.0.1:8000
+    --binary target/debug/agentic-server --vllm http://127.0.0.1:8000 \
+    --model RedHatAI/Qwen3-Coder-Next-NVFP4
 cargo test -p agentic-server --test messages_tool_choice_cassette_test
 ```
 
@@ -261,7 +259,17 @@ submits the output using the returned call ID, and receives the token from that 
 requests and no gateway search. The replay tests assert the complete captured requests and response events,
 including the sole public stop-reason correction, and repeat the conversation on the same gateway.
 
-Capture these scenarios with the same provider and gateway build:
+The client-tool recordings retain vLLM 0.29.0 and `Qwen/Qwen3-4B` revision
+`1cfa9a7208912126459214e8b04321603b3df60c`. To regenerate those recordings, start their original provider:
+
+```bash
+vllm serve Qwen/Qwen3-4B --revision 1cfa9a7208912126459214e8b04321603b3df60c \
+    --host 127.0.0.1 --port 8000 --tool-call-parser hermes --enable-auto-tool-choice \
+    --reasoning-parser qwen3 --generation-config vllm --enforce-eager \
+    --max-model-len 4096 --max-num-seqs 4 --gpu-memory-utilization 0.7
+```
+
+Then capture these scenarios with the gateway build:
 
 ```bash
 python -m pip install anthropic==1.5.0
