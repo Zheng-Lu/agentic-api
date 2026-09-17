@@ -266,7 +266,8 @@ file setting.
 
 `api_key_env` names the process environment variable containing the web-search credential; it does not contain the
 credential itself. When it is unset, the selected provider's conventional variable is read (`YOU_API_KEY` or
-`BRAVE_API_KEY`). `AGENTIC_WEB_SEARCH_PROVIDER`, `AGENTIC_WEB_SEARCH_BASE_URL`, `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES`,
+`BRAVE_API_KEY`). Newly generated files leave `api_key_env` unset so changing providers also changes the default
+credential variable. `AGENTIC_WEB_SEARCH_PROVIDER`, `AGENTIC_WEB_SEARCH_BASE_URL`, `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES`,
 `AGENTIC_MCP_ALLOWED_HOSTS`, `AGENTIC_MAX_REQUEST_BODY_SIZE_BYTES`, and `AGENTIC_MAX_CONCURRENT_GATEWAY_CALLS` can
 override their typed file settings; `YOU_API_BASE_URL` is still honored as the endpoint override when the provider is
 `you`. The concurrency values are sliding-window upper bounds; handlers may further serialize calls to the same tool
@@ -311,7 +312,7 @@ the shared tool contract to Brave:
   automatic retry and reports the upstream `Retry-After` value; a cap lowers, but cannot eliminate, 429s on a
   per-second quota.
 
-If you switch an existing deployment to Brave, update `api_key_env` in a previously generated `config.toml` (or
+If you switch an existing deployment to Brave, update `api_key_env` if an older `config.toml` pins it (or
 remove it) and drop a You.com `base_url`; a mismatched key variable is reported in the failed `web_search_call`
 message. Example:
 

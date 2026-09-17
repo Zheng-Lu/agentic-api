@@ -398,7 +398,7 @@ async fn brave_handler_surfaces_rate_limits_without_retrying() {
     assert_eq!(
         error.to_string(),
         "execution failed: Brave Search rate limited the request (429 Too Many Requests); \
-         the gateway does not retry; retry after 7 seconds"
+         the gateway does not retry; retry after 7"
     );
     captured.recv().await.expect("one request");
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -427,7 +427,7 @@ async fn brave_handler_falls_back_to_rate_limit_reset_header() {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().ends_with("retry after 3 seconds"), "{error}");
+    assert!(error.to_string().ends_with("retry after 3"), "{error}");
 }
 
 #[tokio::test]
@@ -530,4 +530,25 @@ async fn brave_handler_honors_a_raised_concurrency_override() {
         (2..=3).contains(&peak),
         "peak concurrency {peak} should reflect the override of 3"
     );
+}
+
+#[tokio::test]
+async fn brave_handler_preserves_http_date_retry_after() {
+    let retry_after = "Wed, 21 Oct 2026 07:28:00 GMT";
+    let (base_url, _captured, _handle) = spawn_mock_brave(
+        StatusCode::TOO_MANY_REQUESTS,
+        vec![("retry-after", retry_after)],
+        serde_json::json!({}),
+    )
+    .await;
+    let error = brave_handler(&base_url, None)
+        .execute(
+            "call_brave",
+            "web_search",
+            r#"{"query":"q"}"#,
+            &WebSearchToolParam::default(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().ends_with(retry_after), "{error}");
 }

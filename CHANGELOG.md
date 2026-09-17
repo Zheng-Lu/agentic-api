@@ -30,7 +30,8 @@ All notable changes to Agentic API are documented here.
   (case-insensitive), `default_base_url`, `default_max_concurrent_queries`, and `config_name`;
   `WebSearchHandler::from_config` builds the handler for the selected provider and `GatewayExecutors::from_config`
   uses it. With `provider` unset, You.com behavior, configuration, and model-facing output are unchanged; a generated
-  `config.toml` now records `provider = "you"`.
+  `config.toml` now records `provider = "you"` and leaves `api_key_env` unset so provider switches select the matching
+  default credential variable.
 
 ## [0.7.0] - 2026-09-14
 

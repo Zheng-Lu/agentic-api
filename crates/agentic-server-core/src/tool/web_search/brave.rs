@@ -136,7 +136,7 @@ async fn failure_from_status(resp: reqwest::Response) -> ToolError {
                 .map(str::to_owned);
             let hint = retry_after.map_or_else(
                 || "; no Retry-After header was provided".to_owned(),
-                |value| format!("; retry after {value} seconds"),
+                |value| format!("; retry after {value}"),
             );
             ToolError::Execution(format!(
                 "Brave Search rate limited the request ({status}); the gateway does not retry{hint}"
