@@ -151,3 +151,140 @@ async fn dropping_an_enabled_guard_inside_the_runtime_does_not_panic() {
     drop(handles.meter);
     drop(guard);
 }
+
+/// The path `main` uses after its runtime has stopped: no Tokio context, a
+/// plain thread does the shutdown, and the deadline is still enforced.
+#[test]
+fn blocking_shutdown_honours_its_deadline_outside_a_runtime() {
+    let stub_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (endpoint, _stub) = stub_runtime.block_on(OtlpStub::spawn(StubMode::Hang));
+    let config = enabled_config(&endpoint).with_otlp_timeout(Duration::from_secs(60));
+    let (guard, handles) = init_providers(&config).unwrap();
+    let mut span = handles.tracer.unwrap().start("spike.span");
+    span.end();
+    handles.meter.unwrap().u64_counter("spike.counter").build().add(1, &[]);
+
+    let deadline = Duration::from_millis(500);
+    let started = Instant::now();
+    let result = guard.shutdown_blocking(deadline);
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(result, Err(TelemetryError::ShutdownTimeout { deadline: reported }) if reported == deadline),
+        "expected a deadline error, got {result:?}"
+    );
+    assert!(elapsed >= deadline && elapsed < deadline * 3, "{elapsed:?}");
+    stub_runtime.shutdown_background();
+}
+
+/// SIGTERM while a response is still streaming: the gateway drain gives up,
+/// `main` stops the runtime (dropping the connection task and its body), and
+/// only then flushes telemetry — so the abandoned request's span and its
+/// final measurements are in the export, and the gauge returns to zero.
+#[test]
+fn requests_abandoned_at_runtime_shutdown_are_finalized_before_telemetry_shutdown() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::middleware;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+    use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+    use tower::ServiceExt as _;
+    use tracing::instrument::WithSubscriber as _;
+
+    use agentic_server::telemetry::build_subscriber;
+    use agentic_server::telemetry::http::{HttpMetrics, track_request};
+
+    // The collector lives on its own runtime so it survives the gateway's.
+    let stub_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (endpoint, stub) = stub_runtime.block_on(OtlpStub::spawn(StubMode::Accept));
+    let config = enabled_config(&endpoint).with_otlp_timeout(Duration::from_secs(2));
+    let (guard, handles) = init_providers(&config).unwrap();
+    let dispatch = tracing::Dispatch::new(build_subscriber(
+        handles.tracer,
+        tracing_subscriber::EnvFilter::new("info"),
+        std::io::sink,
+    ));
+    let router = Router::new()
+        .route(
+            "/hang",
+            get(|| async {
+                Body::from_stream(futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>()).into_response()
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            HttpMetrics::new(&handles.meter.expect("metrics enabled")),
+            track_request,
+        ));
+
+    let gateway_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (headers_sent, headers_received) = std::sync::mpsc::channel();
+    gateway_runtime.spawn(async move {
+        let request = Request::builder().uri("/hang").body(Body::empty()).unwrap();
+        let response = router.oneshot(request).with_subscriber(dispatch).await.unwrap();
+        headers_sent.send(response.status()).unwrap();
+        // Hold the never-ending body until the runtime drops this task.
+        let _response = response;
+        std::future::pending::<()>().await;
+    });
+    assert_eq!(headers_received.recv_timeout(Duration::from_secs(5)).unwrap(), 200);
+
+    // `main`'s order: runtime first, telemetry second.
+    gateway_runtime.shutdown_timeout(Duration::from_secs(1));
+    guard.shutdown_blocking(Duration::from_secs(5)).unwrap();
+
+    let traces = stub_runtime.block_on(stub.trace_exports());
+    let names: Vec<&str> = traces
+        .iter()
+        .flat_map(|export| export.resource_spans.iter())
+        .flat_map(|resource| resource.scope_spans.iter())
+        .flat_map(|scope| scope.spans.iter().map(|span| span.name.as_str()))
+        .collect();
+    assert_eq!(names, ["GET /hang"], "the abandoned request's span is exported");
+
+    let metrics = stub_runtime.block_on(stub.metric_exports());
+    let latest = metrics.last().expect("metrics exported on shutdown");
+    let mut active = None;
+    let mut durations = 0;
+    for metric in latest
+        .resource_metrics
+        .iter()
+        .flat_map(|resource| resource.scope_metrics.iter())
+        .flat_map(|scope| scope.metrics.iter())
+    {
+        match (metric.name.as_str(), metric.data.as_ref()) {
+            ("http.server.active_requests", Some(Data::Sum(sum))) => {
+                active = Some(
+                    sum.data_points
+                        .iter()
+                        .map(|point| match point.value {
+                            Some(NumberValue::AsInt(value)) => value,
+                            other => panic!("unexpected value {other:?}"),
+                        })
+                        .sum::<i64>(),
+                );
+            }
+            ("http.server.request.duration", Some(Data::Histogram(histogram))) => {
+                durations += histogram.data_points.iter().map(|point| point.count).sum::<u64>();
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(active, Some(0), "gauge balanced by the dropped body");
+    assert_eq!(durations, 1, "duration recorded for the abandoned request");
+    stub_runtime.shutdown_background();
+}

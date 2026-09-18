@@ -7,10 +7,11 @@ connection, and only prints local logs as before.
 
 This page covers the foundation shipped in phase 1 of
 [#279](https://github.com/vllm-project/agentic-api/issues/279): one server span
-per HTTP request, the standard HTTP request metrics, trace-correlated local
-logs, and the export lifecycle. Execution-level spans (rehydration, inference
-rounds, tools, compaction, persistence) and gateway metrics follow in later
-phases.
+per HTTP request parented on the caller's W3C trace context, the standard HTTP
+request metrics, trace-correlated local logs, and the export lifecycle.
+Execution-level spans (rehydration, inference rounds, tools, compaction,
+persistence), context propagation to the upstream, and gateway metrics follow
+in later phases.
 
 ## Enable export
 
@@ -53,16 +54,21 @@ standard precedence *signal-specific variable → generic variable → default*:
 | --- | --- | --- |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` (`_TRACES_`, `_METRICS_`) | Collector base URL; `/v1/traces` and `/v1/metrics` are appended to the generic endpoint | `http://localhost:4318` |
 | `OTEL_EXPORTER_OTLP_HEADERS` (`_TRACES_`, `_METRICS_`) | `key=value,...` headers, for example vendor authentication | none |
-| `OTEL_EXPORTER_OTLP_TIMEOUT` (`_TRACES_`, `_METRICS_`) | Per-export request timeout in milliseconds | `10000` |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` (`_TRACES_`, `_METRICS_`) | Per-export request timeout in milliseconds; the effective bound on every export call | `10000` |
 | `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` or unset | unset |
 | `OTEL_RESOURCE_ATTRIBUTES` | Extra `key=value` resource attributes | none |
 | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Sampler; see below | `parentbased_always_on` |
-| `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | Span batch processor | `2048`, `5000`, `512`, `30000` |
-| `OTEL_METRIC_EXPORT_INTERVAL`, `OTEL_METRIC_EXPORT_TIMEOUT` | Periodic metric reader | `60000`, `30000` |
+| `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | Span batch processor | `2048`, `5000`, `512` |
+| `OTEL_METRIC_EXPORT_INTERVAL` | Periodic metric reader interval in milliseconds | `60000` |
 | `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` | Per-span record limits | `128` |
 
 The exported resource always carries `service.name` and `service.version`
 (the gateway crate version); `OTEL_RESOURCE_ATTRIBUTES` is merged in.
+
+`OTEL_BSP_EXPORT_TIMEOUT` and `OTEL_METRIC_EXPORT_TIMEOUT` are accepted by the
+SDK but not applied by the processors this gateway uses (SDK 0.32); set
+`OTEL_EXPORTER_OTLP_TIMEOUT` instead. The shutdown deadlines below apply on
+top of it.
 
 ## What is exported
 
@@ -70,24 +76,28 @@ The exported resource always carries `service.name` and `service.version`
 
 Every HTTP request produces one `http.server.request` span, named
 `{method} {route}` (for example `POST /v1/responses`) or just the method when
-no route matched. The span stays open until the response body has been fully
-sent or the client disconnected, so streaming responses are covered end to
-end. Attributes follow the HTTP semantic conventions and are deliberately
-bounded:
+no route matched. A valid W3C `traceparent` header makes it a child of the
+caller's span (and the caller's sampling decision is honoured); an absent or
+invalid header starts a new trace. The span stays open until the response
+body has been fully sent or the client disconnected, so streaming responses
+are covered end to end. Attributes follow the HTTP semantic conventions and
+are deliberately bounded:
 
 | Attribute | Value |
 | --- | --- |
 | `http.request.method` | A well-known method, or `_OTHER` |
 | `http.route` | The matched route template; absent for unmatched paths |
 | `http.response.status_code` | Integer status |
-| `url.scheme` | `http` unless the request line carried a scheme |
+| `url.scheme` | Always `http`: the gateway listens on plain HTTP and TLS, if any, terminates in front of it. Never copied from the request target |
 | `network.protocol.version` | `1.1`, `2`, ... |
+| `error.type` | Only on failures the middleware itself observes: `handler_panic` or `response_body` |
 
 Query strings, request or response headers, client addresses, request and
-response bodies, and upstream error bodies are never recorded. Spans with a
-5xx status are marked with error status; a `2xx` on a streaming response does
-**not** mean the execution succeeded — execution outcomes are recorded on the
-execution spans added in phase 2.
+response bodies, and upstream error bodies are never recorded. Spans are
+marked with error status on a 5xx response, when a handler panics, or when
+the response body fails mid-stream; a `2xx` on a streaming response does
+**not** by itself mean the execution succeeded — execution outcomes are
+recorded on the execution spans added in phase 2.
 
 WebSocket upgrades on `/v1/responses` produce a span for the upgrade request
 only; the session itself is instrumented in phase 2.
@@ -136,9 +146,11 @@ Two independent filters are in play:
 - `RUST_LOG` (default
   `agentic_server=info,agentic_core=info,opentelemetry_sdk=warn,opentelemetry-otlp=warn`)
   decides what is printed locally. It never changes what is exported.
-- The export bridge only forwards spans at `INFO` and above from the
-  gateway's own crates. It never forwards log events, and it excludes the
-  exporter's HTTP stack so exporting cannot feed back into itself.
+- The export bridge only forwards spans at `INFO` and above whose target is
+  one of this repository's crates (`agentic_server`, `agentic_core`,
+  `agentic_praxis`, `agentic_llm_d`). Spans declared by dependencies are never
+  exported, it never forwards log events, and exporting cannot feed back into
+  itself.
 
 The default `RUST_LOG` includes the SDK and exporter at `WARN` on purpose:
 queue overflow and export failures are reported there, so a Collector that is
@@ -156,11 +168,12 @@ Correlated lines are written without ANSI colour.
 - A slow or unreachable Collector only affects the exporter threads: each
   export request is bounded by `OTEL_EXPORTER_OTLP_TIMEOUT`.
 - On shutdown the gateway first drains in-flight requests (8 s budget), then
-  flushes and shuts down the telemetry providers with a 3 s deadline, then
-  stops the runtime with a 1 s deadline. A hung Collector therefore cannot
-  hold the process beyond roughly 12 s, well inside the 30 s termination grace
-  period used by the Kubernetes manifests. Spans still buffered when the
-  deadline passes are lost.
+  stops the runtime with a 1 s deadline — any request still streaming past
+  the drain budget is dropped here, which records its final span and metrics
+  — and only then flushes and shuts down the telemetry providers with a 3 s
+  deadline. A hung Collector therefore cannot hold the process beyond roughly
+  12 s, well inside the 30 s termination grace period used by the Kubernetes
+  manifests. Spans still buffered when the deadline passes are lost.
 
 ## Kubernetes
 

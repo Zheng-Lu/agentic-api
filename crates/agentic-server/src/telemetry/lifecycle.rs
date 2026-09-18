@@ -64,6 +64,8 @@ pub enum TelemetryError {
     ShutdownTimeout { deadline: Duration },
     #[error("telemetry shutdown task failed: {0}")]
     ShutdownJoin(#[source] tokio::task::JoinError),
+    #[error("telemetry shutdown thread failed: {0}")]
+    ShutdownThread(#[source] std::io::Error),
     #[error("{signal} provider shutdown failed: {source}")]
     ProviderShutdown {
         signal: Signal,
@@ -243,8 +245,20 @@ impl TelemetryGuard {
         matches!(self.state, GuardState::Enabled(_))
     }
 
+    fn take_providers(&mut self) -> Option<Providers> {
+        match std::mem::replace(&mut self.state, GuardState::ShutDown) {
+            GuardState::Enabled(providers) => Some(providers),
+            GuardState::Disabled | GuardState::ShutDown => None,
+        }
+    }
+
     /// Flush and shut down every provider on the blocking pool, returning
     /// within `deadline` even if an exporter is stuck on a slow collector.
+    ///
+    /// For callers inside a Tokio runtime. The gateway binary instead uses
+    /// [`Self::shutdown_blocking`] after its runtime has stopped, so that
+    /// request tasks abandoned by the drain deadline have already dropped
+    /// their spans and metrics into the still-running providers.
     ///
     /// # Errors
     ///
@@ -254,7 +268,7 @@ impl TelemetryGuard {
     /// provider reports a failure, and [`TelemetryError::ShutdownJoin`] if
     /// the blocking task panics.
     pub async fn shutdown(mut self, deadline: Duration) -> Result<(), TelemetryError> {
-        let GuardState::Enabled(providers) = std::mem::replace(&mut self.state, GuardState::ShutDown) else {
+        let Some(providers) = self.take_providers() else {
             return Ok(());
         };
         let task = tokio::task::spawn_blocking(move || providers.shutdown_blocking(deadline));
@@ -262,6 +276,40 @@ impl TelemetryGuard {
             Ok(Ok(result)) => result,
             Ok(Err(join_error)) => Err(TelemetryError::ShutdownJoin(join_error)),
             Err(_elapsed) => Err(TelemetryError::ShutdownTimeout { deadline }),
+        }
+    }
+
+    /// Flush and shut down every provider from a plain thread, returning
+    /// within `deadline`.
+    ///
+    /// Must not be called from inside a Tokio runtime (it blocks the calling
+    /// thread). If the deadline elapses the shutdown thread is left running;
+    /// it is bounded by the exporter timeout and dies with the process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::ShutdownTimeout`] when the deadline elapses,
+    /// [`TelemetryError::ProviderShutdown`] when a provider reports a failure,
+    /// and [`TelemetryError::ShutdownThread`] if the thread cannot be spawned
+    /// or panics.
+    pub fn shutdown_blocking(mut self, deadline: Duration) -> Result<(), TelemetryError> {
+        let Some(providers) = self.take_providers() else {
+            return Ok(());
+        };
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("agentic-telemetry-shutdown".to_owned())
+            .spawn(move || {
+                // The receiver may be gone if the deadline already passed.
+                let _ = done.send(providers.shutdown_blocking(deadline));
+            })
+            .map_err(TelemetryError::ShutdownThread)?;
+        match result.recv_timeout(deadline) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(TelemetryError::ShutdownTimeout { deadline }),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(TelemetryError::ShutdownThread(
+                std::io::Error::other("telemetry shutdown thread exited without reporting"),
+            )),
         }
     }
 }

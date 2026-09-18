@@ -18,6 +18,7 @@ use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics, SumDataPoint};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 use tower::ServiceExt as _;
 use tracing::Dispatch;
@@ -33,7 +34,11 @@ const ALLOWED_SPAN_ATTRIBUTES: &[&str] = &[
     "http.response.status_code",
     "url.scheme",
     "network.protocol.version",
+    "error.type",
 ];
+
+const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+const UNSAMPLED_TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
 
 struct Harness {
     router: Router,
@@ -53,11 +58,16 @@ impl Harness {
             .with_reader(PeriodicReader::builder(metrics.clone()).build())
             .build();
         let http_metrics = HttpMetrics::new(&meter_provider.meter("test"));
+        // Production registers the propagator in `install_globals`; this
+        // harness builds providers by hand, so register it here (idempotent).
+        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
         let router = Router::new()
             .route("/ok", get(|| async { "ok" }))
             .route("/boom", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
             .route("/stream", get(stream_slowly))
+            .route("/broken-stream", get(stream_then_fail))
+            .route("/panic", get(explode))
             .layer(middleware::from_fn_with_state(http_metrics, track_request));
         let dispatch = Dispatch::new(build_subscriber(
             Some(tracer_provider.tracer("test")),
@@ -77,10 +87,17 @@ impl Harness {
     /// Send a request under the test subscriber; the returned body has not
     /// been read yet.
     async fn send(&self, path: &str) -> Response {
-        let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+        self.send_with_headers(path, &[]).await
+    }
+
+    async fn send_with_headers(&self, path: &str, headers: &[(&str, &str)]) -> Response {
+        let mut request = Request::builder().uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
         self.router
             .clone()
-            .oneshot(request)
+            .oneshot(request.body(Body::empty()).unwrap())
             .with_subscriber(self.dispatch.clone())
             .await
             .unwrap()
@@ -116,6 +133,18 @@ async fn stream_slowly() -> Response {
         tokio::time::sleep(Duration::from_millis(20)).await;
         Some((Ok::<Bytes, io::Error>(Bytes::from_static(b"chunk\n")), sent + 1))
     });
+    Body::from_stream(chunks).into_response()
+}
+
+async fn explode() -> Response {
+    panic!("handler exploded");
+}
+
+async fn stream_then_fail() -> Response {
+    let chunks = futures::stream::iter([
+        Ok::<Bytes, io::Error>(Bytes::from_static(b"chunk\n")),
+        Err(io::Error::other("upstream went away")),
+    ]);
     Body::from_stream(chunks).into_response()
 }
 
@@ -285,4 +314,96 @@ async fn unmatched_routes_have_no_route_attribute() {
         ),
         "raw URL or query captured: {attributes:?}"
     );
+}
+
+#[tokio::test]
+async fn valid_traceparent_becomes_the_parent() {
+    let harness = Harness::new();
+    let response = harness.send_with_headers("/ok", &[("traceparent", TRACEPARENT)]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    let spans = harness.finished_spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(
+        spans[0].span_context.trace_id().to_string(),
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    );
+    assert_eq!(spans[0].parent_span_id.to_string(), "00f067aa0ba902b7");
+    assert_allow_listed(&spans[0]);
+}
+
+#[tokio::test]
+async fn unsampled_traceparent_suppresses_the_span_but_not_the_metrics() {
+    let harness = Harness::new();
+    let response = harness
+        .send_with_headers("/ok", &[("traceparent", UNSAMPLED_TRACEPARENT)])
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    assert!(
+        harness.finished_spans().is_empty(),
+        "parent-based sampler honours the caller's decision"
+    );
+    let (active, durations) = harness.snapshot();
+    assert_eq!(active, 0);
+    assert_eq!(durations.values().sum::<u64>(), 1, "metrics do not depend on sampling");
+}
+
+#[tokio::test]
+async fn invalid_traceparent_starts_a_new_root() {
+    let harness = Harness::new();
+    let response = harness
+        .send_with_headers("/ok", &[("traceparent", "00-not-a-trace-id-xx"), ("tracestate", "a=b")])
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+
+    let spans = harness.finished_spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].parent_span_id, opentelemetry::trace::SpanId::INVALID);
+    assert!(spans[0].span_context.is_valid());
+    assert_allow_listed(&spans[0]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handler_panics_are_recorded_as_errors_and_finalized_once() {
+    let harness = Harness::new();
+    let router = harness.router.clone();
+    let request = Request::builder().uri("/panic").body(Body::empty()).unwrap();
+    let outcome = tokio::spawn(router.oneshot(request).with_subscriber(harness.dispatch.clone())).await;
+    assert!(outcome.unwrap_err().is_panic());
+
+    let spans = harness.finished_spans();
+    assert_eq!(spans.len(), 1, "the span closes while the panic unwinds");
+    assert!(matches!(spans[0].status, opentelemetry::trace::Status::Error { .. }));
+    assert_eq!(attribute(&spans[0], "error.type"), Some(&Value::from("handler_panic")));
+    assert_eq!(attribute(&spans[0], "http.response.status_code"), None);
+    assert_allow_listed(&spans[0]);
+
+    let (active, durations) = harness.snapshot();
+    assert_eq!(active, 0, "the guard unwinds with the panic");
+    assert_eq!(durations.values().sum::<u64>(), 1);
+}
+
+#[tokio::test]
+async fn failing_response_bodies_mark_the_span() {
+    let harness = Harness::new();
+    let response = harness.send("/broken-stream").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let read = axum::body::to_bytes(response.into_body(), 1024).await;
+    assert!(read.is_err());
+
+    let spans = harness.finished_spans();
+    assert_eq!(spans.len(), 1);
+    assert!(matches!(spans[0].status, opentelemetry::trace::Status::Error { .. }));
+    assert_eq!(attribute(&spans[0], "error.type"), Some(&Value::from("response_body")));
+    assert_eq!(
+        attribute(&spans[0], "http.response.status_code"),
+        Some(&Value::from(200_i64))
+    );
+    let (active, durations) = harness.snapshot();
+    assert_eq!(active, 0);
+    assert_eq!(durations.values().sum::<u64>(), 1);
 }

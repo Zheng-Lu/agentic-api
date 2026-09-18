@@ -3,8 +3,9 @@
 //!
 //! The two layers are filtered independently: `RUST_LOG` only affects what
 //! is printed locally, and the bridge only sees spans at `INFO` and above
-//! from this repository's crates, so local log verbosity never changes what
-//! is exported and sampling never changes what is logged.
+//! whose target belongs to this repository's crates, so local log verbosity
+//! never changes what is exported, dependency spans never leak into the
+//! export, and sampling never changes what is logged.
 
 use std::fmt;
 use std::io;
@@ -31,21 +32,12 @@ use super::lifecycle::TelemetryError;
 pub const DEFAULT_LOG_FILTER: &str =
     "agentic_server=info,agentic_core=info,opentelemetry_sdk=warn,opentelemetry-otlp=warn";
 
-/// Crates whose spans must never reach the exporter: the exporter's own HTTP
-/// stack and the SDK's internal diagnostics would otherwise feed back into
-/// the export pipeline. Matched against the leading `::` segment of a target,
-/// and any crate whose name starts with `opentelemetry` is treated the same.
-const INTERNAL_CRATES: &[&str] = &[
-    "h2",
-    "hyper",
-    "hyper_util",
-    "reqwest",
-    "rustls",
-    "tokio",
-    "tokio_util",
-    "tower",
-    "tower_http",
-];
+/// Crates whose spans may be exported. An allow-list rather than a deny-list:
+/// dependencies such as `rmcp`, `hyper`, or the SDK itself declare their own
+/// `INFO` spans, and none of those attributes have been reviewed for
+/// cardinality or sensitivity. Matched against the leading `::` segment of a
+/// span's target.
+const EXPORTED_CRATES: &[&str] = &["agentic_server", "agentic_core", "agentic_praxis", "agentic_llm_d"];
 
 /// Install the global subscriber.
 ///
@@ -95,18 +87,18 @@ where
 }
 
 /// Bridge filter: spans only (events are reviewed and opted in individually
-/// by later work), at `INFO` or above, excluding internal targets.
+/// by later work), at `INFO` or above, from this repository's crates only.
 fn is_exported(metadata: &Metadata<'_>) -> bool {
-    metadata.is_span() && is_exported_level(*metadata.level()) && !is_internal_target(metadata.target())
+    metadata.is_span() && is_exported_level(*metadata.level()) && is_exported_target(metadata.target())
 }
 
 fn is_exported_level(level: Level) -> bool {
     level <= Level::INFO
 }
 
-fn is_internal_target(target: &str) -> bool {
+fn is_exported_target(target: &str) -> bool {
     let crate_name = target.split("::").next().unwrap_or(target);
-    crate_name.starts_with("opentelemetry") || INTERNAL_CRATES.contains(&crate_name)
+    EXPORTED_CRATES.contains(&crate_name)
 }
 
 /// Trace and span identifiers of the active OpenTelemetry span, if any.
@@ -228,15 +220,39 @@ mod tests {
     }
 
     #[test]
-    fn internal_targets_are_excluded_by_crate() {
-        assert!(is_internal_target("opentelemetry_sdk::trace"));
-        assert!(is_internal_target("opentelemetry_otlp::exporter::http"));
-        assert!(is_internal_target("hyper::proto::h1"));
-        assert!(is_internal_target("hyper_util::client::legacy"));
-        assert!(is_internal_target("reqwest"));
-        assert!(!is_internal_target("agentic_core::executor::engine"));
-        assert!(!is_internal_target("agentic_server::telemetry"));
-        assert!(!is_internal_target("hyperion::service"));
+    fn only_repository_crates_are_exported() {
+        assert!(is_exported_target("agentic_core::executor::engine"));
+        assert!(is_exported_target("agentic_server::telemetry::http"));
+        assert!(is_exported_target("agentic_server"));
+        for dependency in [
+            "rmcp::service",
+            "opentelemetry_sdk::trace",
+            "opentelemetry-otlp",
+            "hyper::proto::h1",
+            "hyper_util::client::legacy",
+            "reqwest",
+            "tokio::task",
+            "sqlx_core::pool",
+            "agentic_server_evil::x",
+        ] {
+            assert!(!is_exported_target(dependency), "{dependency} must not be exported");
+        }
+    }
+
+    #[test]
+    fn dependency_spans_are_not_exported_even_at_info() {
+        let (provider, exporter) = in_memory_tracer();
+        let output = SharedBuffer::default();
+        let subscriber = build_subscriber(Some(provider.tracer("test")), EnvFilter::new("info"), output.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let dependency = tracing::info_span!(target: "rmcp::service", "serve_inner");
+            let _dependency = dependency.enter();
+            let own = tracing::info_span!(target: "agentic_core::executor", "execute");
+            let _own = own.enter();
+        });
+        let spans = exporter.get_finished_spans().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, "execute");
     }
 
     #[test]

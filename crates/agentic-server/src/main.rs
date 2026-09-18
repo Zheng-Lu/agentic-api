@@ -400,29 +400,32 @@ fn parse_comma_separated(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Upper bound for stopping the runtime once the gateway and telemetry have
-/// shut down; only in-flight blocking work (such as a stuck exporter call)
-/// can still be running by then.
+/// Upper bound for stopping the runtime once the gateway has drained. Request
+/// tasks the drain deadline abandoned are dropped here, which finalizes their
+/// spans and metrics; only in-flight blocking work can hold this up.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> Result<(), server::ServerError> {
     // Parse first so `--help`/`--version` never build exporters.
     let cli = Cli::parse();
     // Providers and the subscriber are created outside the runtime so the
-    // guard outlives every task and is dropped after the runtime has stopped.
+    // guard outlives every task.
     let telemetry_config = TelemetryConfig::from_env().map_err(TelemetryError::from)?;
     let telemetry = telemetry::init(&telemetry_config)?;
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(run(cli));
-    runtime.block_on(shutdown_telemetry(telemetry));
+    // Stop the runtime before flushing telemetry: connection tasks that outlived
+    // the gateway drain are dropped now, so their final measurements land in
+    // providers that are still accepting them.
     runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    shutdown_telemetry(telemetry);
     result
 }
 
-/// Flush exported telemetry after the gateway has drained; failures are
+/// Flush exported telemetry after the runtime has stopped; failures are
 /// logged rather than surfaced because the gateway result is what matters.
-async fn shutdown_telemetry(telemetry: TelemetryGuard) {
-    if let Err(error) = telemetry.shutdown(DEFAULT_SHUTDOWN_TIMEOUT).await {
+fn shutdown_telemetry(telemetry: TelemetryGuard) {
+    if let Err(error) = telemetry.shutdown_blocking(DEFAULT_SHUTDOWN_TIMEOUT) {
         warn!(%error, "telemetry shutdown incomplete");
     }
 }

@@ -1,12 +1,15 @@
 //! Root HTTP server span and HTTP semantic-convention metrics.
 //!
-//! One span per request, `http.server.request`, opened before routing hands
-//! the request to a handler and closed only when the response body has been
+//! One span per request, `http.server.request`, parented on the caller's W3C
+//! `traceparent` when one is present, opened before routing hands the
+//! request to a handler and closed only when the response body has been
 //! fully sent or dropped, so streaming responses are covered end to end. A
 //! guard attached to the body records `http.server.request.duration` and
 //! keeps `http.server.active_requests` balanced exactly once per request,
-//! whichever way the body ends. Only bounded attributes are recorded: no
-//! query strings, headers, client addresses, or original method strings.
+//! whichever way the body ends — including handler panics and failed
+//! bodies, which also mark the span as errored. Only bounded attributes are
+//! recorded: no query strings, headers, client addresses, or original method
+//! strings.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -16,11 +19,13 @@ use axum::body::{Body, Bytes};
 use axum::extract::{MatchedPath, Request, State};
 use axum::middleware::Next;
 use axum::response::Response;
-use http::{Method, Version};
+use http::{HeaderMap, Method, Version};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use opentelemetry::metrics::{Histogram, Meter, UpDownCounter};
+use opentelemetry::propagation::Extractor;
 use opentelemetry::{KeyValue, global};
 use tracing::{Instrument, Span, field, info_span};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 const INSTRUMENTATION_SCOPE: &str = "agentic_server";
 
@@ -28,6 +33,17 @@ const ATTR_METHOD: &str = "http.request.method";
 const ATTR_ROUTE: &str = "http.route";
 const ATTR_STATUS: &str = "http.response.status_code";
 const ATTR_SCHEME: &str = "url.scheme";
+const ATTR_ERROR_TYPE: &str = "error.type";
+const ATTR_OTEL_STATUS: &str = "otel.status_code";
+
+/// The gateway listens on plain HTTP; TLS, if any, terminates in front of it.
+/// The scheme is therefore a property of the listener, never copied from the
+/// request target (absolute-form targets can carry any client-chosen scheme).
+const LISTENER_SCHEME: &str = "http";
+
+/// Bounded `error.type` values for failures the middleware itself observes.
+const ERROR_TYPE_PANIC: &str = "handler_panic";
+const ERROR_TYPE_BODY: &str = "response_body";
 
 /// Semantic-convention boundaries for `http.server.request.duration`,
 /// extended past 10 s because streamed inference responses routinely run for
@@ -154,30 +170,38 @@ pub async fn track_request(State(metrics): State<HttpMetrics>, request: Request,
         .extensions()
         .get::<MatchedPath>()
         .map(|path| path.as_str().to_owned());
-    let scheme = request.uri().scheme_str().unwrap_or("http").to_owned();
 
     let span = info_span!(
         "http.server.request",
         otel.name = %span_name(method, route.as_deref()),
         otel.kind = "server",
         otel.status_code = field::Empty,
+        error.r#type = field::Empty,
         http.request.method = method.as_str(),
         http.route = field::Empty,
         http.response.status_code = field::Empty,
-        url.scheme = %scheme,
+        url.scheme = LISTENER_SCHEME,
         network.protocol.version = protocol_version(request.version()),
     );
     if let Some(route) = &route {
         span.record(ATTR_ROUTE, route.as_str());
     }
+    // A valid `traceparent` makes this span a child of the caller's and lets
+    // the parent-based sampler honour the caller's decision; absent or invalid
+    // headers leave it a root. `set_parent` only fails when no bridge layer is
+    // installed, in which case there is nothing to attach to.
+    let parent = global::get_text_map_propagator(|propagator| propagator.extract(&HeaderCarrier(request.headers())));
+    let _ = span.set_parent(parent);
 
-    let mut guard = RequestGuard::start(metrics, method, route, scheme);
+    let mut guard = RequestGuard::start(metrics, method, route);
+    let mut outcome = SpanOutcome::pending(span.clone());
     let response = next.run(request).instrument(span.clone()).await;
+    outcome.completed();
 
     let status = response.status();
     span.record(ATTR_STATUS, i64::from(status.as_u16()));
     if status.is_server_error() {
-        span.record("otel.status_code", "ERROR");
+        span.record(ATTR_OTEL_STATUS, "ERROR");
     }
     guard.status = Some(status.as_u16());
 
@@ -199,18 +223,16 @@ struct RequestGuard {
     started: Instant,
     method: KnownMethod,
     route: Option<String>,
-    scheme: String,
     status: Option<u16>,
 }
 
 impl RequestGuard {
-    fn start(metrics: HttpMetrics, method: KnownMethod, route: Option<String>, scheme: String) -> Self {
+    fn start(metrics: HttpMetrics, method: KnownMethod, route: Option<String>) -> Self {
         let guard = Self {
             metrics,
             started: Instant::now(),
             method,
             route,
-            scheme,
             status: None,
         };
         guard.metrics.active.add(1, &guard.active_attributes());
@@ -220,7 +242,7 @@ impl RequestGuard {
     fn active_attributes(&self) -> [KeyValue; 2] {
         [
             KeyValue::new(ATTR_METHOD, self.method.as_str()),
-            KeyValue::new(ATTR_SCHEME, self.scheme.clone()),
+            KeyValue::new(ATTR_SCHEME, LISTENER_SCHEME),
         ]
     }
 
@@ -245,9 +267,49 @@ impl Drop for RequestGuard {
     }
 }
 
+/// Read-only view of the request headers for W3C context extraction.
+struct HeaderCarrier<'a>(&'a HeaderMap);
+
+impl Extractor for HeaderCarrier<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(http::HeaderName::as_str).collect()
+    }
+}
+
+/// Marks the span as errored if the handler never returns normally — a
+/// panic unwinding through the middleware is the only way to get here.
+struct SpanOutcome {
+    span: Span,
+    completed: bool,
+}
+
+impl SpanOutcome {
+    fn pending(span: Span) -> Self {
+        Self { span, completed: false }
+    }
+
+    fn completed(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for SpanOutcome {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.span.record(ATTR_OTEL_STATUS, "ERROR");
+            self.span.record(ATTR_ERROR_TYPE, ERROR_TYPE_PANIC);
+        }
+    }
+}
+
 /// Response body that keeps the request span alive and enters it on every
-/// poll, so work done while streaming stays attributed to the request. The
-/// guard is held only for its `Drop`, which fires when this body does.
+/// poll, so work done while streaming stays attributed to the request. A
+/// body error marks the span; the guard is held only for its `Drop`, which
+/// fires when this body does.
 struct TrackedBody {
     inner: Body,
     span: Span,
@@ -262,7 +324,12 @@ impl HttpBody for TrackedBody {
         // `Body`, `Span`, and the guard are all `Unpin`, so no projection is needed.
         let this = self.get_mut();
         let _entered = this.span.enter();
-        Pin::new(&mut this.inner).poll_frame(cx)
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if let Poll::Ready(Some(Err(_))) = &polled {
+            this.span.record(ATTR_OTEL_STATUS, "ERROR");
+            this.span.record(ATTR_ERROR_TYPE, ERROR_TYPE_BODY);
+        }
+        polled
     }
 
     fn is_end_stream(&self) -> bool {
