@@ -66,25 +66,28 @@ fn log_filter_from_env() -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER))
 }
 
-/// Assemble the layer stack without installing it, so tests can scope it
-/// with [`tracing::subscriber::with_default`].
-pub(crate) fn build_subscriber<W>(
-    tracer: Option<SdkTracer>,
-    log_filter: EnvFilter,
-    writer: W,
-) -> impl Subscriber + Send + Sync
+/// Assemble the layer stack without installing it.
+///
+/// Embedding applications and tests can scope the result with
+/// [`tracing::subscriber::with_default`] or install it themselves; the
+/// gateway binary installs it globally through [`crate::telemetry::init`].
+pub fn build_subscriber<W>(tracer: Option<SdkTracer>, log_filter: EnvFilter, writer: W) -> impl Subscriber + Send + Sync
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
     let fmt_layer = tracing_subscriber::fmt::layer()
-        .event_format(CorrelatedFormat::default())
+        .event_format(CorrelatedFormat::new(tracer.is_some()))
         .with_writer(writer)
         .with_filter(log_filter);
     let otel_layer = tracer.map(|tracer| {
         tracing_opentelemetry::layer()
             .with_tracer(tracer)
+            // Only declared span fields become attributes: no source location,
+            // thread, `tracing` target/level, or busy/idle timings.
             .with_location(false)
             .with_threads(false)
+            .with_target(false)
+            .with_level(false)
             .with_tracked_inactivity(false)
             .with_filter(filter_fn(is_exported))
     });
@@ -129,9 +132,22 @@ fn current_correlation_ids() -> Option<CorrelationIds> {
 
 /// The default human-readable format with `trace_id`/`span_id` appended when
 /// the event is emitted inside an exported span.
-#[derive(Debug, Default)]
+///
+/// Without a bridge layer no span can carry an OpenTelemetry context, so the
+/// formatter skips the context lookup entirely and delegates unchanged.
+#[derive(Debug)]
 struct CorrelatedFormat {
     inner: Format<Full, SystemTime>,
+    correlate: bool,
+}
+
+impl CorrelatedFormat {
+    fn new(correlate: bool) -> Self {
+        Self {
+            inner: Format::default(),
+            correlate,
+        }
+    }
 }
 
 impl<S, N> FormatEvent<S, N> for CorrelatedFormat
@@ -140,7 +156,7 @@ where
     N: for<'a> FormatFields<'a> + 'static,
 {
     fn format_event(&self, ctx: &FmtContext<'_, S, N>, mut writer: Writer<'_>, event: &Event<'_>) -> fmt::Result {
-        let Some(ids) = current_correlation_ids() else {
+        let Some(ids) = self.correlate.then(current_correlation_ids).flatten() else {
             return self.inner.format_event(ctx, writer, event);
         };
         // The inner format owns the line terminator, so render to a buffer

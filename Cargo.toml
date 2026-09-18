@@ -27,6 +27,7 @@ dirs = "6"
 futures = "0.3"
 indexmap = "2"
 http = "1"
+http-body = "1"
 jsonwebtoken = { version = "=10.3.0", default-features = false, features = ["rust_crypto"] }
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false }
@@ -43,9 +44,13 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "internal-logs"] }
+# OTLP over HTTP/protobuf only: gRPC needs tonic 0.14 (rust-version 1.88), above the MSRV.
+# `reqwest-rustls` pins the exporter's TLS backend explicitly instead of relying on
+# feature unification with `rmcp-reqwest`.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "http-proto",
     "reqwest-blocking-client",
+    "reqwest-rustls",
     "trace",
     "metrics",
     "internal-logs",
