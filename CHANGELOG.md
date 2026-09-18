@@ -8,8 +8,9 @@ All notable changes to Agentic API are documented here.
 
 - Added SearXNG as a selectable backend for the gateway-owned `web_search` tool (#326, Phase 3 of #291). Select it
   with `AGENTIC_WEB_SEARCH_PROVIDER=searxng` or `[web_search] provider = "searxng"` and point
-  `AGENTIC_WEB_SEARCH_BASE_URL` or `[web_search] base_url` at a self-hosted instance; the endpoint is mandatory and
-  the server refuses to start without it. No API key is needed; `SEARXNG_API_KEY` (or the variable named by
+  `AGENTIC_WEB_SEARCH_BASE_URL` or `[web_search] base_url` at a self-hosted instance; the endpoint is mandatory
+  (an absolute `http(s)` URL without a query or fragment, sub-path mounts allowed) and the server refuses to start
+  without it. No API key is needed; `SEARXNG_API_KEY` (or the variable named by
   `api_key_env`) is sent as a `Bearer` token only when set. Web and news results come from one
   `format=json&categories=general,news` request per query, split by category. The gateway adapts the shared tool
   contract: `allowed_domains` / `blocked_domains` and the model's `include_domains` / `exclude_domains` are enforced
@@ -40,6 +41,14 @@ All notable changes to Agentic API are documented here.
 
 ### Changed
 
+- `WebSearchProviderKind` gains a `Searxng` variant (`"searxng"`) with no default endpoint, `SEARXNG_API_KEY` as
+  its conventional key variable, and no provider concurrency ceiling. `WebSearchProviderKind::ALL` grows from
+  `[Self; 2]` to `[Self; 3]` (it enumerates every selectable provider and will grow again with each one); iterating
+  it is unaffected, but code that destructured or annotated the fixed length must be updated.
+  `agentic_core::tool::SEARXNG_BASE_URL_HINT` and `validate_searxng_base_url` carry the operator-facing rules for
+  the mandatory endpoint (absolute `http(s)` URL with a host and no query or fragment). The shared
+  `null_as_default` and `read_response_limited` helpers moved from `web_search/mod.rs` to `web_search/provider.rs`
+  (crate-private, re-exported unchanged).
 - Modeled the Codex model catalog and the upstream model listing as typed Rust structs instead of
   untyped JSON, and reported an undecodable upstream `/v1/models` payload as `502` rather than
   serving it as an empty catalog (#252).

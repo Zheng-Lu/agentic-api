@@ -425,8 +425,10 @@ default; raise `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES` only on a paid plan. 
 `AGENTIC_WEB_SEARCH_PROVIDER=searxng` and `AGENTIC_WEB_SEARCH_BASE_URL` to the in-cluster URL of a self-hosted SearXNG
 instance; no Secret is needed, and the server refuses to start if the base URL is missing. The SearXNG instance must
 enable the JSON format (`search.formats: [html, json]` in `settings.yml`), and if its `server.limiter` is on, the
-gateway's Pod CIDR must be listed in `botdetection.ip_lists.pass_ip` in `limiter.toml`, because the gateway never
-sends `Accept-Encoding: gzip` and the limiter otherwise rejects it.
+source address SearXNG observes for the gateway (normally the gateway Pod CIDR) must be listed in
+`botdetection.ip_lists.pass_ip` in `limiter.toml`, because the gateway never sends `Accept-Encoding: gzip` and the
+limiter otherwise rejects it. SearXNG still forwards queries to the engines it has enabled, so restrict those to
+internal or offline engines when the cluster must not reach the public internet.
 
 Create the Secret from a protected environment file so the key does not enter shell history or process arguments:
 

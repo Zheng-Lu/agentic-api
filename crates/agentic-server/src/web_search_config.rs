@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 
 use agentic_core::config::{WebSearchProviderConfig, WebSearchProviderKind};
 use agentic_core::error::Error;
-use agentic_core::tool::SEARXNG_BASE_URL_HINT;
+use agentic_core::tool::validate_searxng_base_url;
 
 use crate::config_file::WebSearchFileConfig;
 
@@ -28,7 +28,8 @@ const WEB_SEARCH_MAX_CONCURRENT_QUERIES_ENV: &str = "AGENTIC_WEB_SEARCH_MAX_CONC
 /// so the provider's own default applies.
 ///
 /// SearXNG has no default endpoint, so selecting it without a usable base URL
-/// is rejected here rather than on the first `web_search` call.
+/// is rejected here (via [`validate_searxng_base_url`]) rather than on the
+/// first `web_search` call.
 pub(crate) fn resolve_web_search_config(
     file: &WebSearchFileConfig,
     env: impl Fn(&str) -> Option<String>,
@@ -59,26 +60,12 @@ pub(crate) fn resolve_web_search_config(
         None => file.max_concurrent_queries,
     };
     if provider == WebSearchProviderKind::Searxng {
+        // SearXNG has no default endpoint; fail at startup with the provider's own message.
         validate_searxng_base_url(base_url.as_deref())?;
     }
     Ok(WebSearchProviderConfig::new(api_key, base_url)
         .with_provider(provider)
         .with_max_concurrent_queries(max_concurrent_queries))
-}
-
-/// Rejects a missing or non-HTTP SearXNG endpoint with the same hint the
-/// provider reports at execution time.
-fn validate_searxng_base_url(base_url: Option<&str>) -> Result<(), Error> {
-    let value = base_url.map(str::trim).filter(|value| !value.is_empty());
-    let Some(value) = value else {
-        return Err(Error::Config(SEARXNG_BASE_URL_HINT.to_owned()));
-    };
-    match url::Url::parse(value) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") && url.has_host() => Ok(()),
-        _ => Err(Error::Config(format!(
-            "SearXNG base URL {value:?} must be an absolute http(s) URL such as http://searxng:8080"
-        ))),
-    }
 }
 
 /// Seeds `[web_search]` in a generated configuration file from the current
@@ -102,6 +89,8 @@ pub(crate) fn generated_web_search_file_config(env: impl Fn(&str) -> Option<Stri
 
 #[cfg(test)]
 mod tests {
+    use agentic_core::tool::SEARXNG_BASE_URL_HINT;
+
     use super::*;
 
     /// Environment lookup over a fixed set of variables, mirroring `environment_value`.
@@ -237,6 +226,20 @@ mod tests {
             assert_eq!(
                 error.to_string(),
                 format!("SearXNG base URL {invalid:?} must be an absolute http(s) URL such as http://searxng:8080")
+            );
+        }
+        for invalid in ["http://searxng:8080?format=json", "http://searxng:8080/#search"] {
+            let error = resolve_web_search_config(
+                &WebSearchFileConfig::default(),
+                env_from(&[
+                    ("AGENTIC_WEB_SEARCH_PROVIDER", "searxng"),
+                    ("AGENTIC_WEB_SEARCH_BASE_URL", invalid),
+                ]),
+            )
+            .expect_err(invalid);
+            assert!(
+                error.to_string().contains("must not contain a query or fragment"),
+                "{error}"
             );
         }
     }

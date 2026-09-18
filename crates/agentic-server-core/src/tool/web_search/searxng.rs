@@ -39,6 +39,7 @@ use super::{
     null_as_default, read_response_limited,
 };
 use crate::config::WebSearchProviderKind;
+use crate::error::Error;
 use crate::tool::handler::ToolError;
 use crate::types::tools::{WebSearchContextSize, WebSearchToolParam};
 
@@ -49,8 +50,55 @@ pub(crate) const SEARXNG_API_KEY: &str = WebSearchProviderKind::Searxng.default_
 pub const SEARXNG_BASE_URL_HINT: &str = "SearXNG requires a base URL; set AGENTIC_WEB_SEARCH_BASE_URL or [web_search] base_url \
      (for example http://searxng:8080)";
 
-const SEARCH_PATH: &str = "/search";
+const SEARCH_PATH: &str = "search";
 const CATEGORIES: &str = "general,news";
+
+/// Checks that a configured SearXNG endpoint can be addressed: an absolute
+/// `http`/`https` URL with a host and no query or fragment, because the
+/// provider appends `/search` to its path. A blank or missing value is
+/// reported with [`SEARXNG_BASE_URL_HINT`]. Shared by the `agentic-server`
+/// startup check and the provider so both reject the same inputs.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] with the operator-facing message when the value
+/// is blank, not an absolute `http(s)` URL with a host, or carries a query or
+/// fragment.
+pub fn validate_searxng_base_url(value: Option<&str>) -> Result<(), Error> {
+    let value = value.map(str::trim).filter(|value| !value.is_empty());
+    let Some(value) = value else {
+        return Err(Error::Config(SEARXNG_BASE_URL_HINT.to_owned()));
+    };
+    parse_base_url(value).map(drop).map_err(Error::Config)
+}
+
+/// Parses a non-blank endpoint, producing the operator-facing message on failure.
+fn parse_base_url(value: &str) -> Result<url::Url, String> {
+    match url::Url::parse(value) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.has_host() => {
+            if url.query().is_some() || url.fragment().is_some() {
+                return Err(format!(
+                    "SearXNG base URL {value:?} must not contain a query or fragment; the gateway appends /search to \
+                     its path"
+                ));
+            }
+            Ok(url)
+        }
+        _ => Err(format!(
+            "SearXNG base URL {value:?} must be an absolute http(s) URL such as http://searxng:8080"
+        )),
+    }
+}
+
+/// Builds the `/search` endpoint under the configured base path, so a
+/// sub-path mount such as `http://host/searxng` resolves to
+/// `http://host/searxng/search`.
+fn search_endpoint(base_url: &str) -> Result<url::Url, ToolError> {
+    let mut url = parse_base_url(base_url).map_err(ToolError::Config)?;
+    let path = format!("{}/{SEARCH_PATH}", url.path().trim_end_matches('/'));
+    url.set_path(&path);
+    Ok(url)
+}
 const NEWS_CATEGORY: &str = "news";
 
 #[derive(Debug, Clone)]
@@ -95,10 +143,11 @@ impl WebSearchProvider for SearxngSearchProvider {
                 .base_url
                 .as_deref()
                 .ok_or_else(|| ToolError::Config(SEARXNG_BASE_URL_HINT.to_owned()))?;
+            let endpoint = search_endpoint(base_url)?;
             let request = SearxngSearchRequest::from_args_and_config(query, args, config)?;
             let mut builder = self
                 .client
-                .get(format!("{base_url}{SEARCH_PATH}"))
+                .get(endpoint)
                 .query(&request.query_params())
                 .header("Accept", "application/json");
             if let Some(api_key) = &self.api_key {
@@ -310,9 +359,10 @@ fn searxng_language(value: &str) -> Option<String> {
         return None;
     }
     let region = subtags.find(|subtag| subtag.len() == 2 && subtag.bytes().all(|byte| byte.is_ascii_alphabetic()));
-    Some(region.map_or(primary.clone(), |region| {
-        format!("{primary}-{}", region.to_ascii_uppercase())
-    }))
+    Some(match region {
+        Some(region) => format!("{primary}-{}", region.to_ascii_uppercase()),
+        None => primary,
+    })
 }
 
 /// Maps the named `safesearch` levels onto SearXNG's `0` / `1` / `2`.
@@ -442,6 +492,56 @@ mod tests {
         assert!(provider.api_key.is_none());
         assert!(provider.base_url.is_none());
         assert!(build_provider(None, None).base_url.is_none());
+    }
+
+    #[test]
+    fn search_endpoint_appends_search_under_the_base_path() {
+        assert_eq!(
+            search_endpoint("http://searxng:8080").unwrap().as_str(),
+            "http://searxng:8080/search"
+        );
+        assert_eq!(
+            search_endpoint("https://search.internal/searxng").unwrap().as_str(),
+            "https://search.internal/searxng/search"
+        );
+        assert_eq!(
+            search_endpoint("http://[::1]:8080/a/b").unwrap().as_str(),
+            "http://[::1]:8080/a/b/search"
+        );
+        for invalid in [
+            "searxng:8080",
+            "ftp://searxng",
+            "http://",
+            "http://host?x=y",
+            "http://host/#top",
+        ] {
+            let error = search_endpoint(invalid).expect_err(invalid).to_string();
+            assert!(error.starts_with("invalid tool config: SearXNG base URL"), "{error}");
+        }
+    }
+
+    #[test]
+    fn validate_base_url_shares_the_provider_rules() {
+        assert!(validate_searxng_base_url(Some(" http://searxng:8080/ ")).is_ok());
+        assert_eq!(
+            validate_searxng_base_url(None).unwrap_err().to_string(),
+            SEARXNG_BASE_URL_HINT
+        );
+        assert_eq!(
+            validate_searxng_base_url(Some("  ")).unwrap_err().to_string(),
+            SEARXNG_BASE_URL_HINT
+        );
+        assert_eq!(
+            validate_searxng_base_url(Some("http://host?x=y"))
+                .unwrap_err()
+                .to_string(),
+            "SearXNG base URL \"http://host?x=y\" must not contain a query or fragment; the gateway appends /search \
+             to its path"
+        );
+        assert_eq!(
+            validate_searxng_base_url(Some("/searxng")).unwrap_err().to_string(),
+            "SearXNG base URL \"/searxng\" must be an absolute http(s) URL such as http://searxng:8080"
+        );
     }
 
     #[tokio::test]

@@ -193,7 +193,7 @@ AGENTIC_WEB_SEARCH_PROVIDER=brave BRAVE_API_KEY=<your-brave-api-key> \
   cargo run -p agentic-server -- --llm-api-base http://0.0.0.0:5050
 ```
 
-Running fully on-premise? Point the gateway at a self-hosted [SearXNG](https://docs.searxng.org/) instance instead;
+Prefer a self-hosted backend? Point the gateway at your own [SearXNG](https://docs.searxng.org/) instance instead;
 no API key is needed, only its URL:
 
 ```bash
@@ -347,9 +347,12 @@ api_key_env = "BRAVE_API_KEY"
 ```
 
 **SearXNG** (`provider = "searxng"`) runs against a [self-hosted SearXNG](https://docs.searxng.org/admin/installation.html)
-instance, so prompts and search queries never leave your network and no API key is needed. The endpoint is
-mandatory: the server refuses to start when `searxng` is selected without `AGENTIC_WEB_SEARCH_BASE_URL` or
-`[web_search] base_url`. Two instance settings matter:
+instance: the gateway talks only to your instance, no API key is needed, and no search vendor sees your
+deployment. Note that SearXNG itself forwards each query to the engines enabled in its `settings.yml`, so for a
+fully air-gapped setup restrict it to internal or offline engines. The endpoint is mandatory: the server refuses to
+start when `searxng` is selected without `AGENTIC_WEB_SEARCH_BASE_URL` or `[web_search] base_url` (an absolute
+`http(s)` URL without a query or fragment; a sub-path such as `http://host/searxng` is fine). Two instance settings
+matter:
 
 - The JSON output format must be enabled: add `json` to `search.formats` in SearXNG's `settings.yml`
   (`formats: [html, json]`). Without it SearXNG answers `403`, which the failed `web_search_call` explains.

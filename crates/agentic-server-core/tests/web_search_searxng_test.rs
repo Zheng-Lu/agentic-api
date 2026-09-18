@@ -615,6 +615,68 @@ async fn searxng_handler_fails_without_base_url_naming_the_setting() {
     }
 }
 
+#[tokio::test]
+async fn searxng_handler_rejects_unaddressable_base_urls_without_sending() {
+    // Core callers bypass the server's startup check, so the provider applies
+    // the same rules before any request leaves the gateway.
+    let (base_url, mut captured, _handle) = spawn_mock_json(StatusCode::OK, mixed_response()).await;
+    for (suffix, needle) in [
+        ("?format=json", "must not contain a query or fragment"),
+        ("/#search", "must not contain a query or fragment"),
+    ] {
+        let handler = searxng_handler(Some(&format!("{base_url}{suffix}")), None, None);
+        let error = execute(&handler, r#"{"query":"q"}"#, &WebSearchToolParam::default())
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("invalid tool config: SearXNG base URL"), "{error}");
+        assert!(error.contains(needle), "{error}");
+    }
+    let error = execute(
+        &searxng_handler(Some("searxng:8080"), None, None),
+        r#"{"query":"q"}"#,
+        &WebSearchToolParam::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("must be an absolute http(s) URL"), "{error}");
+    assert!(
+        captured.try_recv().is_err(),
+        "no request may be sent for an invalid endpoint"
+    );
+
+    // A sub-path mount resolves to `{base}/search`.
+    let mounted = spawn_mounted_mock().await;
+    let handler = searxng_handler(Some(&format!("{}/searxng/", mounted.0)), None, None);
+    execute(&handler, r#"{"query":"q"}"#, &WebSearchToolParam::default())
+        .await
+        .unwrap();
+    assert_eq!(mounted.1.lock().await.as_deref(), Some("/searxng/search"));
+}
+
+/// Mock that records the request path of the first `/searxng/search` hit.
+async fn spawn_mounted_mock() -> (
+    String,
+    Arc<tokio::sync::Mutex<Option<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let seen = Arc::new(tokio::sync::Mutex::new(None));
+    let app = Router::new()
+        .route(
+            "/searxng/search",
+            get(
+                |State(seen): State<Arc<tokio::sync::Mutex<Option<String>>>>, uri: Uri| async move {
+                    *seen.lock().await = Some(uri.path().to_owned());
+                    Json(serde_json::json!({"results": []}))
+                },
+            ),
+        )
+        .with_state(Arc::clone(&seen));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen, handle)
+}
+
 /// Mock that records the peak number of in-flight requests.
 async fn spawn_concurrency_tracking_searxng() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
     let active = Arc::new(AtomicUsize::new(0));
