@@ -1,8 +1,10 @@
 //! In-process OTLP/HTTP receiver for telemetry tests: records protobuf
-//! export bodies, or holds requests open to simulate a hung collector.
+//! export bodies (inflating gzip-encoded ones, as a collector would), or
+//! holds requests open to simulate a hung collector.
 
 #![allow(dead_code)]
 
+use std::io::Read as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -10,7 +12,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::routing::post;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -33,6 +35,8 @@ pub enum StubMode {
 pub struct OtlpStub {
     mode: StubMode,
     pub connections: Arc<AtomicUsize>,
+    /// Requests that arrived with `content-encoding: gzip`.
+    pub gzip_requests: Arc<AtomicUsize>,
     traces: Arc<Mutex<Vec<Bytes>>>,
     metrics: Arc<Mutex<Vec<Bytes>>>,
 }
@@ -43,6 +47,7 @@ impl OtlpStub {
         let stub = Self {
             mode,
             connections: Arc::new(AtomicUsize::new(0)),
+            gzip_requests: Arc::new(AtomicUsize::new(0)),
             traces: Arc::new(Mutex::new(Vec::new())),
             metrics: Arc::new(Mutex::new(Vec::new())),
         };
@@ -94,6 +99,18 @@ async fn receive(State(stub): State<OtlpStub>, headers: HeaderMap, path: &'stati
             StatusCode::OK
         }
         StubMode::Accept => {
+            let body = match headers.get(header::CONTENT_ENCODING).map(HeaderValue::as_bytes) {
+                None => body,
+                Some(b"gzip") => {
+                    stub.gzip_requests.fetch_add(1, Ordering::SeqCst);
+                    let mut inflated = Vec::new();
+                    flate2::read::GzDecoder::new(&body[..])
+                        .read_to_end(&mut inflated)
+                        .expect("gzip body inflates");
+                    Bytes::from(inflated)
+                }
+                Some(other) => panic!("unexpected content-encoding {}", String::from_utf8_lossy(other)),
+            };
             let store = if path == "traces" { &stub.traces } else { &stub.metrics };
             store.lock().await.push(body);
             StatusCode::OK

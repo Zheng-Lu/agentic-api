@@ -46,11 +46,13 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "internal-logs"] }
 # OTLP over HTTP/protobuf only: gRPC needs tonic 0.14 (rust-version 1.88), above the MSRV.
 # `reqwest-rustls` pins the exporter's TLS backend explicitly instead of relying on
-# feature unification with `rmcp-reqwest`.
+# feature unification with `rmcp-reqwest`. `gzip-http` backs
+# `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` (pure-Rust `flate2`, already in the tree).
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "http-proto",
     "reqwest-blocking-client",
     "reqwest-rustls",
+    "gzip-http",
     "trace",
     "metrics",
     "internal-logs",

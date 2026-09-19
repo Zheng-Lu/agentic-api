@@ -45,6 +45,7 @@ Variables validated by the gateway (invalid values fail startup):
 | `OTEL_TRACES_EXPORTER` | `none` \| `otlp` | `none` |
 | `OTEL_METRICS_EXPORTER` | `none` \| `otlp` | `none` |
 | `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` | `http/protobuf` | `http/protobuf` |
+| `OTEL_EXPORTER_OTLP_COMPRESSION`, `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION`, `OTEL_EXPORTER_OTLP_METRICS_COMPRESSION` | `gzip`, or unset for no compression (`zstd` and the literal `none` are rejected) | unset |
 | `OTEL_SERVICE_NAME` | any non-empty string | `agentic-api` |
 
 Variables read directly by the OpenTelemetry SDK and OTLP exporter, with the
@@ -55,7 +56,6 @@ standard precedence *signal-specific variable → generic variable → default*:
 | `OTEL_EXPORTER_OTLP_ENDPOINT` (`_TRACES_`, `_METRICS_`) | Collector base URL; `/v1/traces` and `/v1/metrics` are appended to the generic endpoint | `http://localhost:4318` |
 | `OTEL_EXPORTER_OTLP_HEADERS` (`_TRACES_`, `_METRICS_`) | `key=value,...` headers, for example vendor authentication | none |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` (`_TRACES_`, `_METRICS_`) | Per-export request timeout in milliseconds; the effective bound on every export call | `10000` |
-| `OTEL_EXPORTER_OTLP_COMPRESSION` | `gzip` or unset | unset |
 | `OTEL_RESOURCE_ATTRIBUTES` | Extra `key=value` resource attributes | none |
 | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Sampler; see below | `parentbased_always_on` |
 | `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | Span batch processor | `2048`, `5000`, `512` |
@@ -90,14 +90,17 @@ are deliberately bounded:
 | `http.response.status_code` | Integer status |
 | `url.scheme` | Always `http`: the gateway listens on plain HTTP and TLS, if any, terminates in front of it. Never copied from the request target |
 | `network.protocol.version` | `1.1`, `2`, ... |
-| `error.type` | Only on failures the middleware itself observes: `handler_panic` or `response_body` |
+| `error.type` | Only on outcomes the middleware itself observes: `handler_panic`, `response_body`, or `cancelled` |
 
 Query strings, request or response headers, client addresses, request and
 response bodies, and upstream error bodies are never recorded. Spans are
 marked with error status on a 5xx response, when a handler panics, or when
-the response body fails mid-stream; a `2xx` on a streaming response does
-**not** by itself mean the execution succeeded — execution outcomes are
-recorded on the execution spans added in phase 2.
+the response body fails mid-stream. A request dropped before any response
+existed — a timeout around the handler, the client disconnecting, or the
+runtime shutting down mid-request — carries `error.type=cancelled` with no
+status code and is **not** marked as an error. A `2xx` on a streaming
+response does **not** by itself mean the execution succeeded — execution
+outcomes are recorded on the execution spans added in phase 2.
 
 WebSocket upgrades on `/v1/responses` produce a span for the upgrade request
 only; the session itself is instrumented in phase 2.

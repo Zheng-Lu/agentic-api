@@ -82,6 +82,57 @@ async fn exports_carry_the_configured_service_identity() {
     assert_eq!(metric_names, ["spike.counter"]);
 }
 
+/// `OTEL_EXPORTER_OTLP_COMPRESSION=gzip` must build (the exporter needs its
+/// `gzip-http` feature for that) and the collector must receive bodies it
+/// can inflate back into the same protobuf payloads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_compressed_exports_reach_the_collector() {
+    let (endpoint, stub) = OtlpStub::spawn(StubMode::Accept).await;
+    let config = TelemetryConfig::from_lookup(|name| match name {
+        "OTEL_TRACES_EXPORTER" | "OTEL_METRICS_EXPORTER" => Some("otlp".to_owned()),
+        "OTEL_EXPORTER_OTLP_COMPRESSION" => Some("gzip".to_owned()),
+        _ => None,
+    })
+    .unwrap()
+    .with_otlp_endpoint(&endpoint)
+    .with_otlp_timeout(Duration::from_secs(2));
+
+    let (guard, handles) = init_providers(&config).expect("gzip is compiled into the exporter");
+    let tracer = handles.tracer.expect("traces enabled");
+    let mut span = tracer.start("compressed.span");
+    span.end();
+    let meter = handles.meter.expect("metrics enabled");
+    meter.u64_counter("compressed.counter").build().add(1, &[]);
+
+    guard.shutdown(Duration::from_secs(5)).await.unwrap();
+
+    let requests = stub.connections.load(Ordering::SeqCst);
+    assert!(requests >= 2, "one export per signal, got {requests}");
+    assert_eq!(
+        stub.gzip_requests.load(Ordering::SeqCst),
+        requests,
+        "every export body is gzip-encoded"
+    );
+    let span_names: Vec<String> = stub
+        .trace_exports()
+        .await
+        .iter()
+        .flat_map(|export| export.resource_spans.iter())
+        .flat_map(|resource| resource.scope_spans.iter())
+        .flat_map(|scope| scope.spans.iter().map(|span| span.name.clone()))
+        .collect();
+    assert_eq!(span_names, ["compressed.span"]);
+    let metric_names: Vec<String> = stub
+        .metric_exports()
+        .await
+        .iter()
+        .flat_map(|export| export.resource_metrics.iter())
+        .flat_map(|resource| resource.scope_metrics.iter())
+        .flat_map(|scope| scope.metrics.iter().map(|metric| metric.name.clone()))
+        .collect();
+    assert_eq!(metric_names, ["compressed.counter"]);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_completes_when_the_collector_times_out() {
     let (endpoint, _stub) = OtlpStub::spawn(StubMode::Hang).await;

@@ -7,7 +7,9 @@
 //! guard attached to the body records `http.server.request.duration` and
 //! keeps `http.server.active_requests` balanced exactly once per request,
 //! whichever way the body ends — including handler panics and failed
-//! bodies, which also mark the span as errored. Only bounded attributes are
+//! bodies, which also mark the span as errored, and requests cancelled before
+//! a response exists (a timeout or runtime shutdown dropping the handler),
+//! which are labelled but not treated as errors. Only bounded attributes are
 //! recorded: no query strings, headers, client addresses, or original method
 //! strings.
 
@@ -41,9 +43,10 @@ const ATTR_OTEL_STATUS: &str = "otel.status_code";
 /// request target (absolute-form targets can carry any client-chosen scheme).
 const LISTENER_SCHEME: &str = "http";
 
-/// Bounded `error.type` values for failures the middleware itself observes.
+/// Bounded `error.type` values for outcomes the middleware itself observes.
 const ERROR_TYPE_PANIC: &str = "handler_panic";
 const ERROR_TYPE_BODY: &str = "response_body";
+const ERROR_TYPE_CANCELLED: &str = "cancelled";
 
 /// Semantic-convention boundaries for `http.server.request.duration`,
 /// extended past 10 s because streamed inference responses routinely run for
@@ -280,8 +283,14 @@ impl Extractor for HeaderCarrier<'_> {
     }
 }
 
-/// Marks the span as errored if the handler never returns normally — a
-/// panic unwinding through the middleware is the only way to get here.
+/// Records how a request ended when the handler never returned a response.
+///
+/// Two things drop this before [`SpanOutcome::completed`] is called: a panic
+/// unwinding through the middleware, and the request future being dropped
+/// while the handler is still pending — a timeout wrapping the handler, the
+/// client going away before headers, or the runtime shutting down. Only the
+/// former is a failure; the latter is labelled `cancelled` and leaves the
+/// span status unset.
 struct SpanOutcome {
     span: Span,
     completed: bool,
@@ -299,9 +308,17 @@ impl SpanOutcome {
 
 impl Drop for SpanOutcome {
     fn drop(&mut self) {
-        if !self.completed {
+        if self.completed {
+            return;
+        }
+        // A panicking handler drops the request future — and this with it —
+        // while the panic is still unwinding (tokio drops a task's future
+        // inside its unwind guard), so `panicking()` tells the two apart.
+        if std::thread::panicking() {
             self.span.record(ATTR_OTEL_STATUS, "ERROR");
             self.span.record(ATTR_ERROR_TYPE, ERROR_TYPE_PANIC);
+        } else {
+            self.span.record(ATTR_ERROR_TYPE, ERROR_TYPE_CANCELLED);
         }
     }
 }

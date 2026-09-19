@@ -44,6 +44,7 @@ url.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
+flate2 = "1"
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace", "metrics"] }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 prost = "0.14"

@@ -12,7 +12,7 @@ pub mod http;
 mod lifecycle;
 mod subscriber;
 
-pub use config::{ExporterSelection, OtlpProtocol, TelemetryConfig, TelemetryConfigError};
+pub use config::{ExporterSelection, OtlpCompression, OtlpProtocol, TelemetryConfig, TelemetryConfigError};
 pub use lifecycle::{DEFAULT_SHUTDOWN_TIMEOUT, InstrumentationHandles, Signal, TelemetryError, TelemetryGuard};
 pub use subscriber::{DEFAULT_LOG_FILTER, build_subscriber};
 

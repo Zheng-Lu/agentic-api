@@ -11,7 +11,9 @@ use std::time::Duration;
 use opentelemetry::metrics::{Meter, MeterProvider as _};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{KeyValue, global};
-use opentelemetry_otlp::{ExporterBuildError, MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{
+    Compression, ExporterBuildError, MetricExporter, SpanExporter, WithExportConfig, WithHttpConfig,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkError;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
@@ -19,7 +21,7 @@ use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
 use tracing::warn;
 
-use super::config::{ExporterSelection, TelemetryConfig, TelemetryConfigError};
+use super::config::{ExporterSelection, OtlpCompression, TelemetryConfig, TelemetryConfigError};
 
 /// Upper bound for flushing and shutting down providers at process exit.
 ///
@@ -152,6 +154,9 @@ pub(crate) fn build_providers(config: &TelemetryConfig) -> Result<(Providers, In
         if let Some(timeout) = config.otlp_timeout() {
             builder = builder.with_timeout(timeout);
         }
+        if let Some(compression) = exporter_compression(config.traces_compression()) {
+            builder = builder.with_compression(compression);
+        }
         let exporter = builder.build().map_err(|source| TelemetryError::ExporterBuild {
             signal: Signal::Traces,
             source,
@@ -172,6 +177,9 @@ pub(crate) fn build_providers(config: &TelemetryConfig) -> Result<(Providers, In
         if let Some(timeout) = config.otlp_timeout() {
             builder = builder.with_timeout(timeout);
         }
+        if let Some(compression) = exporter_compression(config.metrics_compression()) {
+            builder = builder.with_compression(compression);
+        }
         let exporter = builder.build().map_err(|source| TelemetryError::ExporterBuild {
             signal: Signal::Metrics,
             source,
@@ -185,6 +193,16 @@ pub(crate) fn build_providers(config: &TelemetryConfig) -> Result<(Providers, In
     }
 
     Ok((providers, handles))
+}
+
+/// The exporter builder only takes an algorithm, never "none": for `None` the
+/// builder is left untouched, and the exporter then reads the (validated,
+/// unset) compression variables itself and sends bodies uncompressed.
+fn exporter_compression(compression: OtlpCompression) -> Option<Compression> {
+    match compression {
+        OtlpCompression::None => None,
+        OtlpCompression::Gzip => Some(Compression::Gzip),
+    }
 }
 
 /// Register the providers and the W3C `traceparent` propagator globally so

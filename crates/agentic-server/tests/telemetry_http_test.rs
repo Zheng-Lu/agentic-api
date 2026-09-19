@@ -68,6 +68,7 @@ impl Harness {
             .route("/stream", get(stream_slowly))
             .route("/broken-stream", get(stream_then_fail))
             .route("/panic", get(explode))
+            .route("/hang", get(never_respond))
             .layer(middleware::from_fn_with_state(http_metrics, track_request));
         let dispatch = Dispatch::new(build_subscriber(
             Some(tracer_provider.tracer("test")),
@@ -138,6 +139,12 @@ async fn stream_slowly() -> Response {
 
 async fn explode() -> Response {
     panic!("handler exploded");
+}
+
+/// A handler that never produces headers, so the request can only end by
+/// the caller dropping it.
+async fn never_respond() -> Response {
+    std::future::pending().await
 }
 
 async fn stream_then_fail() -> Response {
@@ -384,6 +391,60 @@ async fn handler_panics_are_recorded_as_errors_and_finalized_once() {
 
     let (active, durations) = harness.snapshot();
     assert_eq!(active, 0, "the guard unwinds with the panic");
+    assert_eq!(durations.values().sum::<u64>(), 1);
+}
+
+/// The request future dropped before headers exist — a timeout around the
+/// handler, or the client leaving early — is not a panic: the span is
+/// finalized with `error.type=cancelled` and its status left unset, and the
+/// metrics are still balanced.
+#[tokio::test]
+async fn cancelling_a_pending_handler_is_not_recorded_as_a_panic() {
+    let harness = Harness::new();
+    let request = Request::builder().uri("/hang").body(Body::empty()).unwrap();
+    let pending = harness
+        .router
+        .clone()
+        .oneshot(request)
+        .with_subscriber(harness.dispatch.clone());
+    let outcome = tokio::time::timeout(Duration::from_millis(50), pending).await;
+    assert!(outcome.is_err(), "the handler never responds");
+
+    let spans = harness.finished_spans();
+    assert_eq!(spans.len(), 1, "the span closes when the request future is dropped");
+    assert_eq!(spans[0].status, opentelemetry::trace::Status::Unset);
+    assert_eq!(attribute(&spans[0], "error.type"), Some(&Value::from("cancelled")));
+    assert_eq!(attribute(&spans[0], "http.response.status_code"), None);
+    assert_allow_listed(&spans[0]);
+
+    let (active, durations) = harness.snapshot();
+    assert_eq!(active, 0, "the guard is dropped with the request future");
+    assert_eq!(durations.values().sum::<u64>(), 1);
+}
+
+/// Aborting the task that runs the handler, as runtime shutdown does, takes
+/// the same path as a timeout: cancelled, not panicked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborting_a_pending_handler_is_not_recorded_as_a_panic() {
+    let harness = Harness::new();
+    let router = harness.router.clone();
+    let request = Request::builder().uri("/hang").body(Body::empty()).unwrap();
+    let task = tokio::spawn(router.oneshot(request).with_subscriber(harness.dispatch.clone()));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(harness.finished_spans().is_empty(), "still in flight");
+
+    task.abort();
+    let outcome = task.await;
+    assert!(outcome.unwrap_err().is_cancelled());
+
+    let spans = harness.finished_spans();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].status, opentelemetry::trace::Status::Unset);
+    assert_eq!(attribute(&spans[0], "error.type"), Some(&Value::from("cancelled")));
+    assert_allow_listed(&spans[0]);
+
+    let (active, durations) = harness.snapshot();
+    assert_eq!(active, 0);
     assert_eq!(durations.values().sum::<u64>(), 1);
 }
 

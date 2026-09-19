@@ -2,10 +2,11 @@
 //! interprets itself.
 //!
 //! Only the variables the SDK or exporter would otherwise fall back on
-//! silently are validated here (exporter selection, protocol, service name,
-//! and the global kill switch). Endpoint, header, timeout, sampler, and batch
-//! settings are read by the SDK and OTLP exporter directly, which already
-//! implement the signal-specific → generic → default precedence rules.
+//! silently, or reject with an unhelpful message, are validated here
+//! (exporter selection, protocol, compression, service name, and the global
+//! kill switch). Endpoint, header, timeout, sampler, and batch settings are
+//! read by the SDK and OTLP exporter directly, which already implement the
+//! signal-specific → generic → default precedence rules.
 
 use std::fmt;
 use std::time::Duration;
@@ -19,6 +20,9 @@ pub const OTEL_METRICS_EXPORTER: &str = "OTEL_METRICS_EXPORTER";
 pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
 pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
 pub const OTEL_EXPORTER_OTLP_METRICS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL";
+pub const OTEL_EXPORTER_OTLP_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_COMPRESSION";
+pub const OTEL_EXPORTER_OTLP_TRACES_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION";
+pub const OTEL_EXPORTER_OTLP_METRICS_COMPRESSION: &str = "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION";
 
 /// Which exporter a signal is delivered to.
 ///
@@ -76,6 +80,31 @@ impl fmt::Display for OtlpProtocol {
     }
 }
 
+/// Compression applied to OTLP export request bodies.
+///
+/// Only `gzip` is compiled in (`zstd` would add a C dependency). The
+/// exporter's own parser rejects the specification's `none` value, so the
+/// only way to disable compression is to leave the variable unset — which
+/// this type mirrors rather than papering over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OtlpCompression {
+    #[default]
+    None,
+    Gzip,
+}
+
+impl OtlpCompression {
+    fn parse(var: &'static str, value: &str) -> Result<Self, TelemetryConfigError> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "gzip" => Ok(Self::Gzip),
+            _ => Err(TelemetryConfigError::UnsupportedCompression {
+                var,
+                value: value.to_owned(),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TelemetryConfigError {
     #[error("{var} must be `true` or `false`, got `{value}`")]
@@ -84,6 +113,8 @@ pub enum TelemetryConfigError {
     UnknownExporter { var: &'static str, value: String },
     #[error("{var} must be `http/protobuf` (gRPC is unavailable below Rust 1.88), got `{value}`")]
     UnsupportedProtocol { var: &'static str, value: String },
+    #[error("{var} must be `gzip` or unset (zstd is not compiled in), got `{value}`")]
+    UnsupportedCompression { var: &'static str, value: String },
 }
 
 /// Validated telemetry settings.
@@ -92,6 +123,11 @@ pub struct TelemetryConfig {
     traces: ExporterSelection,
     metrics: ExporterSelection,
     protocol: OtlpProtocol,
+    /// Per-signal compression, already resolved with the signal-specific →
+    /// generic → unset precedence so the exporter never has to read the
+    /// compression variables itself.
+    traces_compression: OtlpCompression,
+    metrics_compression: OtlpCompression,
     service_name: String,
     /// Programmatic OTLP endpoint. Overrides every endpoint environment
     /// variable, so it is only set by embedding code and tests, never from
@@ -116,6 +152,8 @@ impl TelemetryConfig {
             traces: ExporterSelection::None,
             metrics: ExporterSelection::None,
             protocol: OtlpProtocol::HttpProtobuf,
+            traces_compression: OtlpCompression::None,
+            metrics_compression: OtlpCompression::None,
             service_name: DEFAULT_SERVICE_NAME.to_owned(),
             otlp_endpoint: None,
             otlp_timeout: None,
@@ -159,6 +197,22 @@ impl TelemetryConfig {
         for var in [OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, OTEL_EXPORTER_OTLP_METRICS_PROTOCOL] {
             parse_protocol(var, lookup(var).as_deref())?;
         }
+        let compression = parse_compression(
+            OTEL_EXPORTER_OTLP_COMPRESSION,
+            lookup(OTEL_EXPORTER_OTLP_COMPRESSION).as_deref(),
+        )?;
+        let traces_compression = parse_compression(
+            OTEL_EXPORTER_OTLP_TRACES_COMPRESSION,
+            lookup(OTEL_EXPORTER_OTLP_TRACES_COMPRESSION).as_deref(),
+        )?
+        .or(compression)
+        .unwrap_or_default();
+        let metrics_compression = parse_compression(
+            OTEL_EXPORTER_OTLP_METRICS_COMPRESSION,
+            lookup(OTEL_EXPORTER_OTLP_METRICS_COMPRESSION).as_deref(),
+        )?
+        .or(compression)
+        .unwrap_or_default();
         let service_name = lookup(OTEL_SERVICE_NAME)
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
@@ -168,6 +222,8 @@ impl TelemetryConfig {
             traces,
             metrics,
             protocol,
+            traces_compression,
+            metrics_compression,
             service_name,
             otlp_endpoint: None,
             otlp_timeout: None,
@@ -203,6 +259,16 @@ impl TelemetryConfig {
     #[must_use]
     pub fn protocol(&self) -> OtlpProtocol {
         self.protocol
+    }
+
+    #[must_use]
+    pub fn traces_compression(&self) -> OtlpCompression {
+        self.traces_compression
+    }
+
+    #[must_use]
+    pub fn metrics_compression(&self) -> OtlpCompression {
+        self.metrics_compression
     }
 
     #[must_use]
@@ -250,6 +316,15 @@ fn parse_protocol(var: &'static str, value: Option<&str>) -> Result<OtlpProtocol
     match value.map(str::trim) {
         None | Some("") => Ok(OtlpProtocol::HttpProtobuf),
         Some(value) => OtlpProtocol::parse(var, value),
+    }
+}
+
+/// `None` when the variable is unset, so a signal-specific variable can fall
+/// back to the generic one.
+fn parse_compression(var: &'static str, value: Option<&str>) -> Result<Option<OtlpCompression>, TelemetryConfigError> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(value) => OtlpCompression::parse(var, value).map(Some),
     }
 }
 
@@ -346,6 +421,51 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(config.protocol(), OtlpProtocol::HttpProtobuf);
+    }
+
+    #[test]
+    fn compression_defaults_to_none_and_accepts_gzip() {
+        let config = config_from(&[("OTEL_TRACES_EXPORTER", "otlp")]).unwrap();
+        assert_eq!(config.traces_compression(), OtlpCompression::None);
+        assert_eq!(config.metrics_compression(), OtlpCompression::None);
+
+        let config = config_from(&[
+            ("OTEL_TRACES_EXPORTER", "otlp"),
+            ("OTEL_METRICS_EXPORTER", "otlp"),
+            ("OTEL_EXPORTER_OTLP_COMPRESSION", " GZIP "),
+        ])
+        .unwrap();
+        assert_eq!(config.traces_compression(), OtlpCompression::Gzip);
+        assert_eq!(config.metrics_compression(), OtlpCompression::Gzip);
+    }
+
+    #[test]
+    fn signal_specific_compression_overrides_the_generic_variable() {
+        let config = config_from(&[
+            ("OTEL_TRACES_EXPORTER", "otlp"),
+            ("OTEL_METRICS_EXPORTER", "otlp"),
+            ("OTEL_EXPORTER_OTLP_TRACES_COMPRESSION", "gzip"),
+        ])
+        .unwrap();
+        assert_eq!(config.traces_compression(), OtlpCompression::Gzip);
+        assert_eq!(config.metrics_compression(), OtlpCompression::None);
+    }
+
+    #[test]
+    fn unsupported_compression_is_rejected_on_every_compression_variable() {
+        for var in [
+            "OTEL_EXPORTER_OTLP_COMPRESSION",
+            "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+            "OTEL_EXPORTER_OTLP_METRICS_COMPRESSION",
+        ] {
+            for value in ["zstd", "none"] {
+                let error = config_from(&[("OTEL_TRACES_EXPORTER", "otlp"), (var, value)]).unwrap_err();
+                assert!(
+                    matches!(&error, TelemetryConfigError::UnsupportedCompression { var: failed, value: got } if *failed == var && got == value),
+                    "{var}={value}: {error}"
+                );
+            }
+        }
     }
 
     #[test]
