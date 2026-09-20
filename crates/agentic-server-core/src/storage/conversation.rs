@@ -77,7 +77,8 @@ impl ConversationStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if a stored item is missing its sequence number or if the database query fails.
+    /// Returns an error if a stored item is invalid or missing its sequence number,
+    /// or if the database query fails.
     pub async fn rehydrate(&self, conversation_id: &str) -> StoreResult<Vec<InOutItem>> {
         Ok(self.rehydrate_snapshot(conversation_id).await?.items)
     }
@@ -86,7 +87,8 @@ impl ConversationStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if a stored item is missing its sequence number or if the database query fails.
+    /// Returns an error if a stored item is invalid or missing its sequence number,
+    /// or if the database query fails.
     pub async fn rehydrate_snapshot(&self, conversation_id: &str) -> StoreResult<ConversationSnapshot> {
         let pool = self.pool()?;
         let snapshot_rows = conversation::get_snapshot(pool, conversation_id).await?;
@@ -103,8 +105,8 @@ impl ConversationStore {
             items: snapshot_rows
                 .items
                 .into_iter()
-                .filter_map(|row| row.as_inout())
-                .collect(),
+                .map(|row| InOutItem::try_from(&row))
+                .collect::<StoreResult<_>>()?,
             version: ConversationVersion::from_snapshot(last_sequence, snapshot_rows.latest_response_id),
         })
     }
