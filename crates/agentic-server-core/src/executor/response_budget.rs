@@ -18,8 +18,9 @@ use crate::types::io::output::{McpListTool, McpListTools, McpToolExecutionError,
 use crate::types::io::{
     AgentAttribution, AgentMessage, AgentMessageContent, CodeInterpreterCall, CodeInterpreterCallOutput,
     CompactionItem, CustomToolCall, FunctionToolCall, McpCall, McpCallError, MultiAgentCall, MultiAgentCallOutput,
-    MultiAgentCallOutputContent, OutputItem, OutputMessage, OutputMessageContent, OutputTextContent, OutputTextLogprob,
-    ReasoningOutput, ShellCall, ToolSearchCall, TopLogprob, WebSearchAction, WebSearchCall,
+    MultiAgentCallOutputContent, OpaqueReasoning, OutputItem, OutputMessage, OutputMessageContent, OutputTextContent,
+    OutputTextLogprob, ReasoningOutput, ReasoningSummaryContent, ShellCall, ToolSearchCall, TopLogprob, WebSearchAction,
+    WebSearchCall,
 };
 use crate::types::request_response::IncompleteDetails;
 #[cfg(test)]
@@ -275,7 +276,19 @@ impl RetainedSize for ShellCall {
 
 impl RetainedSize for ReasoningTextContent {
     fn retained_bytes(&self) -> usize {
-        RETAINED_CONTAINER_OVERHEAD_BYTES + self.type_.len() + self.text.len()
+        RETAINED_CONTAINER_OVERHEAD_BYTES + self.text.len()
+    }
+}
+
+impl RetainedSize for ReasoningSummaryContent {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES + self.text.len()
+    }
+}
+
+impl RetainedSize for OpaqueReasoning {
+    fn retained_bytes(&self) -> usize {
+        self.as_str().len()
     }
 }
 
@@ -284,7 +297,6 @@ impl RetainedSize for ReasoningOutput {
         RETAINED_CONTAINER_OVERHEAD_BYTES
             + self.agent.retained_bytes()
             + self.id.len()
-            + opt_len(self.status.as_ref())
             + self.encrypted_content.retained_bytes()
             + sum_retained(&self.content)
             + sum_retained(&self.summary)
@@ -754,19 +766,16 @@ mod tests {
         let reasoning = OutputItem::Reasoning(ReasoningOutput {
             agent: None,
             id: "rs_1".to_owned(),
-            status: Some("completed".to_owned()),
+            status: Some(crate::types::ReasoningStatus::Completed),
             content: vec![ReasoningTextContent::new("thought")],
             summary: vec![],
-            encrypted_content: Some(Value::String("encrypted_blob".to_owned())),
+            encrypted_content: Some(OpaqueReasoning::try_from("encrypted_blob".to_owned()).unwrap()),
         });
         assert_eq!(
             retained_output_item_bytes(&reasoning),
             RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "rs_1".len()
-                + "completed".len()
-                + RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "encrypted_blob".len()
-                + "reasoning_text".len()
                 + RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "thought".len()
         );

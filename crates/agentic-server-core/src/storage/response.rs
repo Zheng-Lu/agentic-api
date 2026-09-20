@@ -62,24 +62,29 @@ impl ResponseStore {
     ///
     /// # Errors
     ///
-    /// Returns error if database query fails or store is disabled.
+    /// Returns an error if a history item is missing or invalid, the database query
+    /// fails, or the store is disabled.
     pub async fn rehydrate(&self, response_id: &str) -> StoreResult<Vec<InOutItem>> {
         let pool = self.pool()?;
         let response = self.get(response_id).await?;
         let rows = item::get_items(pool, &response.history_item_ids).await?;
         let mut items_by_id: HashMap<String, InOutItem> = rows
             .into_iter()
-            .filter_map(|row| {
-                let id = row.id.clone();
-                row.as_inout().map(|item| (id, item))
+            .map(|row| {
+                let item = InOutItem::try_from(&row)?;
+                Ok((row.id, item))
             })
-            .collect();
+            .collect::<StoreResult<_>>()?;
 
         let ordered_items = response
             .history_item_ids
             .iter()
-            .filter_map(|id| items_by_id.remove(id))
-            .collect();
+            .map(|id| {
+                items_by_id
+                    .remove(id)
+                    .ok_or_else(|| StorageError::InvalidHistoryItem { item_id: id.clone() })
+            })
+            .collect::<StoreResult<_>>()?;
 
         Ok(ordered_items)
     }
