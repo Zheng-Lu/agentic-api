@@ -36,7 +36,13 @@ that fails item decoding. Response history also rejects a missing referenced row
 This prevents legacy malformed reasoning from silently disappearing after schema
 tightening. Database rows are neither rewritten nor deleted, and no SQL migration
 is required for this slice. Valid existing records keep their wire representation.
-This is not yet comprehensive validation of response metadata or replay provenance.
+Response history references and effective metadata now also decode fallibly. Malformed
+JSON, wrong field types, and explicit JSON `null` fail closed instead of becoming empty
+history or default settings. SQL NULL retains its existing legacy behavior; it does not
+establish replay provenance. A missing captured conversation response or a reference
+to another conversation is an error when loading versioned metadata. Parse diagnostics
+are intentionally excluded from storage errors because they may echo stored secrets.
+These checks do not establish provider identity or authorize opaque replay.
 
 ## Remaining slices before enabling a provider profile
 
@@ -44,7 +50,7 @@ This is not yet comprehensive validation of response metadata or replay provenan
    credential realm, compatible model family, and opaque format. Never select a
    permissive policy from the client-supplied model name alone.
 2. Carry typed, versioned per-item provenance through durable history and transient
-   session checkpoints, with fail-closed metadata decoding and a storage migration.
+   session checkpoints, extending the fail-closed metadata decoding with a storage migration.
    Distinguish provider-issued state from manually submitted state; successful
    upstream acceptance must not silently upgrade manual provenance.
 3. Project compatible reasoning only in the upstream request copy. Keep the single
@@ -70,6 +76,10 @@ nullability, exact string round trips, redaction, and the decoded-byte ceiling.
 Accumulator tests cover malformed strict completion and retained-budget exhaustion,
 including arrays of empty typed parts. Storage tests cover invalid and missing rows;
 stateful and session tests retain the existing vLLM continuation behavior.
+`storage_response_integrity_test.rs` additionally verifies invalid metadata and history
+references, legacy SQL NULL handling, missing/foreign captured turns, error redaction,
+and refusal to persist a child of an invalid parent. A recorded initial exchange checks
+that malformed continuation metadata fails before either JSON or SSE inference starts.
 
 No captured YAML was hand-authored or modified for this slice. Future provider replay
 scenarios must use the cassette README's recorder workflow and staged validation.
