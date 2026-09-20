@@ -8,6 +8,48 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use thiserror::Error;
 
+/// Canonical reasoning item. Content containers and text are charged to the
+/// shared retained-response budget during ingestion, including empty parts.
+/// Input and stored history retain the public representation, not a replay projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ReasoningOutput {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    pub content: Vec<ReasoningTextContent>,
+    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
+    pub summary: Vec<ReasoningSummaryContent>,
+    pub encrypted_content: Option<OpaqueReasoning>,
+    pub status: Option<ReasoningStatus>,
+    /// Server-owned observation retained in storage and transient checkpoints only.
+    /// Ignored in client/upstream JSON and excluded from public `OpenAPI` schemas.
+    #[serde(skip)]
+    #[cfg_attr(feature = "openapi", schema(ignore))]
+    pub replay_provenance: Option<crate::types::reasoning_replay::ReasoningProvenance>,
+}
+
+fn deserialize_nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
+impl ReasoningOutput {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            content: vec![],
+            summary: vec![],
+            encrypted_content: None,
+            status: None,
+            replay_provenance: None,
+        }
+    }
+}
+
 /// Absolute decoded-byte ceiling for one opaque reasoning value (16 MiB).
 ///
 /// This is a gateway safety limit, not a provider limit. Request admission,

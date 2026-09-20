@@ -151,6 +151,10 @@ sequence index are missing, or if the four integer columns still need widening. 
 with a DDL-capable migration role before starting the DML-only gateway role. When using `psql`, pass
 `-v ON_ERROR_STOP=1` so any statement failure stops the script:
 
+Apply all repository migrations first, including `0005_reasoning_provenance.sql`, which adds nullable
+`items.reasoning_provenance` TEXT without backfilling legacy rows. Startup and readiness require this column.
+Leave legacy values NULL; do not infer provenance from item JSON or response metadata.
+
 ```sql
 BEGIN;
 ALTER TABLE conversations

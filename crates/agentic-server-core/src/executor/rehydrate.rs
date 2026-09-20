@@ -160,10 +160,12 @@ pub async fn rehydrate_in_session(
 }
 
 pub(crate) async fn rehydrate_with_continuation(
-    request: RequestPayload,
+    mut request: RequestPayload,
     exec_ctx: &ExecutionContext,
     continuation: Option<ResponseContinuation>,
 ) -> ExecutorResult<RequestContext> {
+    exec_ctx.responses_config.reasoning_replay_policy.validate()?;
+    super::replay::mark_client_input(&mut request.input);
     // Fail before storage work for new files; check again once history is resolved.
     validate_message_content(&request.input)?;
     let response_id = uuid7_str("resp_");
@@ -427,6 +429,7 @@ mod tests {
             encrypted_content: encrypted_content
                 .map(|text| crate::types::OpaqueReasoning::try_from(text.to_owned()).unwrap()),
             status: Some(crate::types::ReasoningStatus::Completed),
+            replay_provenance: None,
         })
     }
 

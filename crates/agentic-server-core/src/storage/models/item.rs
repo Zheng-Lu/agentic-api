@@ -1,15 +1,19 @@
 //! Conversation history item stored in the database.
 
+mod insert;
+pub(crate) use insert::InsertItem;
+
 use serde_json::Value;
 use std::fmt::Write;
 use tracing::warn;
 
 use super::super::pool::{DbPool, DbResult, DbTransaction};
 use super::super::types::item::{InOutItem, ItemKind, STORED_ITEM_KIND_KEY};
-use crate::types::io::{InputItem, OutputItem};
+use crate::types::io::{InputItem, OutputItem, ReasoningOutput};
+use crate::types::reasoning_replay::MAX_REASONING_PROVENANCE_BYTES;
 use crate::utils::common::{deserialize_from_str_opt, utcnow_str};
 
-const ITEM_COLUMN_COUNT: usize = 5;
+const ITEM_COLUMN_COUNT: usize = 6;
 const SEQUENCE_COLUMN_INDEX: usize = 4;
 const MAX_BIND_PARAMETERS: usize = 999;
 const MAX_ITEMS_PER_INSERT: usize = MAX_BIND_PARAMETERS / ITEM_COLUMN_COUNT;
@@ -35,6 +39,8 @@ pub struct Item {
 
     /// Optional sequence number within conversation.
     pub seq: Option<i64>,
+    /// Versioned server-owned provenance, separate from untrusted public JSON.
+    pub reasoning_provenance: Option<String>,
 }
 
 impl Item {
@@ -49,13 +55,33 @@ impl Item {
     /// Deserialize data column as `InputItem`.
     #[must_use]
     pub fn as_input(&self) -> Option<InputItem> {
-        serde_json::from_value(self.data_without_storage_marker()?).ok()
+        let mut item = serde_json::from_value(self.data_without_storage_marker()?).ok()?;
+        self.restore_provenance(match &mut item {
+            InputItem::Reasoning(reasoning) => Some(reasoning),
+            _ => None,
+        })?;
+        Some(item)
     }
 
     /// Deserialize data column as `OutputItem`.
     #[must_use]
     pub fn as_output(&self) -> Option<OutputItem> {
-        serde_json::from_value(self.data_without_storage_marker()?).ok()
+        let mut item = serde_json::from_value(self.data_without_storage_marker()?).ok()?;
+        self.restore_provenance(match &mut item {
+            OutputItem::Reasoning(reasoning) => Some(reasoning),
+            _ => None,
+        })?;
+        Some(item)
+    }
+
+    fn restore_provenance(&self, reasoning: Option<&mut ReasoningOutput>) -> Option<()> {
+        if let Some(json) = &self.reasoning_provenance {
+            if json.len() > MAX_REASONING_PROVENANCE_BYTES {
+                return None;
+            }
+            reasoning?.replay_provenance = Some(deserialize_from_str_opt(json)?);
+        }
+        Some(())
     }
 
     /// Deserialize data column as either `InputItem` or `OutputItem`.
@@ -135,9 +161,9 @@ fn item_values_clause(row_count: usize, first_bind_index: usize, sequence_from_c
 ///
 /// # Errors
 /// Returns `DbResult::Err` if the database insertion fails.
-pub async fn create_in_tx(
+pub(crate) async fn create_in_tx(
     tx: &mut DbTransaction<'_>,
-    items: Vec<(String, String)>,
+    items: Vec<InsertItem>,
     conversation_id: Option<&str>,
 ) -> DbResult<Vec<Item>> {
     if items.is_empty() {
@@ -156,18 +182,22 @@ pub async fn create_in_tx(
     Ok(created)
 }
 
-async fn create_in_tx_without_conversation(
-    tx: &mut DbTransaction<'_>,
-    items: &[(String, String)],
-) -> DbResult<Vec<Item>> {
+async fn create_in_tx_without_conversation(tx: &mut DbTransaction<'_>, items: &[InsertItem]) -> DbResult<Vec<Item>> {
     let now = utcnow_str();
     let values_clause = item_values_clause(items.len(), 1, false);
-    let sql =
-        format!("INSERT INTO items (id, data, created_at, conversation_id, seq) VALUES {values_clause} RETURNING *");
+    let sql = format!(
+        "INSERT INTO items (id, data, created_at, conversation_id, seq, reasoning_provenance) VALUES {values_clause} RETURNING *"
+    );
 
     let mut query = sqlx::query_as::<_, Item>(&sql);
-    for (id, data) in items {
-        query = query.bind(id).bind(data).bind(now).bind(None::<&str>).bind(None::<i64>);
+    for item in items {
+        query = query
+            .bind(&item.id)
+            .bind(&item.data)
+            .bind(now)
+            .bind(None::<&str>)
+            .bind(None::<i64>)
+            .bind(&item.reasoning_provenance);
     }
 
     query.fetch_all(&mut **tx).await
@@ -175,7 +205,7 @@ async fn create_in_tx_without_conversation(
 
 async fn create_in_tx_with_next_conversation_seq(
     tx: &mut DbTransaction<'_>,
-    items: &[(String, String)],
+    items: &[InsertItem],
     conversation_id: &str,
 ) -> DbResult<Vec<Item>> {
     let now = utcnow_str();
@@ -186,20 +216,21 @@ async fn create_in_tx_with_next_conversation_seq(
              FROM items \
              WHERE conversation_id = $1 \
          ) \
-         INSERT INTO items (id, data, created_at, conversation_id, seq) \
+         INSERT INTO items (id, data, created_at, conversation_id, seq, reasoning_provenance) \
          VALUES {values_clause} \
          RETURNING *"
     );
 
     let mut query = sqlx::query_as::<_, Item>(&sql).bind(conversation_id);
     #[allow(clippy::cast_possible_wrap)]
-    for (idx, (id, data)) in items.iter().enumerate() {
+    for (idx, item) in items.iter().enumerate() {
         query = query
-            .bind(id)
-            .bind(data)
+            .bind(&item.id)
+            .bind(&item.data)
             .bind(now)
             .bind(conversation_id)
-            .bind(idx as i64);
+            .bind(idx as i64)
+            .bind(&item.reasoning_provenance);
     }
 
     query.fetch_all(&mut **tx).await
@@ -264,7 +295,7 @@ mod tests {
     fn item_values_clause_numbers_plain_rows() {
         assert_eq!(
             item_values_clause(2, 1, false),
-            "($1, $2, $3, $4, $5), ($6, $7, $8, $9, $10)"
+            "($1, $2, $3, $4, $5, $6), ($7, $8, $9, $10, $11, $12)"
         );
     }
 
@@ -272,8 +303,8 @@ mod tests {
     fn item_values_clause_numbers_conversation_rows_after_cte_bind() {
         assert_eq!(
             item_values_clause(2, 2, true),
-            "($2, $3, $4, $5, (SELECT start + $6 FROM next_seq)), \
-             ($7, $8, $9, $10, (SELECT start + $11 FROM next_seq))"
+            "($2, $3, $4, $5, (SELECT start + $6 FROM next_seq), $7), \
+             ($8, $9, $10, $11, (SELECT start + $12 FROM next_seq), $13)"
         );
     }
 
@@ -283,9 +314,9 @@ mod tests {
             .await
             .expect("create in-memory database");
         let items = (0..=MAX_BIND_PARAMETERS)
-            .map(|index| (format!("item_{index}"), "{}".to_owned()))
+            .map(|index| InsertItem::unmarked(format!("item_{index}"), "{}".to_owned()))
             .collect::<Vec<_>>();
-        let ids = items.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
         let mut transaction = pool.begin().await.expect("begin transaction");
         let created = create_in_tx(&mut transaction, items, None)
             .await
@@ -308,7 +339,7 @@ mod tests {
             .expect("create conversation");
         let item_count = MAX_ITEMS_PER_INSERT + 1;
         let items = (0..item_count)
-            .map(|index| (format!("conversation_item_{index}"), "{}".to_owned()))
+            .map(|index| InsertItem::unmarked(format!("conversation_item_{index}"), "{}".to_owned()))
             .collect::<Vec<_>>();
         let mut transaction = pool.begin().await.expect("begin transaction");
         let created = create_in_tx(&mut transaction, items, Some(conversation_id))
@@ -344,6 +375,7 @@ mod tests {
             created_at: 1_704_067_200,
             conversation_id: Some("conv_456".to_string()),
             seq: Some(1),
+            reasoning_provenance: None,
         };
 
         assert_eq!(item.id, "item_123");
@@ -359,6 +391,7 @@ mod tests {
             created_at: 1_704_067_200,
             conversation_id: None,
             seq: None,
+            reasoning_provenance: None,
         };
 
         assert!(item.conversation_id.is_none());
@@ -386,6 +419,7 @@ mod tests {
             created_at: 1_704_067_200,
             conversation_id: None,
             seq: None,
+            reasoning_provenance: None,
         };
 
         let Some(InOutItem::Output(OutputItem::Reasoning(reasoning))) = item.as_inout() else {
@@ -422,6 +456,7 @@ mod tests {
             created_at: 1_704_067_200,
             conversation_id: None,
             seq: None,
+            reasoning_provenance: None,
         };
 
         let stored = item.as_inout().expect("stored item");
@@ -447,6 +482,7 @@ mod tests {
             created_at: 1_704_067_200,
             conversation_id: None,
             seq: None,
+            reasoning_provenance: None,
         };
 
         let inputs = InOutItem::into_input_items(vec![item.as_inout().expect("stored item")]);
@@ -482,6 +518,7 @@ mod tests {
             created_at: 1_704_067_200,
             conversation_id: None,
             seq: None,
+            reasoning_provenance: None,
         };
 
         let inputs = InOutItem::into_input_items(vec![item.as_inout().expect("stored shell item")]);
@@ -524,6 +561,7 @@ mod tests {
                 created_at: 1_704_067_200,
                 conversation_id: None,
                 seq: Some(idx.try_into().expect("seq")),
+                reasoning_provenance: None,
             })
             .map(|item| item.as_inout().expect("stored item"))
             .collect();
@@ -557,6 +595,7 @@ mod tests {
             created_at: 1_704_067_200,
             conversation_id: None,
             seq: None,
+            reasoning_provenance: None,
         };
 
         let inputs = InOutItem::into_input_items(vec![item.as_inout().expect("stored item")]);

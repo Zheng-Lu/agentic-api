@@ -2,7 +2,7 @@
 
 Tracking issue: [#335](https://github.com/vllm-project/agentic-api/issues/335).
 
-## Current slice: typed reasoning foundation
+## Completed foundation: typed reasoning
 
 This slice does **not** enable opaque reasoning replay. The executor still uses the
 existing vLLM replay policy: join usable plaintext content, omit summaries from the
@@ -35,7 +35,7 @@ Both stores now return `StorageError::InvalidHistoryItem` instead of skipping a 
 that fails item decoding. Response history also rejects a missing referenced row.
 This prevents legacy malformed reasoning from silently disappearing after schema
 tightening. Database rows are neither rewritten nor deleted, and no SQL migration
-is required for this slice. Valid existing records keep their wire representation.
+was required for that foundation. Valid existing records keep their wire representation.
 Response history references and effective metadata now also decode fallibly. Malformed
 JSON, wrong field types, and explicit JSON `null` fail closed instead of becoming empty
 history or default settings. SQL NULL retains its existing legacy behavior; it does not
@@ -44,23 +44,89 @@ to another conversation is an error when loading versioned metadata. Parse diagn
 are intentionally excluded from storage errors because they may echo stored secrets.
 These checks do not establish provider identity or authorize opaque replay.
 
+## Current slice: server policy and per-item provenance
+
+Opaque replay remains disabled. Server configuration now accepts an explicit typed
+`responses.reasoning_replay_policy`; its default and only executable value is
+`vllm_plaintext`. The reserved `opaque_responses` value returns a typed core error
+before rehydration, tool discovery, inference, compaction, or external commit. Startup
+also rejects it before opening storage. No policy is inferred from the request model.
+
+```toml
+[responses]
+reasoning_replay_policy = "vllm_plaintext"
+```
+
+`types/reasoning_replay.rs` owns the versioned `ReasoningProvenance` envelope:
+
+- SQL NULL means unknown legacy origin. It is never backfilled or upgraded implicitly.
+- `ClientSubmitted` marks manually supplied reasoning input and externally committed
+  output. Receiving a successful upstream response does not upgrade those items.
+- `Upstream` marks only output observed through the gateway's inference path. The
+  engine attaches it after the existing JSON/SSE ingestion path has assembled output,
+  before tool-round history, checkpoints, and persistence consume that output.
+
+Each upstream observation includes its policy and a fixed-size SHA-256 identity
+fingerprint. Domain-separated, fixed-width component hashes bind the configured
+Responses endpoint, effective per-request credential (including missing vs empty),
+requested model, and an optional authoritative reported model. Currently that last
+component is explicitly unknown: the pipeline rebuilds `response.model` from the
+request, so it cannot attest a resolved upstream snapshot. Unknown and reported model
+identities hash differently. Credential rotation, endpoint changes, policy changes,
+and requested-model changes also produce distinct identities. Neither credentials
+nor original identity strings are stored, and identity `Debug` output is redacted.
+This is an equality fingerprint, not an authorization grant, integrity MAC, provider
+attestation, or model-family compatibility claim. It observes the configured endpoint,
+not any final redirect destination. Redirect policy, authoritative model propagation
+through normalization/ingestion, approved snapshots, opaque format identity, and
+compatible-family rules remain enablement prerequisites.
+
+`ReasoningOutput.replay_provenance` is skipped on both serialization and
+deserialization and is absent from OpenAPI. Client or upstream JSON cannot set it.
+Internal output-to-input conversion and transient session forks preserve it; manual
+resubmission and the public split-execution persistence APIs always demote new output
+to client-submitted origin. Existing ancestor items retain their own origin through
+ephemeral-to-durable promotion and branching.
+
+Migration `0005_reasoning_provenance.sql` adds nullable `items.reasoning_provenance`
+TEXT, separately from public item JSON. It rewrites no existing data and establishes
+no provenance for legacy rows. Both stores insert and restore it atomically with each
+item, including batched inserts. Unknown versions/fields, malformed or oversized
+envelopes (maximum 512 UTF-8 bytes), and provenance on non-reasoning items fail closed
+with redacted `InvalidHistoryItem` errors. Missing provenance remains readable under
+the default vLLM policy but cannot qualify opaque state for future replay.
+
+Supervisor-managed schemas must apply migration 0005 before this gateway starts.
+Startup compatibility checks and readiness probes require the new column. Do not
+drop it on rollback: older writers can leave NULL, which must remain unknown to a
+future opaque profile. No public JSON field or SSE/WebSocket event is added.
+
+Shared retained-response accounting and session checkpoint budgets charge fixed
+inline provenance space for every reasoning item, even before it has an origin.
+Checkpoint limits cover serialized bytes plus this fixed non-wire charge, not total
+heap memory. Existing ownership, reservation/refund, cancellation and drop behavior
+is unchanged. This slice adds no task, queue, parser, or client emission path.
+
+Rust callers using struct literals must supply the new `ResponsesConfig` policy
+(or use `..ResponsesConfig::default()`) and `ReasoningOutput` provenance (prefer
+`ReasoningOutput::new`). The latter remains re-exported at its existing paths.
+Raw storage `Item` rows now include the nullable provenance column; low-level item
+insertion is crate-private so callers use typed `ResponseStore`/`ConversationStore`
+operations instead of supplying arbitrary serialized SQL item data.
+
 ## Remaining slices before enabling a provider profile
 
-1. Add explicit server-owned replay-domain configuration, binding provider endpoint,
-   credential realm, compatible model family, and opaque format. Never select a
-   permissive policy from the client-supplied model name alone.
-2. Carry typed, versioned per-item provenance through durable history and transient
-   session checkpoints, extending the fail-closed metadata decoding with a storage migration.
-   Distinguish provider-issued state from manually submitted state; successful
-   upstream acceptance must not silently upgrade manual provenance.
-3. Project compatible reasoning only in the upstream request copy. Keep the single
+1. Extend the server-owned policy with an approved provider/model/opaque-format
+   profile, authoritative model evidence and redirect rules. Enforce the provenance match before any upstream I/O;
+   the observational fingerprint added here is not sufficient to enable a profile.
+2. Project compatible reasoning only in the upstream request copy. Keep the single
    `OutputItem::to_input_item` conversion and existing ingestion path. Select strict
    terminal validation for the opaque profile rather than introducing a second
    state machine. Retain the vLLM default.
-4. Separate local plaintext compaction checkpoints from provider opaque compaction.
+3. Separate local plaintext compaction checkpoints from provider opaque compaction.
    Reject unsupported combinations before inference. Qualify tool-round ordering,
    branching, HTTP/SSE, and transient WebSocket continuations with recorded exchanges.
-5. Close the streaming producer abort/join gap with #244 before production enablement.
+4. Close the streaming producer abort/join gap with #244 before production enablement.
 
 The upstream contract requires preserving opaque state and limits reasoning reuse
 to compatible model families; see the
@@ -84,6 +150,14 @@ that malformed continuation metadata fails before either JSON or SSE inference s
 No captured YAML was hand-authored or modified for this slice. Future provider replay
 scenarios must use the cassette README's recorder workflow and staged validation.
 
+The `reasoning_provenance_*_test.rs` suites cover policy gating, JSON/OpenAPI exclusion,
+closed envelope decoding, exact opaque bytes, mixed-origin storage batches, branches,
+corrupt history, and a real pre-0005 SQLite upgrade with repeated startup. Execution
+tests replay existing recorder-generated Qwen and OpenAI JSON/SSE exchanges, checking
+durable and transient history, cancelled forks, promotion, and external-commit
+demotion. Unit tests additionally exercise fingerprint separation and non-wire budget
+charges/refunds. These local replays are not live provider qualification.
+
 The workspace suite (including OpenAPI and cassette tests), Clippy with warnings
 denied, and formatting checks passed with Rust 1.98. Opt-in ignored tests were not run:
 
@@ -95,5 +169,6 @@ cargo fmt --all -- --check
 
 Rust 1.85 verification currently stops at dependency MSRV checks: the existing
 lockfile includes dependencies requiring Rust 1.86–1.88. This slice does not change
-the dependency graph. Dependency and baseline language compatibility need a separate
+upstream dependency versions; `sha2` 0.10.9 was already locked and is now also a direct
+core dependency. Dependency and baseline language compatibility need a separate
 MSRV repair before the repository can claim the documented 1.85 release gate.

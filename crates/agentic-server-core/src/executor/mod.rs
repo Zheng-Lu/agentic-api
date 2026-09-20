@@ -14,6 +14,7 @@ pub mod modes;
 pub mod persist;
 mod prepare;
 pub mod rehydrate;
+mod replay;
 pub mod request;
 pub mod session;
 pub mod translate;

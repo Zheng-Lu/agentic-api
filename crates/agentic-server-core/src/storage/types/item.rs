@@ -56,6 +56,9 @@ fn serialized_values_equal<T: Serialize>(left: &T, right: &T) -> bool {
 
 impl PartialEq for InOutItem {
     fn eq(&self, other: &Self) -> bool {
+        if self.reasoning_provenance() != other.reasoning_provenance() {
+            return false;
+        }
         match (self, other) {
             (Self::Input(left), Self::Input(right)) => serialized_values_equal(left, right),
             (Self::Output(left), Self::Output(right)) => serialized_values_equal(left, right),
@@ -117,6 +120,17 @@ impl TryFrom<&InOutItem> for String {
 }
 
 impl InOutItem {
+    /// Borrow internal provenance without serializing a public item or changing its kind.
+    #[must_use]
+    pub fn reasoning_provenance(&self) -> Option<&crate::types::reasoning_replay::ReasoningProvenance> {
+        match self {
+            Self::Input(InputItem::Reasoning(item)) | Self::Output(OutputItem::Reasoning(item)) => {
+                item.replay_provenance.as_ref()
+            }
+            _ => None,
+        }
+    }
+
     /// Converts stored history into input items for continuation processing.
     /// Internal items are removed later by `ResponsesInput::model_input`.
     #[must_use]

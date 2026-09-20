@@ -155,6 +155,10 @@ impl ExecutionContext {
     /// Returns an error if the database pool cannot be opened or the schema
     /// migration fails.
     pub async fn from_config(cfg: &Config) -> Result<Self, Error> {
+        cfg.responses
+            .reasoning_replay_policy
+            .validate()
+            .map_err(|error| Error::Config(error.to_string()))?;
         let default_db_url = cfg.db_url.is_none().then(default_database_url).transpose()?;
         let db_url = cfg
             .db_url
@@ -269,6 +273,35 @@ mod tests {
         assert_eq!(parse_streaming_timeout(Some("0")), Duration::ZERO);
         // A valid value is honored.
         assert_eq!(parse_streaming_timeout(Some("30")), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn disabled_reasoning_policy_is_rejected_before_opening_storage() {
+        use crate::config::{Config, ResponsesConfig};
+        use crate::error::Error;
+
+        let cfg = Config {
+            llm_api_base: "http://127.0.0.1:1".to_owned(),
+            openai_api_key: None,
+            llm_ready_timeout_s: 1.0,
+            llm_ready_interval_s: 1.0,
+            skip_llm_ready_check: true,
+            db_url: Some("unsupported://must-not-be-opened".to_owned()),
+            postgres: crate::config::PostgresConfig::default(),
+            sqlite: crate::config::SqliteConfig::default(),
+            tools: crate::config::ToolRuntimeConfig::default(),
+            responses: ResponsesConfig {
+                reasoning_replay_policy: crate::types::reasoning_replay::ReasoningReplayPolicy::OpaqueResponses,
+                ..ResponsesConfig::default()
+            },
+        };
+        let error = ExecutionContext::from_config(&cfg).await.unwrap_err();
+        assert!(matches!(error, Error::Config(_)));
+        assert_eq!(
+            error.to_string(),
+            Error::Config(crate::types::reasoning_replay::ReasoningReplayError::OpaqueNotEnabled.to_string())
+                .to_string()
+        );
     }
 
     #[test]

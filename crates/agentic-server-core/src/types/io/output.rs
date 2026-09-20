@@ -14,8 +14,10 @@ use super::input::{
     CompactionItem, InputContent, InputFunctionToolCall, InputItem, InputMessage, InputMessageContent,
     InputTextContent, InputToolSearchCall, deserialize_non_blank_string,
 };
-pub use super::reasoning::ReasoningTextContent;
-use super::reasoning::{OpaqueReasoning, ReasoningStatus, ReasoningSummaryContent};
+use super::reasoning::ReasoningSummaryContent;
+#[cfg(test)]
+use super::reasoning::{OpaqueReasoning, ReasoningStatus};
+pub use super::reasoning::{ReasoningOutput, ReasoningTextContent};
 use super::shell::ShellCall;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -704,42 +706,6 @@ impl TryFrom<&EventPayload> for McpCall {
             None,
             None,
         ))
-    }
-}
-
-/// Canonical reasoning item. Content containers and text are charged to the
-/// shared retained-response budget during ingestion, including empty parts.
-/// Input and stored history retain the public representation, not a replay projection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct ReasoningOutput {
-    #[serde(default)]
-    pub id: String,
-    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
-    pub content: Vec<ReasoningTextContent>,
-    #[serde(default, deserialize_with = "deserialize_nullable_vec")]
-    pub summary: Vec<ReasoningSummaryContent>,
-    pub encrypted_content: Option<OpaqueReasoning>,
-    pub status: Option<ReasoningStatus>,
-}
-
-fn deserialize_nullable_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
-}
-
-impl ReasoningOutput {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            content: vec![],
-            summary: vec![],
-            encrypted_content: None,
-            status: None,
-        }
     }
 }
 

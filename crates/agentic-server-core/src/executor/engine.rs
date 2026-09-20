@@ -6,9 +6,11 @@
 //! need per-request configuration.
 
 mod streaming;
+mod usage;
 #[cfg(test)]
 use streaming::panicked_stream_chunks;
 use streaming::run_stream;
+use usage::accumulate_usage;
 
 use std::sync::Arc;
 
@@ -90,32 +92,6 @@ fn classify_round(
         LoopDecision::Incomplete(format!("gateway tool execution exceeded {max_rounds} rounds"))
     } else {
         LoopDecision::Continue
-    }
-}
-
-fn add_usage(total: ResponseUsage, usage: ResponseUsage) -> ResponseUsage {
-    ResponseUsage {
-        input_tokens: total.input_tokens.saturating_add(usage.input_tokens),
-        output_tokens: total.output_tokens.saturating_add(usage.output_tokens),
-        total_tokens: total.total_tokens.saturating_add(usage.total_tokens),
-        input_tokens_details: crate::types::io::InputTokenDetails {
-            cached_tokens: total
-                .input_tokens_details
-                .cached_tokens
-                .saturating_add(usage.input_tokens_details.cached_tokens),
-        },
-        output_tokens_details: crate::types::io::OutputTokenDetails {
-            reasoning_tokens: total
-                .output_tokens_details
-                .reasoning_tokens
-                .saturating_add(usage.output_tokens_details.reasoning_tokens),
-        },
-    }
-}
-
-fn accumulate_usage(total: &mut Option<ResponseUsage>, usage: Option<ResponseUsage>) {
-    if let Some(usage) = usage {
-        *total = Some(total.map_or(usage, |current| add_usage(current, usage)));
     }
 }
 
@@ -272,6 +248,7 @@ impl<'a> EngineOrchestration<'a> {
                     Vec::new(),
                 )
             };
+            self.record_round_provenance(&mut payload, auth);
             accumulate_usage(&mut combined_usage, payload.usage.take());
             let current_output = std::mem::take(&mut payload.output);
             if matches!(payload.status.as_str(), "error" | "failed") {
@@ -317,8 +294,7 @@ impl<'a> EngineOrchestration<'a> {
                 // No gateway work remains — this turn is the final response.
                 LoopDecision::Done => {
                     finalize_loop(&mut payload, combined_output, combined_usage, &self.agent.request);
-                    let tool_search_metadata = self.agent.take_tool_search_metadata();
-                    return Ok((payload, tool_search_metadata));
+                    return Ok((payload, self.agent.take_tool_search_metadata()));
                 }
                 // Budget exhausted while the model was still requesting gateway
                 // tools: surface the accumulated work as a partial
@@ -357,6 +333,26 @@ impl<'a> EngineOrchestration<'a> {
             emit_deferred_stream_events(deferred_events, ctx, accumulator, sender, output_offset).await?;
         }
         Ok(())
+    }
+
+    fn record_round_provenance(&self, payload: &mut ResponsePayload, auth: Option<&str>) {
+        if !payload
+            .output
+            .iter()
+            .any(|item| matches!(item, OutputItem::Reasoning(_)))
+        {
+            return;
+        }
+        let policy = self.exec_ctx.responses_config.reasoning_replay_policy;
+        let identity = super::replay::upstream_identity(
+            policy,
+            &self.exec_ctx.responses_url(),
+            auth,
+            &self.agent.request.enriched_request.model,
+            // The pipeline reconstructs payload.model from the request; it is not provider evidence.
+            None,
+        );
+        super::replay::record_upstream_provenance(&mut payload.output, policy, identity);
     }
 
     fn record_gateway_results(&mut self, results: Vec<GatewayCallResult>) {

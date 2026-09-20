@@ -27,6 +27,9 @@ impl std::fmt::Display for ResourceLimit {
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ExecutorError {
+    /// A server-selected reasoning replay policy cannot safely execute.
+    #[error(transparent)]
+    ReasoningReplay(#[from] crate::types::reasoning_replay::ReasoningReplayError),
     /// A storage layer operation failed.
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),

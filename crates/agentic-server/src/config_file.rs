@@ -106,6 +106,8 @@ impl ModelFileConfig {
 #[allow(clippy::struct_field_names)]
 pub(crate) struct ResponsesFileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_replay_policy: Option<agentic_core::types::reasoning_replay::ReasoningReplayPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_retained_bytes: Option<NonZeroUsize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_upstream_json_bytes: Option<NonZeroUsize>,
@@ -117,7 +119,8 @@ pub(crate) struct ResponsesFileConfig {
 
 impl ResponsesFileConfig {
     fn is_empty(&self) -> bool {
-        self.max_retained_bytes.is_none()
+        self.reasoning_replay_policy.is_none()
+            && self.max_retained_bytes.is_none()
             && self.max_upstream_json_bytes.is_none()
             && self.max_upstream_sse_line_bytes.is_none()
             && self.max_stream_event_bytes.is_none()
@@ -733,6 +736,26 @@ mod tests {
 
         let error = FileConfig::load(home.path()).expect_err("zero retained bytes must fail");
         assert!(error.to_string().contains("max_retained_bytes"));
+    }
+
+    #[test]
+    fn reasoning_replay_policy_is_typed_server_owned_configuration() {
+        use agentic_core::types::reasoning_replay::{ReasoningReplayError, ReasoningReplayPolicy};
+
+        let defaults: FileConfig = toml::from_str("").unwrap();
+        assert!(defaults.responses.reasoning_replay_policy.is_none());
+        let explicit: FileConfig = toml::from_str("[responses]\nreasoning_replay_policy = 'vllm_plaintext'").unwrap();
+        assert_eq!(
+            explicit.responses.reasoning_replay_policy,
+            Some(ReasoningReplayPolicy::VllmPlaintext)
+        );
+        assert!(toml::to_string(&explicit).unwrap().contains("reasoning_replay_policy"));
+        let opaque: FileConfig = toml::from_str("[responses]\nreasoning_replay_policy = 'opaque_responses'").unwrap();
+        assert_eq!(
+            opaque.responses.reasoning_replay_policy.unwrap().validate(),
+            Err(ReasoningReplayError::OpaqueNotEnabled)
+        );
+        assert!(toml::from_str::<FileConfig>("[responses]\nreasoning_replay_policy = 'auto'").is_err());
     }
 
     #[test]

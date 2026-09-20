@@ -249,6 +249,7 @@ impl RetainedSize for OpaqueReasoning {
 impl RetainedSize for ReasoningOutput {
     fn retained_bytes(&self) -> usize {
         RETAINED_CONTAINER_OVERHEAD_BYTES
+            + crate::types::reasoning_replay::REASONING_PROVENANCE_RETAINED_BYTES
             + self.id.len()
             + self.encrypted_content.retained_bytes()
             + sum_retained(&self.content)
@@ -497,10 +498,12 @@ mod tests {
             content: vec![ReasoningTextContent::new("thought")],
             summary: vec![],
             encrypted_content: Some(OpaqueReasoning::try_from("encrypted_blob".to_owned()).unwrap()),
+            replay_provenance: None,
         });
         assert_eq!(
             retained_output_item_bytes(&reasoning),
             RETAINED_CONTAINER_OVERHEAD_BYTES
+                + crate::types::reasoning_replay::REASONING_PROVENANCE_RETAINED_BYTES
                 + "rs_1".len()
                 + "encrypted_blob".len()
                 + RETAINED_CONTAINER_OVERHEAD_BYTES

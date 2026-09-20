@@ -198,12 +198,11 @@ impl ConversationStore {
         let pool = self.pool()?;
 
         let mut item_ids: Vec<String> = Vec::new();
-        let mut items_: Vec<(String, String)> = Vec::new();
+        let mut items_ = Vec::new();
         for any_item in new_items {
             let item_id = uuid7_str("item_");
             item_ids.push(item_id.clone());
-            let data_str = String::try_from(&any_item)?;
-            items_.push((item_id, data_str));
+            items_.push(item::InsertItem::from_item(item_id, &any_item)?);
         }
         let history_item_ids_json = serialize_to_string(&item_ids)?;
         let metadata_json = String::try_from(metadata)?;

@@ -40,6 +40,8 @@ pub const MAX_STREAM_EVENT_BYTES_ENV: &str = "AGENTIC_MAX_STREAM_EVENT_BYTES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponsesConfig {
+    /// Server-owned projection policy. Opaque replay remains unavailable.
+    pub reasoning_replay_policy: crate::types::reasoning_replay::ReasoningReplayPolicy,
     pub max_retained_bytes: usize,
     pub max_upstream_json_bytes: usize,
     pub max_upstream_sse_line_bytes: usize,
@@ -49,6 +51,7 @@ pub struct ResponsesConfig {
 impl Default for ResponsesConfig {
     fn default() -> Self {
         Self {
+            reasoning_replay_policy: crate::types::reasoning_replay::ReasoningReplayPolicy::default(),
             max_retained_bytes: DEFAULT_MAX_RETAINED_RESPONSE_BYTES,
             max_upstream_json_bytes: DEFAULT_MAX_UPSTREAM_JSON_BYTES,
             max_upstream_sse_line_bytes: DEFAULT_MAX_UPSTREAM_SSE_LINE_BYTES,
@@ -58,7 +61,7 @@ impl Default for ResponsesConfig {
 }
 
 impl ResponsesConfig {
-    /// Validates internal consistency between configured limits.
+    /// Validates replay-policy availability and consistency between resource limits.
     ///
     /// The wire limits (`max_stream_event_bytes`, `max_upstream_sse_line_bytes`,
     /// and `max_upstream_json_bytes`) must exceed `max_retained_bytes` by proportional
@@ -67,8 +70,11 @@ impl ResponsesConfig {
     ///
     /// # Errors
     /// Returns [`Error::Config`] when streaming delivery, upstream line, or JSON limits
-    /// cannot admit the retained response plus wire headroom.
+    /// cannot admit the retained response plus wire headroom, or the replay policy is unavailable.
     pub fn validate(&self) -> Result<(), Error> {
+        self.reasoning_replay_policy
+            .validate()
+            .map_err(|error| Error::Config(error.to_string()))?;
         let headroom = MIN_WIRE_HEADROOM_BYTES.max(self.max_retained_bytes / 4);
         let required = self.max_retained_bytes.saturating_add(headroom);
         if self.max_stream_event_bytes < required {
@@ -624,6 +630,7 @@ mod tests {
             max_upstream_json_bytes: 2 * 1024 * 1024,
             max_upstream_sse_line_bytes: 2 * 1024 * 1024,
             max_stream_event_bytes: 2 * 1024 * 1024,
+            ..ResponsesConfig::default()
         };
         assert!(valid.validate().is_ok());
 
@@ -645,6 +652,7 @@ mod tests {
             max_upstream_json_bytes: 4 * 1024 * 1024 + 64 * 1024,
             max_upstream_sse_line_bytes: 5 * 1024 * 1024,
             max_stream_event_bytes: 5 * 1024 * 1024,
+            ..ResponsesConfig::default()
         };
         assert!(borderline.validate().is_err());
     }

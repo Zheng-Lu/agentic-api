@@ -120,7 +120,9 @@ impl ConversationHandler {
     /// # Errors
     /// Returns `ExecutorError` if `conversation_id` is absent on the context,
     /// the store is disabled, or the database operation fails.
-    pub async fn execute_turn(&self, mut ctx: RequestContext, output_items: Vec<OutputItem>) -> ExecutorResult<()> {
+    pub async fn execute_turn(&self, mut ctx: RequestContext, mut output_items: Vec<OutputItem>) -> ExecutorResult<()> {
+        crate::executor::replay::mark_client_items(&mut ctx.new_input_items);
+        crate::executor::replay::mark_external_output(&mut output_items);
         let metadata = ResponseMetadata {
             model: std::mem::take(&mut ctx.enriched_request.model),
             previous_response_id: ctx.original_request.previous_response_id.take(),
