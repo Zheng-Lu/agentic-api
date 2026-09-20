@@ -225,6 +225,12 @@ fn build_response(resp: MockResponse) -> Response {
             .body(axum::body::Body::from(body))
             .unwrap()
             .into_response(),
+        MockResponse::Status(status, body) => Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+            .into_response(),
     }
 }
 
@@ -232,6 +238,8 @@ fn build_response(resp: MockResponse) -> Response {
 pub enum MockResponse {
     Json(String),
     Sse(String),
+    /// A non-2xx JSON error body, as an upstream returns on failure.
+    Status(u16, String),
 }
 
 impl MockResponse {
@@ -255,6 +263,12 @@ impl MockResponse {
 // Use a VecDeque so pop_front is O(1).
 impl MockServer {
     pub async fn start_deque(responses: Vec<MockResponse>) -> Self {
+        Self::start_deque_on("/v1/responses", responses).await
+    }
+
+    /// Queue responses on an arbitrary upstream route (`/v1/messages` for the
+    /// Messages API); everything else matches [`Self::start_deque`].
+    pub async fn start_deque_on(path: &'static str, responses: Vec<MockResponse>) -> Self {
         use std::collections::VecDeque;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -269,7 +283,7 @@ impl MockServer {
         let handle = tokio::spawn(async move {
             let app = Router::new()
                 .route(
-                    "/v1/responses",
+                    path,
                     post(move |body: axum::body::Bytes| {
                         let queue = Arc::clone(&queue);
                         let requests = Arc::clone(&requests_for_route);

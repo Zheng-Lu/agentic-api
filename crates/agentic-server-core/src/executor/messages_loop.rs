@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::inference::fetch_response_json_with_headers;
@@ -25,6 +26,7 @@ use crate::executor::messages_context::MessagesRequestContext;
 use crate::executor::messages_request::web_search_budget_exhausted_result;
 use crate::executor::messages_usage::MessagesUsageTotals;
 use crate::executor::request::ExecutionContext;
+use crate::executor::telemetry::{Api, ExecutionSpan, FailureCategory, Route};
 use crate::tool::ToolRegistry;
 use crate::types::messages::{GatewayToolResult, tool_seam};
 use crate::utils::common::deserialize_from_str;
@@ -86,10 +88,35 @@ pub struct MessagesResponse<T> {
 /// Gateway-tool execution failures do **not** error — they become error
 /// `tool_result`s fed back to the model.
 pub async fn run_messages_loop(
+    ctx: MessagesRequestContext,
+    registry: &ToolRegistry,
+    exec_ctx: &ExecutionContext,
+    upstream: &MessagesUpstream,
+) -> ExecutorResult<MessagesResponse<Value>> {
+    let mut execution = ExecutionSpan::start(Api::Messages, Route::Executor, false);
+    let span = execution.span().clone();
+    let result = run_messages_loop_traced(ctx, registry, exec_ctx, upstream, &mut execution)
+        .instrument(span)
+        .await;
+    match &result {
+        // Every `Ok` path inside states its own execution outcome; the
+        // payload is now the handler's to send.
+        Ok(_) => execution.delivered(),
+        Err(error) => {
+            execution.failed(error);
+            execution.not_delivered();
+        }
+    }
+    result
+}
+
+/// The body of [`run_messages_loop`], inside the `agentic.execute` span.
+async fn run_messages_loop_traced(
     mut ctx: MessagesRequestContext,
     registry: &ToolRegistry,
     exec_ctx: &ExecutionContext,
     upstream: &MessagesUpstream,
+    execution: &mut ExecutionSpan,
 ) -> ExecutorResult<MessagesResponse<Value>> {
     // The loop drives turns itself; force non-streaming upstream regardless of
     // what the client asked (the handler routes streaming elsewhere).
@@ -111,6 +138,7 @@ pub async fn run_messages_loop(
         // Any error body from upstream is surfaced verbatim (handler maps it to
         // the Anthropic error envelope).
         if message.get("type").and_then(Value::as_str) == Some("error") {
+            execution.failed_with(FailureCategory::UpstreamError);
             return Ok(MessagesResponse {
                 body: message,
                 headers: response_headers,
@@ -125,6 +153,7 @@ pub async fn run_messages_loop(
         // the loop server-side — return the turn to the client (edge E7).
         let gateway_map = &exec_ctx.messages_gateway_tools;
         let Some(content) = content else {
+            execution.completed_with_stop_reason(stop_reason);
             return Ok(deliver(message, &mut usage, gateway_map, response_headers));
         };
         let mut gateway_calls: Vec<Value> = Vec::new();
@@ -143,6 +172,7 @@ pub async fn run_messages_loop(
         if has_client_tool_use {
             // Client execution takes precedence even when the provider labels a
             // named call end_turn. `deliver` keeps the hidden gateway calls out.
+            execution.completed_with_stop_reason(stop_reason);
             let mut message = message;
             if message["stop_reason"] == "end_turn" {
                 message["stop_reason"] = json!("tool_use");
@@ -158,6 +188,7 @@ pub async fn run_messages_loop(
                 gateway_calls.iter().filter_map(|call| call["name"].as_str()),
             )
         {
+            execution.completed_with_stop_reason(stop_reason);
             return Ok(deliver(message, &mut usage, gateway_map, response_headers));
         }
         // Pure gateway-tool round: execute the calls, then feed the model's FULL
@@ -173,6 +204,7 @@ pub async fn run_messages_loop(
     // last message. (Open Q1: a dedicated pause_turn signal could go here.)
     // Reaching here means every round emitted a gateway tool_use; surface a
     // minimal terminal so the client isn't left hanging.
+    execution.failed_with(FailureCategory::RoundBudget);
     Ok(MessagesResponse {
         body: json!({
             "type": "error",

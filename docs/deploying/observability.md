@@ -99,11 +99,52 @@ the response body fails mid-stream. A request dropped before any response
 existed — a timeout around the handler, the client disconnecting, or the
 runtime shutting down mid-request — carries `error.type=cancelled` with no
 status code and is **not** marked as an error. A `2xx` on a streaming
-response does **not** by itself mean the execution succeeded — execution
-outcomes are recorded on the execution spans added in phase 2.
+response does **not** by itself mean the execution succeeded — that is what
+the execution span below records.
 
 WebSocket upgrades on `/v1/responses` produce a span for the upgrade request
 only; the session itself is instrumented in phase 2.
+
+#### Execution span
+
+Every request the executor runs — Responses or Messages, streaming or not —
+produces one `agentic.execute` span as a child of `http.server.request`. It
+opens when the executor accepts the request and closes when the response
+payload has been handed back or, for a stream, when the last frame has been
+yielded or the client dropped the stream. Work done while streaming (later
+inference rounds, persistence after the last round) is attributed to it.
+
+| Attribute | Value |
+| --- | --- |
+| `agentic.api` | `responses` \| `messages` |
+| `agentic.route` | `executor` |
+| `agentic.stream` | Whether the client asked for a stream |
+| `agentic.execution.outcome` | `completed` \| `incomplete` \| `failed` \| `cancelled` |
+| `agentic.delivery.outcome` | `delivered` \| `disconnected` \| `not_started` |
+| `error.type` | On `failed` only, a bounded category derived from the error's *kind*, never its message: `storage`, `persistence`, `conversation_locked`, `upstream_status`, `upstream_transport`, `upstream_error`, `network`, `parse`, `stream`, `not_found`, `invalid_request`, `payload_too_large`, `resource_limit`, `round_budget`, `conflict`, `compaction`, `tool`, or `panic` |
+
+Execution and delivery are recorded separately because they answer different
+questions:
+
+- **`execution.outcome`** is what the executor concluded. `completed` and
+  `incomplete` (a Responses `incomplete` status or a Messages `max_tokens`
+  stop) are terminal results; `failed` marks the span with error status; and
+  `cancelled` means the executor was stopped before a terminal state — the
+  stream was dropped or the task was aborted at shutdown — and is not an
+  error.
+- **`delivery.outcome`** is whether the transport was handed everything the
+  execution produced: the payload, or the terminal streamed frame
+  (`delivered`); the stream was dropped before that frame (`disconnected`);
+  or the execution failed before there was anything to send (`not_started`).
+
+So an SSE `error` frame under an HTTP 200 is `execution=failed`,
+`delivery=delivered`; a client that leaves mid-stream is
+`execution=cancelled`, `delivery=disconnected`; and a Messages upstream error
+body, which the gateway relays verbatim, is `execution=failed`,
+`error.type=upstream_error` even though the handler never saw an `Err`.
+
+No request, response, or conversation identifier, model name, prompt, tool
+argument, or error message appears on the span.
 
 ### Metrics
 
