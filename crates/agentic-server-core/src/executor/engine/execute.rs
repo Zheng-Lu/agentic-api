@@ -28,6 +28,7 @@ pub struct ExecuteRequest {
     client_auth: Option<String>,
     continuation: Option<crate::executor::session::ResponseContinuation>,
     max_stream_event_bytes: Option<usize>,
+    execution: Option<ExecutionSpan>,
 }
 
 impl ExecuteRequest {
@@ -39,6 +40,7 @@ impl ExecuteRequest {
             client_auth: None,
             continuation: None,
             max_stream_event_bytes: None,
+            execution: None,
         }
     }
 
@@ -65,12 +67,29 @@ impl ExecuteRequest {
         self
     }
 
+    /// Continue the execution span opened by a transport when it admitted the request.
+    /// The executor takes responsibility for finalizing its outcomes.
+    #[must_use]
+    pub fn with_execution_span(mut self, execution: ExecutionSpan) -> Self {
+        self.execution = Some(execution);
+        self
+    }
+
     /// Retain this turn's continuation state in the supplied serial session.
     ///
     /// # Errors
     /// Returns an error when the session is busy or closed.
     pub fn with_session(mut self, session: &crate::executor::session::ResponseSession) -> ExecutorResult<Self> {
-        self.continuation = Some(session.begin(self.payload.previous_response_id.as_deref())?);
+        self.continuation = Some(
+            session
+                .begin(self.payload.previous_response_id.as_deref())
+                .inspect_err(|error| {
+                    if let Some(execution) = &mut self.execution {
+                        execution.failed(error);
+                        execution.not_delivered();
+                    }
+                })?,
+        );
         Ok(self)
     }
 
@@ -82,8 +101,11 @@ impl ExecuteRequest {
     ///
     /// # Errors
     /// Returns [`crate::executor::error::ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
-    pub async fn run(self) -> ExecutorResult<Either<ResponsePayload, BoxStream>> {
-        let execution = ExecutionSpan::start(Api::Responses, Route::Executor, self.payload.stream);
+    pub async fn run(mut self) -> ExecutorResult<Either<ResponsePayload, BoxStream>> {
+        let execution = self
+            .execution
+            .take()
+            .unwrap_or_else(|| ExecutionSpan::start(Api::Responses, Route::Executor, self.payload.stream));
         let span = execution.span().clone();
         self.run_traced(execution).instrument(span).await
     }

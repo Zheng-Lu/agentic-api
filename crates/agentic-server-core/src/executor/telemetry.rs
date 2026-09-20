@@ -24,6 +24,7 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 use tracing::{Span, field, info_span};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use super::error::ExecutorError;
 
@@ -216,13 +217,29 @@ impl ExecutionSpan {
     /// Open the span as a child of whatever span is current.
     #[must_use]
     pub fn start(api: Api, route: Route, stream: bool) -> Self {
+        Self::with_parent(api, route, stream, Span::current().id())
+    }
+
+    /// Start an independent execution trace linked to a long-lived session.
+    #[must_use]
+    pub fn start_linked(api: Api, route: Route, stream: bool, link: opentelemetry::trace::SpanContext) -> Self {
+        let execution = Self::with_parent(api, route, stream, None);
+        if link.is_valid() {
+            execution.span.add_link(link);
+        }
+        execution
+    }
+
+    fn with_parent(api: Api, route: Route, stream: bool, parent: Option<tracing::Id>) -> Self {
         // Field names must be literal here; the `ATTR_*` constants name the
         // same fields for `record` calls.
         let span = info_span!(
+            parent: parent,
             "agentic.execute",
             agentic.api = api.as_str(),
             agentic.route = route.as_str(),
             agentic.stream = stream,
+            agentic.queue.wait = field::Empty,
             agentic.execution.outcome = field::Empty,
             agentic.delivery.outcome = field::Empty,
             error.r#type = field::Empty,
