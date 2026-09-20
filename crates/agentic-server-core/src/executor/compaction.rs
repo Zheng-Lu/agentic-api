@@ -345,6 +345,7 @@ fn request_payload(model: String, input: ResponsesInput, instructions: Option<St
 ///
 /// Returns an invalid-request error for empty input, an upstream error for an unusable model
 /// summary, and propagates inference and serialization failures.
+#[tracing::instrument(name = "agentic.compaction", skip_all, fields(agentic.compaction.operation = "summarize"))]
 pub(crate) async fn compact_items(
     model: &str,
     input: ResponsesInput,

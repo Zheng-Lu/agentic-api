@@ -62,8 +62,9 @@ pub async fn run_messages_stream(
     ctx.force_stream(true);
     let mut execution = ExecutionSpan::start(Api::Messages, Route::Executor, true);
     let span = execution.span().clone();
+    let first_round = span.in_scope(|| super::telemetry::stages::inference_round(0));
     let primed = prime_messages_stream(&ctx, &exec_ctx, &upstream)
-        .instrument(span.clone())
+        .instrument(first_round.clone())
         .await;
     let first_response = match primed {
         Ok(first_response) => first_response,
@@ -74,7 +75,14 @@ pub async fn run_messages_stream(
         }
     };
     let response_headers = processed_response_headers(first_response.headers());
-    let body = messages_stream_body(ctx, registry, exec_ctx, upstream, first_response, execution);
+    let body = messages_stream_body(
+        ctx,
+        registry,
+        exec_ctx,
+        upstream,
+        (first_response, first_round),
+        execution,
+    );
     Ok(MessagesResponse {
         body: Box::pin(InstrumentedStream::new(body, span)),
         headers: response_headers,
@@ -108,7 +116,7 @@ fn messages_stream_body(
     registry: Arc<ToolRegistry>,
     exec_ctx: Arc<ExecutionContext>,
     upstream: MessagesUpstream,
-    first_response: reqwest::Response,
+    first_response: (reqwest::Response, tracing::Span),
     mut execution: ExecutionSpan,
 ) -> BoxStream {
     Box::pin(stream! {
@@ -118,10 +126,11 @@ fn messages_stream_body(
         };
         let mut prepared_response = Some(first_response);
 
-        for _round in 0..MAX_GATEWAY_TOOL_ROUNDS {
-            let response = if let Some(response) = prepared_response.take() {
+        for round in 0..MAX_GATEWAY_TOOL_ROUNDS {
+            let (response, round_span) = if let Some(response) = prepared_response.take() {
                 response
             } else {
+                let round_span = super::telemetry::stages::inference_round(round);
                 let body = match ctx.upstream_body() {
                     Ok(b) => b,
                     Err(e) => {
@@ -139,9 +148,10 @@ fn messages_stream_body(
                     Some(upstream.headers()),
                     exec_ctx.streaming_timeout,
                 )
+                .instrument(round_span.clone())
                 .await
                 {
-                    Ok(response) => response,
+                    Ok(response) => (response, round_span),
                     Err(e) => {
                         execution.failed(&e);
                         execution.delivered();
@@ -150,11 +160,11 @@ fn messages_stream_body(
                     }
                 }
             };
-            let mut response_stream = Box::pin(response_lines(
+            let mut response_stream = InstrumentedStream::new(Box::pin(response_lines(
                 response,
                 exec_ctx.streaming_timeout,
                 exec_ctx.responses_config.max_upstream_sse_line_bytes,
-            ));
+            )), round_span);
 
             acc.begin_round();
             while let Some(line) = response_stream.next().await {

@@ -123,7 +123,7 @@ async fn run_messages_loop_traced(
     ctx.force_stream(false);
     let mut usage = MessagesUsageTotals::default();
 
-    for _round in 0..MAX_GATEWAY_TOOL_ROUNDS {
+    for round in 0..MAX_GATEWAY_TOOL_ROUNDS {
         let body = ctx.upstream_body()?;
         let (resp_text, response_headers) = fetch_response_json_with_headers(
             body,
@@ -132,6 +132,7 @@ async fn run_messages_loop_traced(
             &upstream.headers,
             exec_ctx.responses_config.max_upstream_json_bytes,
         )
+        .instrument(super::telemetry::stages::inference_round(round))
         .await?;
         let message: Value = deserialize_from_str(&resp_text).map_err(ExecutorError::JsonError)?;
 

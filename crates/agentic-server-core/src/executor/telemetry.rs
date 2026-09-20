@@ -27,6 +27,8 @@ use tracing::{Span, field, info_span};
 
 use super::error::ExecutorError;
 
+pub(crate) mod stages;
+
 /// Span name shared by every API and transport.
 pub const EXECUTE_SPAN_NAME: &str = "agentic.execute";
 

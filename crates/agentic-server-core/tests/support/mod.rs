@@ -193,6 +193,7 @@ pub struct MockServer {
     url: String,
     handle: JoinHandle<()>,
     requests: Arc<Mutex<Vec<Value>>>,
+    headers: Arc<Mutex<Vec<http::HeaderMap>>>,
 }
 
 impl MockServer {
@@ -202,6 +203,10 @@ impl MockServer {
 
     pub async fn request_bodies(&self) -> Vec<Value> {
         self.requests.lock().await.clone()
+    }
+
+    pub async fn request_headers(&self) -> Vec<http::HeaderMap> {
+        self.headers.lock().await.clone()
     }
 }
 
@@ -279,18 +284,22 @@ impl MockServer {
         let queue: Arc<Mutex<VecDeque<MockResponse>>> = Arc::new(Mutex::new(VecDeque::from(responses)));
         let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let requests_for_route = Arc::clone(&requests);
+        let headers = Arc::new(Mutex::new(Vec::new()));
+        let headers_for_route = Arc::clone(&headers);
 
         let handle = tokio::spawn(async move {
             let app = Router::new()
                 .route(
                     path,
-                    post(move |body: axum::body::Bytes| {
+                    post(move |incoming: http::HeaderMap, body: axum::body::Bytes| {
                         let queue = Arc::clone(&queue);
                         let requests = Arc::clone(&requests_for_route);
+                        let headers = Arc::clone(&headers_for_route);
                         async move {
                             let request_body =
                                 serde_json::from_slice::<Value>(&body).expect("request body should be valid JSON");
                             requests.lock().await.push(request_body);
+                            headers.lock().await.push(incoming);
                             let mut q = queue.lock().await;
                             let resp = q.pop_front().expect("mock queue exhausted — check test setup");
                             build_response(resp)
@@ -307,7 +316,12 @@ impl MockServer {
             axum::serve(listener, app).await.ok();
         });
 
-        Self { url, handle, requests }
+        Self {
+            url,
+            handle,
+            requests,
+            headers,
+        }
     }
 }
 
@@ -326,7 +340,7 @@ pub async fn setup_pool() -> Arc<DbPool> {
 pub struct TestFixture {
     pub exec_ctx: Arc<ExecutionContext>,
     // Kept for its Drop impl — aborts the mock server when the test ends.
-    server: MockServer,
+    pub server: MockServer,
 }
 
 impl TestFixture {

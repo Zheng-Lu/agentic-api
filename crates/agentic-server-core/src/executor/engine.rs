@@ -7,6 +7,9 @@
 
 mod execute;
 mod streaming;
+mod usage;
+
+use usage::accumulate_usage;
 
 pub use execute::{ExecuteRequest, execute};
 #[cfg(test)]
@@ -16,6 +19,7 @@ use streaming::panicked_stream_chunks;
 use either::Either;
 #[cfg(test)]
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 use tracing::debug;
 
 use super::compaction::{compact_items, maybe_compact_context};
@@ -92,32 +96,6 @@ fn classify_round(
         LoopDecision::Incomplete(format!("gateway tool execution exceeded {max_rounds} rounds"))
     } else {
         LoopDecision::Continue
-    }
-}
-
-fn add_usage(total: ResponseUsage, usage: ResponseUsage) -> ResponseUsage {
-    ResponseUsage {
-        input_tokens: total.input_tokens.saturating_add(usage.input_tokens),
-        output_tokens: total.output_tokens.saturating_add(usage.output_tokens),
-        total_tokens: total.total_tokens.saturating_add(usage.total_tokens),
-        input_tokens_details: crate::types::io::InputTokenDetails {
-            cached_tokens: total
-                .input_tokens_details
-                .cached_tokens
-                .saturating_add(usage.input_tokens_details.cached_tokens),
-        },
-        output_tokens_details: crate::types::io::OutputTokenDetails {
-            reasoning_tokens: total
-                .output_tokens_details
-                .reasoning_tokens
-                .saturating_add(usage.output_tokens_details.reasoning_tokens),
-        },
-    }
-}
-
-fn accumulate_usage(total: &mut Option<ResponseUsage>, usage: Option<ResponseUsage>) {
-    if let Some(usage) = usage {
-        *total = Some(total.map_or(usage, |current| add_usage(current, usage)));
     }
 }
 
@@ -215,6 +193,45 @@ struct EngineOrchestration<'a> {
 }
 
 impl<'a> EngineOrchestration<'a> {
+    async fn fetch_round(
+        &mut self,
+        auth: Option<&str>,
+        stream_upstream: bool,
+        round: usize,
+        output_offset: usize,
+    ) -> ExecutorResult<(ResponsePayload, Vec<EventFrame>)> {
+        let round_span = super::telemetry::stages::inference_round(round);
+        Ok(if stream_upstream {
+            let stream_payload = fetch_stream_payload(
+                self.agent,
+                self.exec_ctx,
+                auth,
+                &self.registry,
+                output_offset,
+                &self.response_budget,
+            )
+            .instrument(round_span)
+            .await?;
+            if round == 0 {
+                self.registry.clear_mcp_list_tool_items();
+            }
+            (stream_payload.payload, stream_payload.deferred_events)
+        } else {
+            (
+                fetch_blocking_payload(
+                    self.agent,
+                    self.exec_ctx,
+                    auth,
+                    &self.registry,
+                    Some(&self.response_budget),
+                )
+                .instrument(round_span)
+                .await?,
+                Vec::new(),
+            )
+        })
+    }
+
     async fn new(agent: &'a mut AgentPipeline, exec_ctx: &'a ExecutionContext) -> ExecutorResult<Self> {
         let response_budget = ExecutorResponseBudget::with_limit(exec_ctx.responses_config.max_retained_bytes);
         let registry = build_tool_registry(agent, exec_ctx, &response_budget).await?;
@@ -247,33 +264,8 @@ impl<'a> EngineOrchestration<'a> {
             )?;
             accumulate_usage(&mut combined_usage, compaction_usage);
             let output_offset = combined_output.len();
-            let (mut payload, deferred_stream_events): (ResponsePayload, Vec<_>) = if stream_upstream {
-                let stream_payload = fetch_stream_payload(
-                    self.agent,
-                    self.exec_ctx,
-                    auth,
-                    &self.registry,
-                    output_offset,
-                    &self.response_budget,
-                )
-                .await?;
-                if round == 0 {
-                    self.registry.clear_mcp_list_tool_items();
-                }
-                (stream_payload.payload, stream_payload.deferred_events)
-            } else {
-                (
-                    fetch_blocking_payload(
-                        self.agent,
-                        self.exec_ctx,
-                        auth,
-                        &self.registry,
-                        Some(&self.response_budget),
-                    )
-                    .await?,
-                    Vec::new(),
-                )
-            };
+            let (mut payload, deferred_stream_events) =
+                self.fetch_round(auth, stream_upstream, round, output_offset).await?;
             accumulate_usage(&mut combined_usage, payload.usage.take());
             let current_output = std::mem::take(&mut payload.output);
             if matches!(payload.status.as_str(), "error" | "failed") {

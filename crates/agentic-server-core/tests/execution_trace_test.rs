@@ -30,6 +30,8 @@ use tracing::{Instrument as _, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
+#[path = "execution_trace/stages.rs"]
+mod stages;
 mod support;
 use support::{MockResponse, MockServer, TestFixture, text_response};
 
@@ -50,6 +52,7 @@ static EXPORTER: OnceLock<InMemorySpanExporter> = OnceLock::new();
 /// Install the bridge once per test binary and return the shared exporter.
 fn exporter() -> &'static InMemorySpanExporter {
     EXPORTER.get_or_init(|| {
+        opentelemetry::global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(exporter.clone())
@@ -316,7 +319,7 @@ async fn streaming_span_stays_open_until_the_terminal_frame() {
         panic!("streaming request returns a stream");
     };
     assert!(
-        traces.finished().is_empty(),
+        traces.finished().iter().all(|span| span.name != "agentic.execute"),
         "the span stays open while the stream is unconsumed"
     );
 
@@ -587,7 +590,10 @@ async fn messages_stream_records_completed_and_delivered() {
     .instrument(traces.root.clone())
     .await
     .unwrap();
-    assert!(traces.finished().is_empty(), "open until the stream is drained");
+    assert!(
+        traces.finished().iter().all(|span| span.name != "agentic.execute"),
+        "open until the stream is drained"
+    );
 
     let frames = collect_frames(&traces, response.body).await;
     assert!(
