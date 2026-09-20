@@ -40,6 +40,7 @@ pub async fn finished(name: &str, count: usize) -> Vec<SpanData> {
         loop {
             let spans = spans();
             if spans.iter().filter(|span| span.name == name).count() >= count {
+                super::trace_attributes::assert_allowed(&spans, &[]);
                 return spans;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

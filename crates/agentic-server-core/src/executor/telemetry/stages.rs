@@ -8,6 +8,23 @@ use crate::tool::ToolType;
 use crate::types::request_response::RequestPayload;
 
 #[derive(Clone, Copy)]
+pub(crate) enum CompactionTrigger {
+    ContextManagement,
+    InputItem,
+    Explicit,
+}
+
+impl CompactionTrigger {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContextManagement => "context_management",
+            Self::InputItem => "input_item",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum StateSource {
     None,
     PreviousResponse,

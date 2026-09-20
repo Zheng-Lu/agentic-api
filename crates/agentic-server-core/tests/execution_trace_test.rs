@@ -28,11 +28,16 @@ use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData
 use serde_json::json;
 use tracing::{Instrument as _, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
+#[path = "execution_trace/compaction.rs"]
+mod compaction;
 #[path = "execution_trace/stages.rs"]
 mod stages;
 mod support;
+#[path = "../../agentic-server/tests/execution_traces/attributes.rs"]
+mod trace_attributes;
 use support::{MockResponse, MockServer, TestFixture, text_response};
 
 const PROMPT: &str = "the prompt text must never be exported";
@@ -65,7 +70,16 @@ fn exporter() -> &'static InMemorySpanExporter {
             .with_threads(false)
             .with_target(false)
             .with_level(false)
-            .with_tracked_inactivity(false);
+            .with_tracked_inactivity(false)
+            .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                metadata.is_span()
+                    && *metadata.level() <= tracing::Level::INFO
+                    && (metadata.target().starts_with("agentic_core")
+                        || matches!(
+                            metadata.name(),
+                            "test.root" | "unrelated.consumer" | "http.server.request"
+                        ))
+            }));
         tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
             .expect("installed once per binary");
         // The provider lives for the process; simple export is synchronous.
@@ -101,12 +115,14 @@ impl Traces {
 
     /// Finished spans belonging to this test, root excluded.
     fn finished(&self) -> Vec<SpanData> {
-        exporter()
+        let spans = exporter()
             .get_finished_spans()
             .unwrap()
             .into_iter()
             .filter(|span| span.span_context.trace_id() == self.trace_id && span.name != "test.root")
-            .collect()
+            .collect::<Vec<_>>();
+        trace_attributes::assert_allowed(&spans, &[PROMPT, "upstream secret detail"]);
+        spans
     }
 
     /// The finished `agentic.execute` span, exactly one.
@@ -461,7 +477,17 @@ async fn messages_fixture(responses: Vec<MockResponse>) -> MessagesFixture {
         Arc::new(reqwest::Client::new()),
         server.url().to_owned(),
     ));
-    let upstream = MessagesUpstream::new(server.url(), None, reqwest::header::HeaderMap::new());
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("authorization", "Bearer private-auth".parse().unwrap());
+    headers.insert("x-api-key", "private-api-key".parse().unwrap());
+    headers.insert(
+        "traceparent",
+        "00-11111111111111111111111111111111-2222222222222222-01"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert("tracestate", "stale=caller".parse().unwrap());
+    let upstream = MessagesUpstream::new(server.url(), Some("secret=private-query"), headers);
     MessagesFixture {
         exec_ctx,
         registry: Arc::new(ToolRegistry::default()),
@@ -643,6 +669,15 @@ async fn messages_stream_records_completed_and_delivered() {
     let client = stages.iter().find(|child| child.name == "http.client.request").unwrap();
     assert_eq!(round.parent_span_id, span.span_context.span_id());
     assert_eq!(client.parent_span_id, round.span_context.span_id());
+    let headers = fixture.server.request_headers().await;
+    assert_eq!(
+        headers[0]["traceparent"],
+        format!("00-{}-{}-01", traces.trace_id, client.span_context.span_id())
+    );
+    assert!(
+        headers[0].get("tracestate").is_none_or(http::HeaderValue::is_empty),
+        "stale outbound trace state was replaced"
+    );
 }
 
 #[tokio::test]

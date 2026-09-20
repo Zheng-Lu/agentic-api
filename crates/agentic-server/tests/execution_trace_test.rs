@@ -6,5 +6,7 @@ mod common;
 mod harness;
 #[path = "execution_traces/proxy.rs"]
 mod proxy;
+#[path = "execution_traces/attributes.rs"]
+mod trace_attributes;
 #[path = "execution_traces/websocket.rs"]
 mod websocket;

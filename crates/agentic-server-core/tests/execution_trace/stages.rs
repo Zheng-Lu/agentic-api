@@ -38,7 +38,11 @@ async fn recorded_two_round_stream_has_exact_stage_tree_and_upstream_parent() {
         {"type":"namespace","name":"mcp__shell","tools":[{"type":"function","name":"run","parameters":{"type":"object"}}]}
     ])).unwrap());
     let Either::Right(stream) = traces
-        .run(ExecuteRequest::new(payload, fixture.exec_ctx).run())
+        .run(
+            ExecuteRequest::new(payload, fixture.exec_ctx)
+                .with_auth(Some("private-auth".into()))
+                .run(),
+        )
         .await
         .unwrap()
     else {
@@ -51,38 +55,17 @@ async fn recorded_two_round_stream_has_exact_stage_tree_and_upstream_parent() {
     assert!(chunks.iter().any(|chunk| chunk.contains("response.completed")));
     assert!(chunks.iter().any(|chunk| chunk.contains("private search result")));
     let spans = traces.finished_by_name(&["agentic.execute", "agentic.persist"]).await;
-    let execute = spans.iter().find(|span| span.name == "agentic.execute").unwrap();
-    let stages: Vec<_> = spans
+    let requests = fixture.server.request_bodies().await;
+    let arguments: Vec<_> = requests[1]["input"]
+        .as_array()
+        .unwrap()
         .iter()
-        .filter(|span| span.name.starts_with("agentic.") || span.name == "http.client.request")
+        .filter_map(|item| item["arguments"].as_str())
         .collect();
-    let mut names: Vec<_> = stages.iter().map(|span| span.name.as_ref()).collect();
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        [
-            "agentic.execute",
-            "agentic.inference_round",
-            "agentic.inference_round",
-            "agentic.persist",
-            "agentic.rehydrate",
-            "agentic.tool.execute",
-            "http.client.request",
-            "http.client.request"
-        ]
-    );
-    for span in &stages {
-        if span.name == "agentic.execute" {
-            assert_eq!(span.parent_span_id, traces.root_span_id());
-        } else if span.name != "http.client.request" {
-            assert_eq!(
-                span.parent_span_id,
-                execute.span_context.span_id(),
-                "{} parent",
-                span.name
-            );
-        }
-    }
+    assert!(!arguments.is_empty(), "scan the actual replayed tool arguments");
+    trace_attributes::assert_allowed(&spans, &arguments);
+    assert_stage_tree(&traces, &spans);
+    let stages = &spans;
     let headers = fixture.server.request_headers().await;
     assert_eq!(headers.len(), 2);
     for (index, headers) in headers.iter().enumerate() {
@@ -118,6 +101,41 @@ async fn recorded_two_round_stream_has_exact_stage_tree_and_upstream_parent() {
         ),
         Some(&Value::from("none"))
     );
+}
+
+fn assert_stage_tree(traces: &Traces, spans: &[SpanData]) {
+    let execute = spans.iter().find(|span| span.name == "agentic.execute").unwrap();
+    let stages: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name.starts_with("agentic.") || span.name == "http.client.request")
+        .collect();
+    let mut names: Vec<_> = stages.iter().map(|span| span.name.as_ref()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "agentic.execute",
+            "agentic.inference_round",
+            "agentic.inference_round",
+            "agentic.persist",
+            "agentic.rehydrate",
+            "agentic.tool.execute",
+            "http.client.request",
+            "http.client.request"
+        ]
+    );
+    for span in &stages {
+        if span.name == "agentic.execute" {
+            assert_eq!(span.parent_span_id, traces.root_span_id());
+        } else if span.name != "http.client.request" {
+            assert_eq!(
+                span.parent_span_id,
+                execute.span_context.span_id(),
+                "{} parent",
+                span.name
+            );
+        }
+    }
 }
 
 #[tokio::test]

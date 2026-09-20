@@ -1,6 +1,9 @@
 mod context;
+mod summary;
 
+use super::telemetry::stages::CompactionTrigger;
 use context::item_has_meaningful_context;
+use summary::completed_summary_text;
 
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::persist::persist_prepared_turn;
@@ -12,12 +15,12 @@ use crate::tool::ToolSearchState;
 use crate::types::event::MessageStatus;
 use crate::types::io::input::latest_compaction_window;
 use crate::types::io::{
-    CompactionItem, InputContent, InputFileContent, InputItem, InputMessage, InputMessageContent, OutputItem,
-    ResponseUsage, ResponsesInput, ToolCallOutput, ToolOutputContent,
+    CompactionItem, InputContent, InputFileContent, InputItem, InputMessage, InputMessageContent, ResponseUsage,
+    ResponsesInput, ToolCallOutput, ToolOutputContent,
 };
-use crate::types::request_response::{CompactRequest, CompactedResponse, RequestPayload, ResponsePayload};
+use crate::types::request_response::{CompactRequest, CompactedResponse, RequestPayload};
 use crate::types::tools::ResponsesTool;
-use crate::utils::common::{serialize_to_string, serialize_to_value, utcnow_str, uuid7_str};
+use crate::utils::common::{serialize_to_value, utcnow_str, uuid7_str};
 
 const COMPACTION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a concise handoff summary that preserves current progress, decisions, constraints, unresolved work, and critical references for the next model. Return only the summary.";
 const ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
@@ -115,45 +118,6 @@ fn finish_compacted_window(mut output: Vec<InputItem>, summary: String) -> Vec<I
 #[cfg(test)]
 fn build_compacted_window(items: &[InputItem], summary: String) -> Vec<InputItem> {
     finish_compacted_window(retained_user_window(items), summary)
-}
-
-fn response_output_text(output: &[OutputItem]) -> Option<String> {
-    let text = output
-        .iter()
-        .filter_map(|item| match item {
-            OutputItem::Message(message) => Some(message),
-            _ => None,
-        })
-        .flat_map(|message| message.content.iter())
-        .map(|content| content.text.trim())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    (!text.is_empty()).then_some(text)
-}
-
-fn completed_summary_text(response: &ResponsePayload) -> ExecutorResult<String> {
-    if response.status != "completed" || response.error.is_some() {
-        let details = response
-            .error
-            .as_ref()
-            .and_then(|error| serialize_to_string(error).ok())
-            .or_else(|| {
-                response
-                    .incomplete_details
-                    .as_ref()
-                    .and_then(|details| details.reason.clone())
-            })
-            .unwrap_or_else(|| "upstream returned no failure details".to_owned());
-        return Err(ExecutorError::CompactionFailed {
-            status: response.status.clone(),
-            details,
-        });
-    }
-    response_output_text(&response.output).ok_or_else(|| ExecutorError::CompactionFailed {
-        status: response.status.clone(),
-        details: "upstream returned no summary text".to_owned(),
-    })
 }
 
 fn add_message_content(estimate: &mut InputTokenEstimate, content: &InputMessageContent) {
@@ -345,13 +309,26 @@ fn request_payload(model: String, input: ResponsesInput, instructions: Option<St
 ///
 /// Returns an invalid-request error for empty input, an upstream error for an unusable model
 /// summary, and propagates inference and serialization failures.
-#[tracing::instrument(name = "agentic.compaction", skip_all, fields(agentic.compaction.operation = "summarize"))]
 pub(crate) async fn compact_items(
     model: &str,
     input: ResponsesInput,
     instructions: Option<&str>,
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
+) -> ExecutorResult<(Vec<InputItem>, ResponseUsage)> {
+    compact_items_with_trigger(model, input, instructions, exec_ctx, auth, CompactionTrigger::InputItem).await
+}
+
+#[tracing::instrument(name = "agentic.compaction", skip_all, fields(
+    agentic.compaction.operation = "summarize", agentic.compaction.trigger = trigger.as_str()
+))]
+async fn compact_items_with_trigger(
+    model: &str,
+    input: ResponsesInput,
+    instructions: Option<&str>,
+    exec_ctx: &ExecutionContext,
+    auth: Option<&str>,
+    trigger: CompactionTrigger,
 ) -> ExecutorResult<(Vec<InputItem>, ResponseUsage)> {
     let original_items = Vec::from(input);
     if !original_items.iter().any(item_has_meaningful_context) {
@@ -435,7 +412,15 @@ pub(crate) async fn maybe_compact_context(
     let model = ctx.enriched_request.model.clone();
     let instructions = ctx.enriched_request.instructions.clone();
     let input = std::mem::replace(&mut ctx.enriched_request.input, ResponsesInput::Items(Vec::new()));
-    let (compacted, usage) = compact_items(&model, input, instructions.as_deref(), exec_ctx, auth).await?;
+    let (compacted, usage) = compact_items_with_trigger(
+        &model,
+        input,
+        instructions.as_deref(),
+        exec_ctx,
+        auth,
+        CompactionTrigger::ContextManagement,
+    )
+    .await?;
     ctx.enriched_request.input = ResponsesInput::Items(compacted.clone());
     ctx.new_input_items = compacted;
     if let Some(continuation) = &mut ctx.continuation {
@@ -474,7 +459,15 @@ pub async fn compact_response(
     let model = ctx.enriched_request.model.clone();
     let instructions = ctx.enriched_request.instructions.clone();
     let input = std::mem::replace(&mut ctx.enriched_request.input, ResponsesInput::Items(Vec::new()));
-    let (output, usage) = compact_items(&model, input, instructions.as_deref(), exec_ctx, auth).await?;
+    let (output, usage) = compact_items_with_trigger(
+        &model,
+        input,
+        instructions.as_deref(),
+        exec_ctx,
+        auth,
+        CompactionTrigger::Explicit,
+    )
+    .await?;
 
     let response_id = ctx.response_id.clone();
     ctx.new_input_items.clone_from(&output);
