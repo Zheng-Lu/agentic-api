@@ -323,13 +323,33 @@ async fn streaming_span_stays_open_until_the_terminal_frame() {
         "the span stays open while the stream is unconsumed"
     );
 
-    let frames = collect_frames(&traces, stream).await;
+    let frames = tokio::spawn(
+        stream
+            .collect::<Vec<_>>()
+            .instrument(tracing::info_span!(parent: None, "unrelated.consumer")),
+    )
+    .await
+    .unwrap();
     assert!(frames.iter().any(|frame| frame.contains("response.completed")));
     assert_eq!(frames.last().map(String::as_str), Some("data: [DONE]\n\n"));
 
     let span = traces.execute_span().await;
     assert_execute_attributes(&span, true, "completed", "delivered");
     assert_eq!(span.status, Status::Unset);
+    let stages = traces
+        .finished_by_name(&["agentic.persist", "agentic.inference_round"])
+        .await;
+    for child in stages
+        .iter()
+        .filter(|child| matches!(child.name.as_ref(), "agentic.persist" | "agentic.inference_round"))
+    {
+        assert_eq!(
+            child.parent_span_id,
+            span.span_context.span_id(),
+            "{} escaped its execution",
+            child.name
+        );
+    }
 }
 
 #[tokio::test]
@@ -595,7 +615,14 @@ async fn messages_stream_records_completed_and_delivered() {
         "open until the stream is drained"
     );
 
-    let frames = collect_frames(&traces, response.body).await;
+    let frames = tokio::spawn(
+        response
+            .body
+            .collect::<Vec<_>>()
+            .instrument(tracing::info_span!(parent: None, "unrelated.consumer")),
+    )
+    .await
+    .unwrap();
     assert!(
         frames.iter().any(|frame| frame.starts_with("event: message_stop")),
         "{frames:?}"
@@ -606,6 +633,16 @@ async fn messages_stream_records_completed_and_delivered() {
     let span = traces.execute_span().await;
     assert_execute_attributes_for(&span, "messages", true, "completed", "delivered");
     assert_eq!(span.status, Status::Unset);
+    let stages = traces
+        .finished_by_name(&["agentic.inference_round", "http.client.request"])
+        .await;
+    let round = stages
+        .iter()
+        .find(|child| child.name == "agentic.inference_round")
+        .unwrap();
+    let client = stages.iter().find(|child| child.name == "http.client.request").unwrap();
+    assert_eq!(round.parent_span_id, span.span_context.span_id());
+    assert_eq!(client.parent_span_id, round.span_context.span_id());
 }
 
 #[tokio::test]
