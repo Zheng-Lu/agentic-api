@@ -47,13 +47,14 @@ impl ResponseStore {
     ///
     /// # Errors
     ///
-    /// Returns error if response not found, database query fails, or store is disabled.
+    /// Returns an error if the response is missing or invalid, the database query
+    /// fails, or the store is disabled.
     pub async fn get(&self, response_id: &str) -> StoreResult<ResponseData> {
         let pool = self.pool()?;
         let row = response::get(pool, response_id)
             .await?
             .ok_or_else(|| StorageError::not_found("Response", response_id))?;
-        Ok(row.into())
+        row.try_into()
     }
 
     /// Rehydrates a response with full history.
