@@ -121,7 +121,8 @@ impl ConversationStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if either targeted database lookup fails.
+    /// Returns an error if the captured response is missing, its metadata is invalid,
+    /// or the database lookup fails. Legacy versions without a response return `None`.
     pub async fn response_metadata_at_version(
         &self,
         conversation_id: &str,
@@ -131,8 +132,13 @@ impl ConversationStore {
             return Ok(None);
         };
         let pool = self.pool()?;
-        let response = response::get_conversation_turn(pool, conversation_id, response_id).await?;
-        Ok(response.and_then(|row| row.metadata_as()))
+        let invalid_metadata = || StorageError::InvalidResponseMetadata {
+            response_id: response_id.clone(),
+        };
+        let response = response::get_conversation_turn(pool, conversation_id, response_id)
+            .await?
+            .ok_or_else(invalid_metadata)?;
+        response.metadata_as().map_err(|_| invalid_metadata())
     }
 
     /// Persists conversation turn with new items and response metadata.

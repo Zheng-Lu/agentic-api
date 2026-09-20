@@ -879,6 +879,10 @@ round that omits `usage` still reports the hidden rounds' counters.
   `OutputItem`), and `StorageError`. Store rehydration uses `TryFrom<&Item>` and fails
   if a row cannot be decoded; response rehydration also rejects missing referenced rows.
   It must not silently omit malformed reasoning from a continuation.
+  `TryFrom<Response>` rejects malformed history references and effective metadata;
+  only SQL NULL keeps the legacy empty/default behavior. Versioned conversation
+  metadata lookup also rejects a missing or foreign captured response. Storage
+  errors omit parser diagnostics that could echo sensitive persisted fields.
   `InOutItem::into_input_items` turns a full
   history into the `Vec<InputItem>` used for continuation processing: stored
   `InputItem`s pass through, while stored `OutputItem`s go through
