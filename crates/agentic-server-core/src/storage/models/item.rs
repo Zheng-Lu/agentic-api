@@ -639,9 +639,9 @@ mod tests {
         ]);
         reasoning
             .summary
-            .push(serde_json::json!({"type": "summary_text", "text": "concise summary"}));
-        reasoning.encrypted_content = Some(serde_json::json!({"ciphertext": "opaque"}));
-        reasoning.status = Some("completed".to_owned());
+            .push(crate::types::ReasoningSummaryContent::new("concise summary"));
+        reasoning.encrypted_content = Some(crate::types::OpaqueReasoning::try_from("opaque".to_owned()).unwrap());
+        reasoning.status = Some(crate::types::ReasoningStatus::Completed);
         let stored = InOutItem::Output(OutputItem::Reasoning(reasoning));
         let stored_json = String::try_from(&stored).expect("serialization failed");
         assert!(stored_json.contains(STORED_ITEM_KIND_KEY));
@@ -660,12 +660,15 @@ mod tests {
         };
         assert_eq!(reasoning.id, "rs_1");
         assert_eq!(reasoning.content.len(), 2);
-        assert_eq!(reasoning.summary[0]["text"], "concise summary");
+        assert_eq!(reasoning.summary[0].text, "concise summary");
         assert_eq!(
-            reasoning.encrypted_content,
-            Some(serde_json::json!({"ciphertext": "opaque"}))
+            reasoning
+                .encrypted_content
+                .as_ref()
+                .map(crate::types::OpaqueReasoning::as_str),
+            Some("opaque")
         );
-        assert_eq!(reasoning.status.as_deref(), Some("completed"));
+        assert_eq!(reasoning.status, Some(crate::types::ReasoningStatus::Completed));
 
         let reconstructed = serde_json::to_value(OutputItem::Reasoning(reasoning)).expect("reasoning value");
         assert!(reconstructed.get(STORED_ITEM_KIND_KEY).is_none());
