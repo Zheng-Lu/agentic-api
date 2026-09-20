@@ -61,6 +61,8 @@ pub enum Route {
     /// The executor ran the request: rehydration, inference rounds, tools,
     /// persistence.
     Executor,
+    /// The gateway forwards the upstream payload without semantic execution.
+    Proxy,
 }
 
 impl Route {
@@ -68,6 +70,7 @@ impl Route {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Executor => "executor",
+            Self::Proxy => "proxy",
         }
     }
 }
@@ -316,6 +319,11 @@ impl ExecutionSpan {
     /// Nothing was ever handed to the transport.
     pub fn not_delivered(&mut self) {
         self.set_delivery(DeliveryOutcome::NotStarted);
+    }
+
+    /// Delivery stopped after the transport accepted the response.
+    pub fn disconnected(&mut self) {
+        self.set_delivery(DeliveryOutcome::Disconnected);
     }
 
     /// Records the first execution outcome only; later calls are ignored so
