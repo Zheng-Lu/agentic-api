@@ -368,6 +368,7 @@ access happen — those live in `tool/`, `executor/`, and `storage/` respectivel
   `ResponsesInput`), `output.rs` (outbound output items: messages, function calls, web
   search/MCP calls, reasoning — plus the `ApplyDone` trait described below), `tools.rs`
   (the normalized `FunctionTool` and `ToolChoice`, distinct from tool *declarations*),
+  `message.rs` (input/output messages and optional assistant phase),
   `reasoning.rs` (typed reasoning content, summaries, item status, and bounded opaque
   state), and `usage.rs` (token accounting structs). `ResponsesInput::model_input()` is the final
   model-visibility boundary used by `RequestPayload::to_upstream_request`: it removes
@@ -595,7 +596,15 @@ project it; the engine binds successful round observations to that profile. Cand
 configuration still fails the qualification gate, so only the default vLLM policy
 executes. The reserved adapter has a typed stateless projection, isolated HTTPS client,
 and strict ingestion selection; see [provider-aware reasoning](docs/design/provider-aware-reasoning.md)
-for the remaining recorder and pinned-provider qualification work.
+for pinned-provider reference evidence and remaining gateway acceptance work.
+
+Assistant `MessagePhase` is a bounded optional enum in the message types, retained by
+the existing authoritative typed completion and output-to-input conversion. Storage
+preserves it in item JSON without a migration. Input validation rejects a supplied
+phase on non-assistant messages; legacy messages and newly constructed user messages
+do not acquire one. In streamed provider references the reasoning bytes in
+`output_item.done` differ from the terminal envelope; ingestion keeps completed items
+as before, and qualification replays those exact item-completion bytes.
 
 The live runner polls one framed line, performs synchronous ingestion and translation,
 then awaits delivery before polling the next line. This propagates bounded sender

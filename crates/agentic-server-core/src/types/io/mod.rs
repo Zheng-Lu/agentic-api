@@ -1,4 +1,5 @@
 pub mod input;
+pub mod message;
 pub mod output;
 pub mod reasoning;
 pub mod shell;
@@ -10,6 +11,7 @@ pub use input::{
     InputFunctionToolCall, InputImageContent, InputItem, InputMessage, InputMessageContent, InputTextContent,
     InputToolSearchCall, RefusalContent, ResponsesInput, ToolCallOutput, ToolOutputContent, ToolSearchOutputMessage,
 };
+pub use message::MessagePhase;
 pub use output::{
     ApplyDone, CustomToolCall, FunctionToolCall, GatewayCallStatus, McpCall, McpCallError, McpCallStatus, McpListTool,
     McpListTools, McpToolExecutionError, McpToolExecutionErrorContent, OutputItem, OutputMessage, OutputTextContent,

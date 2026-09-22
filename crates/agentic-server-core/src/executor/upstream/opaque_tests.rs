@@ -1,5 +1,7 @@
-//! Local replay/fault tests, not qualification of the pinned candidate model.
-//! All provider response bytes originate in existing recorder-generated cassettes.
+//! Replay/fault tests plus pinned reference characterization in `qualification`.
+//! All provider response bytes originate in recorder-generated cassettes.
+
+mod qualification;
 
 use super::*;
 use crate::executor::replay::prepare_initial_reasoning;

@@ -268,7 +268,7 @@ the default contract and convert a `Cow<ResponsesInput>` with `.into()` for `inp
 The pre-existing metadata contract was moved unchanged; no new untyped replay payload
 or public protocol field is introduced.
 
-## Current slice: stream-owned producer lifecycle
+## Stream-owned producer lifecycle
 
 The producer abort/join gap tracked as a prerequisite with #244 is removed from the
 Responses executor. `engine/streaming/producer.rs` polls the existing orchestration
@@ -298,20 +298,63 @@ termination of remote model work. Shared transport/connection drivers retain the
 own lifetimes. No worker-placement performance benefit is claimed; #245 measurement
 work and the broader #244 delivery/observability scope remain separate.
 
+## Current slice: pinned reference recordings and assistant phase
+
+The recorder now supports bounded stateless item replay and independent branches for
+OpenAI, vLLM and gateway targets, and honors `store: false` over WebSocket. The pinned
+scenario in `tests/cassettes/record_opaque_reasoning.py` captures 18 real requests:
+text and function continuations with a branch, each over JSON, SSE and WebSocket.
+The six fixtures are under `tests/cassettes/reasoning/opaque/gpt-5.4-2026-03-05/`.
+They use `reasoning: {effort: low, summary: concise}`, `store: false`, a 1024-output-token
+ceiling, and complete item history without server-side continuation IDs. Every terminal
+response reports the exact pinned model and includes opaque reasoning. The function
+scenario uses automatic selection to obtain reasoning before the call: a diagnostic
+forced-call capture had no reasoning in its first response and was not promoted as
+evidence for that requirement.
+
+Recordings exposed two relevant details:
+
+- Assistant messages include `phase: final_answer`. `types/io/message.rs` now models
+  optional `MessagePhase::{Commentary, FinalAnswer}` for both input and output. The
+  existing typed completion, output-to-input conversion and storage path preserve it.
+  Legacy absent/null phase stays absent; generated user/compaction messages never infer
+  a phase. The typed executor rejects phase on non-assistant input. Old public Rust
+  import paths remain available, but `InputMessage` / `OutputMessage` struct literals
+  must supply `phase`; constructors default it to `None`. No database migration is
+  needed because the typed item JSON already owns this field.
+- Streamed `output_item.done` and `response.completed` contain distinct opaque byte
+  strings. Existing ingestion retains the former; it does not replace completed items
+  with terminal-envelope output. The recorder's explicit `item-done` replay source
+  captures successful provider continuations using those exact bytes. No equivalence
+  between encodings is inferred, no bytes are rewritten, and no second production
+  ingestion or client-emission path was introduced.
+
+The strict Rust replay test runs every captured body through `AgentPipeline` and checks
+terminal model evidence, item order, opaque bytes, summaries, phase and typed request
+projection. It also injects missing terminal, duplicate completion and wrong-index
+faults in memory. The recorder's byte/item/turn limits, branch isolation, optional
+completion source and payload-log suppression have separate offline tests. The OpenAI
+Docs guidance to preserve assistant phase informed the typed contract; see the
+[reasoning guide's phase section](https://developers.openai.com/api/docs/guides/reasoning#phase-parameter).
+
+These are provider-reference recordings, not a live gateway acceptance matrix. WebSocket
+recording uses independent connections and full item replay; it does not qualify the
+gateway's transient connection-local checkpoint routing. The candidate remains disabled.
+
 ## Remaining slices before enabling a provider profile
 
-1. Qualify the exact pinned endpoint/model and stateless projection with recorder-generated
-   initial, multi-turn, tool-loop, branching, HTTP/SSE, and transient WebSocket exchanges.
-   Verify exact reported snapshot identity, supported request parameters, tool normalization,
-   and provider terminal/error behavior. Existing gpt-5.6 recordings are regression evidence,
-   not qualification of gpt-5.4-2026-03-05. Passing local adapter tests does not enable execution.
+1. Complete gateway-level acceptance for durable and transient continuations, gateway-executed
+   tool loops and connection-local WebSocket routing. The reference matrix now covers the
+   pinned provider's initial, multi-turn, function-output and branching contract, but does
+   not qualify every public request parameter, tool normalization or provider error mode.
+   Declare and enforce the supported profile surface before enabling it. Existing gpt-5.6
+   recordings remain regression evidence, not evidence for the pinned model.
 2. Keep local plaintext compaction distinct from provider opaque compaction. Unsupported
    combinations already fail before inference; any future expansion requires its own
    typed contract and recordings, not summary-based compatibility inference.
-3. Extend the recorder's currently tool-search-only manual item replay workflow for
-   pinned stateless reasoning, function outputs, and branches, then validate and stage
-   actual captured exchanges. Live reference recording requires an `OPENAI_API_KEY`
-   available only in the local recording environment, never in fixtures or chat.
+3. Keep live qualification opt-in and credential-local. The expanded recorder and pinned
+   reference fixtures are available; future scenarios must use that workflow and staged
+   validation, never hand-authored captured YAML.
 
 The upstream contract requires preserving opaque state and limits reasoning reuse
 to compatible model families; see the
@@ -332,8 +375,8 @@ references, legacy SQL NULL handling, missing/foreign captured turns, error reda
 and refusal to persist a child of an invalid parent. A recorded initial exchange checks
 that malformed continuation metadata fails before either JSON or SSE inference starts.
 
-No captured YAML was hand-authored or modified for this slice. Future provider replay
-scenarios must use the cassette README's recorder workflow and staged validation.
+Captured YAML is recorder-generated. The pinned reference matrix was staged, structurally
+validated and replayed through Rust before promotion; older captures were not edited.
 
 The `reasoning_provenance_*_test.rs` suites cover policy gating, JSON/OpenAPI exclusion,
 closed envelope decoding, exact opaque bytes, mixed-origin storage batches, branches,

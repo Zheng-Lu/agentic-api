@@ -11,9 +11,11 @@ use crate::utils::common::deserialize_from_value_opt;
 use crate::utils::uuid7_str;
 
 use super::input::{
-    CompactionItem, InputContent, InputFunctionToolCall, InputItem, InputMessage, InputMessageContent,
-    InputTextContent, InputToolSearchCall, deserialize_non_blank_string,
+    CompactionItem, InputFunctionToolCall, InputItem, InputToolSearchCall, deserialize_non_blank_string,
 };
+#[cfg(test)]
+use super::input::{InputContent, InputMessageContent};
+pub use super::message::OutputMessage;
 use super::reasoning::ReasoningSummaryContent;
 #[cfg(test)]
 use super::reasoning::{OpaqueReasoning, ReasoningStatus};
@@ -36,59 +38,6 @@ impl OutputTextContent {
             type_: "output_text".into(),
             text: text.into(),
             annotations: vec![],
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-pub struct OutputMessage {
-    pub id: String,
-    pub role: String,
-    pub status: MessageStatus,
-    #[serde(default)]
-    pub content: Vec<OutputTextContent>,
-}
-
-impl OutputMessage {
-    pub fn new(id: impl Into<String>, status: MessageStatus) -> Self {
-        Self {
-            id: id.into(),
-            role: "assistant".into(),
-            status,
-            content: vec![],
-        }
-    }
-}
-
-impl TryFrom<&EventPayload> for OutputMessage {
-    type Error = ExecutorError;
-
-    fn try_from(payload: &EventPayload) -> Result<Self, Self::Error> {
-        let EventPayload::OutputItemAdded { item_id, .. } = payload else {
-            return Err(ExecutorError::ParseError("expected OutputItemAdded payload".into()));
-        };
-        let id = if item_id.is_empty() {
-            uuid7_str("msg_")
-        } else {
-            item_id.clone()
-        };
-        Ok(Self::new(id, MessageStatus::InProgress))
-    }
-}
-
-impl From<OutputMessage> for InputMessage {
-    fn from(msg: OutputMessage) -> Self {
-        let parts = msg
-            .content
-            .into_iter()
-            .map(|c| InputContent::OutputText(InputTextContent::new(c.text)))
-            .collect();
-        Self {
-            id: Some(msg.id),
-            role: msg.role,
-            status: Some(msg.status),
-            content: InputMessageContent::Parts(parts),
         }
     }
 }
