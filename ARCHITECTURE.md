@@ -578,6 +578,14 @@ inference body through `run_with_json_body` or live `run_with_stream_body`. A ne
 `RoundIngestion` is created for every body and consumed by finalization, while
 `StreamDelivery` and `GatewayStreamAccumulator` survive across inference rounds.
 
+Each round returns an internal `IngestedResponse` with its public payload and a
+separate, bounded upstream-reported model observation. Event normalization extracts
+typed SSE model metadata; ingestion validates consistency, charges retained bytes,
+and requires explicit terminal metadata for evidence. Missing/null metadata and
+lenient EOF completion remain unknown. The engine binds the observation into reasoning
+provenance; it never treats the request-derived public `ResponsePayload.model` as
+provider evidence. The observation does not enable opaque reasoning replay.
+
 The live runner polls one framed line, performs synchronous ingestion and translation,
 then awaits delivery before polling the next line. This propagates bounded sender
 backpressure to the upstream body. Ingestion remains inline; moving it to a worker is

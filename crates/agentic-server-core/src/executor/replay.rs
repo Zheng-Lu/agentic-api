@@ -4,8 +4,11 @@
 
 use sha2::{Digest, Sha256};
 
+use super::request::{ExecutionContext, RequestContext};
+use crate::types::ResponsePayload;
 use crate::types::io::{InputItem, OutputItem, ResponsesInput};
 use crate::types::reasoning_replay::{ReasoningProvenance, ReasoningReplayIdentity, ReasoningReplayPolicy};
+use crate::types::upstream_identity::UpstreamModelId;
 
 /// Bind exact routing inputs and both model identities without retaining secrets.
 /// Nested, fixed-width hashes make field boundaries unambiguous without allocations.
@@ -33,6 +36,32 @@ pub(super) fn upstream_identity(
 }
 
 /// Ingestion has finished; annotate only items observed from this upstream round.
+pub(super) fn record_round_provenance(
+    payload: &mut ResponsePayload,
+    reported_model: Option<&UpstreamModelId>,
+    exec_ctx: &ExecutionContext,
+    request: &RequestContext,
+    auth: Option<&str>,
+) {
+    if !payload
+        .output
+        .iter()
+        .any(|item| matches!(item, OutputItem::Reasoning(_)))
+    {
+        return;
+    }
+    let policy = exec_ctx.responses_config.reasoning_replay_policy;
+    let identity = upstream_identity(
+        policy,
+        &exec_ctx.responses_url(),
+        auth,
+        &request.enriched_request.model,
+        reported_model.map(UpstreamModelId::as_str),
+    );
+    record_upstream_provenance(&mut payload.output, policy, identity);
+}
+
+/// Apply the round's server-owned observation after successful ingestion.
 pub(super) fn record_upstream_provenance(
     output: &mut [OutputItem],
     policy: ReasoningReplayPolicy,

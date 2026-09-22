@@ -14,6 +14,7 @@ use crate::executor::response_budget::ExecutorResponseBudget;
 use crate::executor::translate::{Translation, TranslationContext};
 use crate::tool::{ToolRegistry, ToolSearchMetadata, ToolSearchState};
 use crate::types::request_response::ResponsePayload;
+use crate::types::upstream_identity::{IngestedResponse, UpstreamModelId};
 use delivery::StreamDelivery;
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc::Sender;
@@ -21,6 +22,7 @@ use tokio::sync::mpsc::Sender;
 #[derive(Debug)]
 pub(super) struct StreamPayload {
     pub(super) payload: ResponsePayload,
+    pub(super) upstream_model: Option<UpstreamModelId>,
     pub(super) deferred_events: Vec<EventFrame>,
 }
 
@@ -126,18 +128,18 @@ impl AgentPipeline {
             .push(line)
     }
 
-    fn finish(&mut self) -> ExecutorResult<ResponsePayload> {
+    fn finish(&mut self) -> ExecutorResult<IngestedResponse> {
         let round = self
             .round
             .take()
             .expect("body runner starts a round before finalization");
-        let mut payload = round.finish(
+        let mut response = round.finish(
             &self.request.enriched_request.model,
             self.request.original_request.previous_response_id.as_deref(),
             self.request.original_request.instructions.as_deref(),
         )?;
-        self.request.inject_ids(&mut payload);
-        Ok(payload)
+        self.request.inject_ids(&mut response.payload);
+        Ok(response)
     }
 
     /// Polls live input inline and awaits delivery before reading another framed line.
@@ -158,9 +160,10 @@ impl AgentPipeline {
                 .accept(translation, &self.request, registry, output_offset)
                 .await?;
         }
-        let payload = self.finish()?;
+        let response = self.finish()?;
         Ok(StreamPayload {
-            payload,
+            payload: response.payload,
+            upstream_model: response.upstream_model,
             deferred_events: self.delivery.take_deferred_events(),
         })
     }
@@ -172,7 +175,7 @@ impl AgentPipeline {
         validation: Validation,
         context: TranslationContext,
         budget: Option<ExecutorResponseBudget>,
-    ) -> ExecutorResult<ResponsePayload> {
+    ) -> ExecutorResult<IngestedResponse> {
         self.begin_round(validation, context, budget)?;
         self.round
             .as_mut()
@@ -184,3 +187,5 @@ impl AgentPipeline {
 
 #[cfg(test)]
 mod driver_tests;
+#[cfg(test)]
+mod upstream_identity_tests;

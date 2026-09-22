@@ -377,6 +377,7 @@ fn test_process_event_response_created_sets_id() {
     let frame = EventFrame {
         event_type: SSEEventType::ResponseCreated,
         payload: EventPayload::Response {
+            model: None,
             id: "resp_new".into(),
             status: "in_progress".into(),
             usage: None,
@@ -393,6 +394,7 @@ fn test_process_event_response_created_empty_id_no_overwrite() {
     let frame = EventFrame {
         event_type: SSEEventType::ResponseCreated,
         payload: EventPayload::Response {
+            model: None,
             id: String::new(),
             status: "in_progress".into(),
             usage: None,
@@ -409,6 +411,7 @@ fn test_empty_id_response_created_allows_subsequent_created() {
     let empty_frame = EventFrame {
         event_type: SSEEventType::ResponseCreated,
         payload: EventPayload::Response {
+            model: None,
             id: String::new(),
             status: "in_progress".into(),
             usage: None,
@@ -422,6 +425,7 @@ fn test_empty_id_response_created_allows_subsequent_created() {
     let real_frame = EventFrame {
         event_type: SSEEventType::ResponseCreated,
         payload: EventPayload::Response {
+            model: None,
             id: "resp_real".into(),
             status: "in_progress".into(),
             usage: None,
@@ -475,6 +479,7 @@ fn test_process_event_text_delta_accumulates() {
     acc.process_event(&EventFrame {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
+            model: None,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
@@ -908,6 +913,7 @@ fn test_process_event_completed_with_usage() {
     let frame = EventFrame {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
+            model: None,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: Some(ResponseUsage {
@@ -931,6 +937,7 @@ fn test_process_event_failed_sets_error_status() {
     acc.process_event(&EventFrame {
         event_type: SSEEventType::ResponseFailed,
         payload: EventPayload::Response {
+            model: None,
             id: "resp_1".into(),
             status: "failed".into(),
             usage: None,
@@ -946,6 +953,7 @@ fn test_process_event_incomplete_sets_incomplete_status() {
     acc.process_event(&EventFrame {
         event_type: SSEEventType::ResponseIncomplete,
         payload: EventPayload::Response {
+            model: None,
             id: "resp_1".into(),
             status: "incomplete".into(),
             usage: None,
@@ -1371,6 +1379,7 @@ fn test_function_call_accumulation_basic() {
     acc.process_event(&EventFrame {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
+            model: None,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
@@ -1499,6 +1508,7 @@ fn test_function_call_multiple_parallel() {
     acc.process_event(&EventFrame {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
+            model: None,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
@@ -1567,6 +1577,7 @@ fn test_function_call_interleaved_with_message() {
     acc.process_event(&EventFrame {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
+            model: None,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
@@ -1764,6 +1775,7 @@ fn test_function_call_finalized_on_response_completed() {
     acc.process_event(&EventFrame {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
+            model: None,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,

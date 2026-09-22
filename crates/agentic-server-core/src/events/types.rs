@@ -307,6 +307,7 @@ pub enum EventPayload {
         id: String,
         status: String,
         usage: Option<ResponseUsage>,
+        model: Option<crate::types::upstream_identity::UpstreamModelId>,
     },
 
     /// `response.output_item.added`

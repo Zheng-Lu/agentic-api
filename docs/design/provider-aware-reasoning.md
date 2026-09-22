@@ -44,7 +44,7 @@ to another conversation is an error when loading versioned metadata. Parse diagn
 are intentionally excluded from storage errors because they may echo stored secrets.
 These checks do not establish provider identity or authorize opaque replay.
 
-## Current slice: server policy and per-item provenance
+## Completed: server policy and per-item provenance
 
 Opaque replay remains disabled. Server configuration now accepts an explicit typed
 `responses.reasoning_replay_policy`; its default and only executable value is
@@ -69,16 +69,15 @@ reasoning_replay_policy = "vllm_plaintext"
 Each upstream observation includes its policy and a fixed-size SHA-256 identity
 fingerprint. Domain-separated, fixed-width component hashes bind the configured
 Responses endpoint, effective per-request credential (including missing vs empty),
-requested model, and an optional authoritative reported model. Currently that last
-component is explicitly unknown: the pipeline rebuilds `response.model` from the
-request, so it cannot attest a resolved upstream snapshot. Unknown and reported model
-identities hash differently. Credential rotation, endpoint changes, policy changes,
+requested model, and an optional consistently reported terminal model. The latter now
+comes from upstream metadata, separately from the public `response.model` that the
+pipeline rebuilds from the request. Unknown and reported model identities hash
+differently. Credential rotation, endpoint changes, policy changes,
 and requested-model changes also produce distinct identities. Neither credentials
 nor original identity strings are stored, and identity `Debug` output is redacted.
 This is an equality fingerprint, not an authorization grant, integrity MAC, provider
 attestation, or model-family compatibility claim. It observes the configured endpoint,
-not any final redirect destination. Redirect policy, authoritative model propagation
-through normalization/ingestion, approved snapshots, opaque format identity, and
+not any final redirect destination. Redirect policy, approved snapshots, opaque format identity, and
 compatible-family rules remain enablement prerequisites.
 
 `ReasoningOutput.replay_provenance` is skipped on both serialization and
@@ -114,11 +113,54 @@ Raw storage `Item` rows now include the nullable provenance column; low-level it
 insertion is crate-private so callers use typed `ResponseStore`/`ConversationStore`
 operations instead of supplying arbitrary serialized SQL item data.
 
+## Current slice: upstream-reported model evidence
+
+`types/upstream_identity.rs` defines the bounded `UpstreamModelId`, safe typed
+`UpstreamModelError`, and internal `IngestedResponse` result. Model identifiers retain
+their exact spelling: there is no alias resolution, normalization, or request-model
+fallback. The gateway rejects empty/whitespace-only names and names exceeding 1024
+decoded UTF-8 bytes. This ceiling is a gateway limit, not an OpenAI protocol limit.
+
+JSON response bodies and SSE lifecycle response objects use the same typed model
+projection. Normalization extracts SSE metadata; synchronous ingestion checks that
+all supplied names agree within a round. Malformed metadata returns a redacted
+`upstream_error` (HTTP 502 for blocking requests); strict ingestion also rejects a
+changed name. Lenient ingestion preserves compatibility but permanently invalidates
+model evidence on a conflict. The existing gateway reasoning cassette demonstrates
+why: its early events report `gpt-5.6-sol`, while its terminal response echoes the
+requested `gpt-5.6` alias. Neither spelling may supply model evidence for that round.
+Failed ingestion does not persist a response or publish a session checkpoint. A streaming caller can already
+have received earlier valid events before the final error.
+
+Only an explicit terminal JSON status or SSE event with a model supplies evidence.
+Missing/null metadata, nonterminal JSON, and lenient completion at EOF remain unknown,
+even if earlier metadata or the request names a model. Strict ingestion rejects
+post-terminal events as before. Lenient ingestion retains its repeated-snapshot
+compatibility but permanently invalidates model evidence after any post-terminal
+semantic event. This observation is not a substitute for the strict lifecycle
+validation required by a future opaque profile.
+
+One bounded model string is retained and charged once per round under the existing
+shared retained-response budget; repeated matching snapshots do not double-charge.
+The consuming ingestion result carries it separately to the engine, which includes
+it in that round's provenance fingerprint. Inference framing and ordered delivery do
+not inspect or decide model identity. No queue, worker, parser, client emission path,
+database migration, or public response field is added. Public completed response
+model naming remains unchanged; Rust callers constructing `EventPayload::Response`
+must now supply its typed optional `model` field.
+
+Old provenance is not rewritten: observations without a reported model retain their
+original unknown-model fingerprint. A provider's self-reported name does not attest
+its backend, establish compatible model families, or authorize opaque replay.
+Opaque replay remains disabled. The metadata projection follows the response objects
+in the [official streaming reference](https://developers.openai.com/api/reference/resources/responses/streaming-events).
+
 ## Remaining slices before enabling a provider profile
 
 1. Extend the server-owned policy with an approved provider/model/opaque-format
-   profile, authoritative model evidence and redirect rules. Enforce the provenance match before any upstream I/O;
-   the observational fingerprint added here is not sufficient to enable a profile.
+   profile and redirect rules, using the reported-model evidence now available.
+   Enforce the provenance match before any upstream I/O; the observational fingerprint
+   added here is not sufficient to enable a profile.
 2. Project compatible reasoning only in the upstream request copy. Keep the single
    `OutputItem::to_input_item` conversion and existing ingestion path. Select strict
    terminal validation for the opaque profile rather than introducing a second
@@ -157,6 +199,15 @@ tests replay existing recorder-generated Qwen and OpenAI JSON/SSE exchanges, che
 durable and transient history, cancelled forks, promotion, and external-commit
 demotion. Unit tests additionally exercise fingerprint separation and non-wire budget
 charges/refunds. These local replays are not live provider qualification.
+
+`upstream_model_provenance_test.rs` replays the recorder-generated Qwen JSON/SSE
+exchanges on one endpoint with an unchanged request alias. In-memory fault injection
+proves that changing only the reported model changes persisted provenance, JSON/SSE
+identities match, missing/null/conflicting metadata stays unknown under lenient
+ingestion, and malformed terminal metadata emits an error without storing a response.
+Pipeline tests cover malformed
+metadata, exact UTF-8 bounds, strict/lenient terminal handling, round isolation,
+retained-budget exhaustion, upstream disconnect, and client backpressure/drop.
 
 The workspace suite (including OpenAPI and cassette tests), Clippy with warnings
 denied, and formatting checks passed with Rust 1.98. Opt-in ignored tests were not run:

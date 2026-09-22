@@ -5,6 +5,7 @@
 //! primary entry point; [`execute`] is a convenience shim for callers that don't
 //! need per-request configuration.
 
+mod round;
 mod streaming;
 mod usage;
 #[cfg(test)]
@@ -41,7 +42,7 @@ use crate::executor::response_budget::ExecutorResponseBudget;
 use crate::executor::response_budget::MAX_EXECUTOR_RESPONSE_BYTES;
 #[cfg(test)]
 use crate::executor::upstream::agent_pipeline;
-use crate::executor::upstream::{agent_pipeline_with_limits, fetch_blocking_payload, fetch_stream_payload};
+use crate::executor::upstream::agent_pipeline_with_limits;
 use crate::tool::{ToolRegistry, ToolSearchMetadata, ToolSearchState, mcp};
 use crate::types::io::{InputItem, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use crate::types::request_response::{IncompleteDetails, RequestPayload, ResponsePayload};
@@ -221,34 +222,8 @@ impl<'a> EngineOrchestration<'a> {
             )?;
             accumulate_usage(&mut combined_usage, compaction_usage);
             let output_offset = combined_output.len();
-            let (mut payload, deferred_stream_events): (ResponsePayload, Vec<_>) = if stream_upstream {
-                let stream_payload = fetch_stream_payload(
-                    self.agent,
-                    self.exec_ctx,
-                    auth,
-                    &self.registry,
-                    output_offset,
-                    &self.response_budget,
-                )
-                .await?;
-                if round == 0 {
-                    self.registry.clear_mcp_list_tool_items();
-                }
-                (stream_payload.payload, stream_payload.deferred_events)
-            } else {
-                (
-                    fetch_blocking_payload(
-                        self.agent,
-                        self.exec_ctx,
-                        auth,
-                        &self.registry,
-                        Some(&self.response_budget),
-                    )
-                    .await?,
-                    Vec::new(),
-                )
-            };
-            self.record_round_provenance(&mut payload, auth);
+            let (mut payload, deferred_stream_events) =
+                self.fetch_round(auth, stream_upstream, round, output_offset).await?;
             accumulate_usage(&mut combined_usage, payload.usage.take());
             let current_output = std::mem::take(&mut payload.output);
             if matches!(payload.status.as_str(), "error" | "failed") {
@@ -333,26 +308,6 @@ impl<'a> EngineOrchestration<'a> {
             emit_deferred_stream_events(deferred_events, ctx, accumulator, sender, output_offset).await?;
         }
         Ok(())
-    }
-
-    fn record_round_provenance(&self, payload: &mut ResponsePayload, auth: Option<&str>) {
-        if !payload
-            .output
-            .iter()
-            .any(|item| matches!(item, OutputItem::Reasoning(_)))
-        {
-            return;
-        }
-        let policy = self.exec_ctx.responses_config.reasoning_replay_policy;
-        let identity = super::replay::upstream_identity(
-            policy,
-            &self.exec_ctx.responses_url(),
-            auth,
-            &self.agent.request.enriched_request.model,
-            // The pipeline reconstructs payload.model from the request; it is not provider evidence.
-            None,
-        );
-        super::replay::record_upstream_provenance(&mut payload.output, policy, identity);
     }
 
     fn record_gateway_results(&mut self, results: Vec<GatewayCallResult>) {

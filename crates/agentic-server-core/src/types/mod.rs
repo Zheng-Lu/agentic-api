@@ -4,6 +4,7 @@ pub mod messages;
 pub mod reasoning_replay;
 pub mod request_response;
 pub mod tools;
+pub mod upstream_identity;
 
 pub use io::{
     AllowedTool, AllowedToolsMode, CompactionItem, CustomToolCall, CustomToolCallOutputMessage, FunctionTool,

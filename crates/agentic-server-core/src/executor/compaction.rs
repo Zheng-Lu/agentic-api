@@ -378,11 +378,11 @@ pub(crate) async fn compact_items(
     let mut agent = agent_pipeline(ctx, None, None);
     let response =
         fetch_blocking_payload(&mut agent, exec_ctx, auth, &crate::tool::ToolRegistry::default(), None).await?;
-    let summary = completed_summary_text(&response)?;
+    let summary = completed_summary_text(&response.payload)?;
 
     Ok((
         finish_compacted_window(compacted, summary),
-        response.usage.unwrap_or_default(),
+        response.payload.usage.unwrap_or_default(),
     ))
 }
 

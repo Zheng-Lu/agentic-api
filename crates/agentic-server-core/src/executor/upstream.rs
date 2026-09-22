@@ -91,7 +91,7 @@ pub(super) async fn fetch_blocking_payload(
     auth: Option<&str>,
     registry: &ToolRegistry,
     response_budget: Option<&ExecutorResponseBudget>,
-) -> ExecutorResult<ResponsePayload> {
+) -> ExecutorResult<crate::types::upstream_identity::IngestedResponse> {
     agent.ensure_request_prepared()?;
     let upstream_json = upstream_request(&agent.request, false)?;
     let body = fetch_response_json_limited(
@@ -129,7 +129,9 @@ pub async fn decode_upstream(
     let mut agent = agent_pipeline(ctx, None, None);
     let payload = match body {
         UpstreamBody::Json(body) => {
-            agent.run_with_json_body(body, Validation::Strict, TranslationContext::default(), None)?
+            agent
+                .run_with_json_body(body, Validation::Strict, TranslationContext::default(), None)?
+                .payload
         }
         UpstreamBody::Sse(body) => {
             let lines = futures::stream::iter(body.lines().map(|line| Ok(line.to_owned())));
@@ -282,11 +284,12 @@ pub(super) mod tests {
         let translated = ingestion.push(SseLine::parse(&format!("data: {done}"))).unwrap();
         assert_eq!(translated.frames[0].wire.rest["item"]["namespace"], "travel");
         assert_eq!(translated.frames[0].wire.rest["item"]["name"], "timezone");
-        let stream_payload = ingestion.finish("test", None, None).unwrap();
+        let stream_payload = ingestion.finish("test", None, None).unwrap().payload;
         let body = serde_json::json!({"id":"upstream","status":"completed","output":[item]}).to_string();
         let json_payload = agent
             .run_with_json_body(&body, Validation::Lenient, json_context, None)
-            .unwrap();
+            .unwrap()
+            .payload;
         assert_eq!(
             serde_json::to_value(&stream_payload.output).unwrap(),
             serde_json::to_value(&json_payload.output).unwrap()
@@ -713,7 +716,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             serde_json::to_value(&result_1byte.payload.output).unwrap(),
-            serde_json::to_value(&result_json.output).unwrap()
+            serde_json::to_value(&result_json.payload.output).unwrap()
         );
     }
 

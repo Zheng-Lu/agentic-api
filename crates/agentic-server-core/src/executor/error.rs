@@ -27,6 +27,9 @@ impl std::fmt::Display for ResourceLimit {
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ExecutorError {
+    /// Upstream model evidence is malformed or contradictory.
+    #[error(transparent)]
+    UpstreamModel(#[from] crate::types::upstream_identity::UpstreamModelError),
     /// A server-selected reasoning replay policy cannot safely execute.
     #[error(transparent)]
     ReasoningReplay(#[from] crate::types::reasoning_replay::ReasoningReplayError),
@@ -165,7 +168,8 @@ impl ExecutorError {
                 | ToolError::InvalidUpstreamToolSearch
                 | ToolError::UpstreamWithheldFunctionCall,
             )
-            | Self::CompactionFailed { .. } => StatusCode::BAD_GATEWAY,
+            | Self::CompactionFailed { .. }
+            | Self::UpstreamModel(_) => StatusCode::BAD_GATEWAY,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ParseError(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -190,7 +194,10 @@ impl ExecutorError {
             | Self::PayloadTooLarge(_) => "invalid_request_error",
             Self::Storage(e) if e.is_not_found() => "not_found",
             Self::Conflict(_) => "conflict_error",
-            Self::LLMRequest { .. } | Self::LLMTransport { .. } | Self::CompactionFailed { .. } => "upstream_error",
+            Self::LLMRequest { .. }
+            | Self::LLMTransport { .. }
+            | Self::CompactionFailed { .. }
+            | Self::UpstreamModel(_) => "upstream_error",
             Self::ResourceLimitExceeded { limit, .. } => match limit {
                 ResourceLimit::UpstreamSseLine | ResourceLimit::UpstreamJsonBody => "upstream_error",
                 ResourceLimit::ResponseBudget | ResourceLimit::StreamEvent => "server_error",
