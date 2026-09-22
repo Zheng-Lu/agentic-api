@@ -35,7 +35,7 @@ use crate::executor::inference::DONE_MARKER;
 use crate::executor::persist::persist_if_needed;
 use crate::executor::pipeline::{AgentPipeline, emit_deferred_stream_events};
 use crate::executor::prepare::prepare_request_tools;
-use crate::executor::rehydrate::prepare_reasoning_for_vllm;
+use crate::executor::replay::prepare_initial_reasoning;
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
 #[cfg(test)]
@@ -146,13 +146,6 @@ async fn build_tool_registry(
     Ok(registry)
 }
 
-fn prepare_initial_reasoning_for_vllm(input: &mut ResponsesInput, round: usize, compacted: bool) -> ExecutorResult<()> {
-    if round == 0 && !compacted {
-        return prepare_reasoning_for_vllm(input);
-    }
-    Ok(())
-}
-
 fn record_round_history(
     ctx: &mut RequestContext,
     output_items: &[OutputItem],
@@ -215,8 +208,9 @@ impl<'a> EngineOrchestration<'a> {
 
         for round in 0..MAX_GATEWAY_TOOL_ROUNDS {
             let compaction_usage = maybe_compact_context(&mut self.agent.request, self.exec_ctx, auth).await?;
-            prepare_initial_reasoning_for_vllm(
+            prepare_initial_reasoning(
                 &mut self.agent.request.enriched_request.input,
+                self.exec_ctx.responses_config.reasoning_replay_policy,
                 round,
                 compaction_usage.is_some(),
             )?;

@@ -4,6 +4,7 @@ use std::time::Duration;
 use crate::config::{Config, ResponsesConfig, default_database_url};
 use crate::error::Error;
 use crate::executor::gateway::GatewaySchedulerPolicy;
+use crate::executor::inference::transport::ResponsesTransport;
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
 use crate::storage::backend::redact_database_urls;
 use crate::storage::{
@@ -79,9 +80,24 @@ pub struct ExecutionContext {
     pub(crate) gateway_scheduler_policy: GatewaySchedulerPolicy,
     pub responses_config: ResponsesConfig,
     storage_pool: Option<Arc<crate::storage::DbPool>>,
+    opaque_transport: Arc<tokio::sync::OnceCell<ResponsesTransport>>,
 }
 
 impl ExecutionContext {
+    /// Called only after profile/provenance/availability preflight succeeds.
+    pub(super) async fn responses_transport(&self) -> super::error::ExecutorResult<ResponsesTransport> {
+        match self.responses_config.reasoning_replay_policy {
+            crate::types::reasoning_replay::ReasoningReplayPolicy::VllmPlaintext => {
+                Ok(ResponsesTransport::shared(Arc::clone(&self.client)))
+            }
+            crate::types::reasoning_replay::ReasoningReplayPolicy::OpaqueResponses => self
+                .opaque_transport
+                .get_or_try_init(|| async { ResponsesTransport::opaque() })
+                .await
+                .cloned(),
+        }
+    }
+
     /// Returns the full URL for the `/v1/responses` endpoint.
     #[must_use]
     pub fn responses_url(&self) -> String {
@@ -113,6 +129,7 @@ impl ExecutionContext {
             gateway_scheduler_policy: GatewaySchedulerPolicy::default(),
             responses_config: ResponsesConfig::default(),
             storage_pool: None,
+            opaque_transport: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -194,6 +211,7 @@ impl ExecutionContext {
             gateway_scheduler_policy: GatewaySchedulerPolicy::new(cfg.tools.max_concurrent_gateway_calls),
             responses_config: cfg.responses,
             storage_pool: Some(pool),
+            opaque_transport: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 }

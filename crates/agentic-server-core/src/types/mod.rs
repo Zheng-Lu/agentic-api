@@ -6,6 +6,8 @@ pub mod reasoning_replay;
 pub mod request_response;
 pub mod tools;
 pub mod upstream_identity;
+pub mod upstream_input;
+pub mod upstream_request;
 
 pub use io::{
     AllowedTool, AllowedToolsMode, CompactionItem, CustomToolCall, CustomToolCallOutputMessage, FunctionTool,

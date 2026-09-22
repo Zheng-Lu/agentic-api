@@ -6,6 +6,9 @@ use crate::tool::ToolError;
 use crate::types::reasoning_replay::ReasoningReplayError;
 use crate::utils::common::serialize_to_vec_or_default;
 
+mod opaque;
+pub use opaque::OpaqueUpstreamError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceLimit {
     ResponseBudget,
@@ -28,6 +31,9 @@ impl std::fmt::Display for ResourceLimit {
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ExecutorError {
+    /// Invalid provider data with redacted diagnostics and a retained typed cause.
+    #[error(transparent)]
+    OpaqueUpstream(#[from] OpaqueUpstreamError),
     /// Upstream model evidence is malformed or contradictory.
     #[error(transparent)]
     UpstreamModel(#[from] crate::types::upstream_identity::UpstreamModelError),
@@ -184,7 +190,8 @@ impl ExecutorError {
                 | ToolError::UpstreamWithheldFunctionCall,
             )
             | Self::CompactionFailed { .. }
-            | Self::UpstreamModel(_) => StatusCode::BAD_GATEWAY,
+            | Self::UpstreamModel(_)
+            | Self::OpaqueUpstream(_) => StatusCode::BAD_GATEWAY,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ParseError(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -217,7 +224,8 @@ impl ExecutorError {
             Self::LLMRequest { .. }
             | Self::LLMTransport { .. }
             | Self::CompactionFailed { .. }
-            | Self::UpstreamModel(_) => "upstream_error",
+            | Self::UpstreamModel(_)
+            | Self::OpaqueUpstream(_) => "upstream_error",
             Self::ResourceLimitExceeded { limit, .. } => match limit {
                 ResourceLimit::UpstreamSseLine | ResourceLimit::UpstreamJsonBody => "upstream_error",
                 ResourceLimit::ResponseBudget | ResourceLimit::StreamEvent => "server_error",
@@ -235,6 +243,7 @@ impl ExecutorError {
     #[must_use]
     pub fn error_code(&self) -> &'static str {
         match self.client_visible_error() {
+            Self::OpaqueUpstream(_) => "invalid_upstream_response",
             Self::ReasoningReplay(_) => "reasoning_replay_incompatible",
             Self::ConversationLocked { .. } => "conversation_locked",
             Self::PreviousResponseNotFound { .. } => "previous_response_not_found",

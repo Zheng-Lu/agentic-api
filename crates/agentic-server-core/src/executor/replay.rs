@@ -68,8 +68,23 @@ pub(super) fn validate_initial_input(
     auth: Option<&str>,
 ) -> ExecutorResult<()> {
     preflight_inference(exec_ctx, request, auth)?;
-    if !request.input.has_compaction_trigger() {
+    if exec_ctx.responses_config.reasoning_replay_policy == ReasoningReplayPolicy::VllmPlaintext
+        && !request.input.has_compaction_trigger()
+    {
         super::rehydrate::validate_reasoning_for_vllm(&request.input)?;
+    }
+    Ok(())
+}
+
+/// Only the default vLLM adapter mutates its initial model-context copy.
+pub(super) fn prepare_initial_reasoning(
+    input: &mut ResponsesInput,
+    policy: ReasoningReplayPolicy,
+    round: usize,
+    compacted: bool,
+) -> ExecutorResult<()> {
+    if policy == ReasoningReplayPolicy::VllmPlaintext && round == 0 && !compacted {
+        return super::rehydrate::prepare_reasoning_for_vllm(input);
     }
     Ok(())
 }
@@ -107,10 +122,11 @@ pub(super) fn record_round_provenance(
     request: &RequestContext,
     auth: Option<&str>,
 ) -> ExecutorResult<()> {
-    if !payload
-        .output
-        .iter()
-        .any(|item| matches!(item, OutputItem::Reasoning(_)))
+    if exec_ctx.responses_config.reasoning_replay_profile.is_none()
+        && !payload
+            .output
+            .iter()
+            .any(|item| matches!(item, OutputItem::Reasoning(_)))
     {
         return Ok(());
     }

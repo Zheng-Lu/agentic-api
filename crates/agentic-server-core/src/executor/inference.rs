@@ -15,6 +15,9 @@ use crate::config::DEFAULT_MAX_UPSTREAM_SSE_LINE_BYTES;
 use crate::executor::error::{ExecutorError, ExecutorResult, ResourceLimit};
 use crate::proxy::processed_response_headers;
 
+pub(crate) mod transport;
+use transport::{ResponsePolicy, ResponsesTransport};
+
 /// SSE stream of raw lines sent to the client (`data: …\n\n` per event).
 pub type BoxStream = std::pin::Pin<Box<dyn Stream<Item = String> + Send>>;
 
@@ -44,13 +47,14 @@ where
 #[cfg(test)]
 fn drain_complete_utf8_lines(buffer: &mut Vec<u8>) -> ExecutorResult<Vec<String>> {
     let mut scanned = 0;
-    drain_complete_utf8_lines_limited(buffer, &mut scanned, MAX_SSE_LINE_BYTES)
+    drain_complete_utf8_lines_limited(buffer, &mut scanned, MAX_SSE_LINE_BYTES, ResponsePolicy::Compatible)
 }
 
 fn drain_complete_utf8_lines_limited(
     buffer: &mut Vec<u8>,
     scanned: &mut usize,
     max_sse_line_bytes: usize,
+    policy: ResponsePolicy,
 ) -> ExecutorResult<Vec<String>> {
     let mut lines = Vec::new();
     while let Some(rel_pos) = buffer[*scanned..].iter().position(|byte| *byte == b'\n') {
@@ -68,8 +72,14 @@ fn drain_complete_utf8_lines_limited(
         } else {
             pos
         };
-        if let Ok(line) = std::str::from_utf8(&line[..line_end]) {
-            lines.push(line.to_string());
+        match std::str::from_utf8(&line[..line_end]) {
+            Ok(line) => lines.push(line.to_string()),
+            Err(_) if matches!(policy, ResponsePolicy::Opaque) => {
+                return Err(ExecutorError::StreamError(
+                    "upstream SSE line was not valid UTF-8".to_owned(),
+                ));
+            }
+            Err(_) => {}
         }
     }
     *scanned = buffer.len();
@@ -120,6 +130,27 @@ pub(super) async fn send_request(
     forwarded_headers: Option<&reqwest::header::HeaderMap>,
     chunk_timeout: Duration,
 ) -> ExecutorResult<reqwest::Response> {
+    send_request_with_policy(
+        client,
+        url,
+        body,
+        auth,
+        forwarded_headers,
+        chunk_timeout,
+        ResponsePolicy::Compatible,
+    )
+    .await
+}
+
+async fn send_request_with_policy(
+    client: &reqwest::Client,
+    url: &str,
+    body: String,
+    auth: Option<&str>,
+    forwarded_headers: Option<&reqwest::header::HeaderMap>,
+    chunk_timeout: Duration,
+    policy: ResponsePolicy,
+) -> ExecutorResult<reqwest::Response> {
     let mut headers = forwarded_headers.cloned().unwrap_or_default();
     headers
         .entry(reqwest::header::CONTENT_TYPE)
@@ -143,6 +174,19 @@ pub(super) async fn send_request(
     })?;
 
     if !resp.status().is_success() {
+        if matches!(policy, ResponsePolicy::Opaque) {
+            // A provider can reflect input (including opaque state) in an error.
+            // Never read, log, or forward that body or its headers. A redirect is
+            // an upstream protocol failure, not a redirect for the gateway client.
+            return Err(ExecutorError::LLMTransport {
+                status: if resp.status().is_redirection() {
+                    http::StatusCode::BAD_GATEWAY
+                } else {
+                    resp.status()
+                },
+                message: "opaque Responses upstream rejected the request",
+            });
+        }
         let status = resp.status().as_u16();
         let headers = processed_response_headers(resp.headers());
         // Log and discard any error reading the error body — the status code
@@ -174,7 +218,8 @@ pub(super) async fn fetch_response_json(
     fetch_response_json_limited(upstream_json, url, client, auth, DEFAULT_MAX_UPSTREAM_JSON_BYTES).await
 }
 
-pub(super) async fn fetch_response_json_limited(
+#[cfg(test)]
+async fn fetch_response_json_limited(
     upstream_json: String,
     url: &str,
     client: &reqwest::Client,
@@ -234,20 +279,36 @@ pub fn call_inference_limited(
     chunk_timeout: Duration,
     max_sse_line_bytes: usize,
 ) -> impl Stream<Item = Result<String, ExecutorError>> + Send + 'static {
+    call_inference_with_transport(
+        upstream_json,
+        url,
+        ResponsesTransport::shared(client),
+        auth,
+        chunk_timeout,
+        max_sse_line_bytes,
+    )
+}
+
+pub(super) fn call_inference_with_transport(
+    upstream_json: String,
+    url: String,
+    transport: ResponsesTransport,
+    auth: Option<String>,
+    chunk_timeout: Duration,
+    max_sse_line_bytes: usize,
+) -> impl Stream<Item = Result<String, ExecutorError>> + Send + 'static {
     stream! {
-        let resp = match send_request(
-            &client,
+        let resp = match transport.send(
             &url,
             upstream_json,
             auth.as_deref(),
-            None,
             chunk_timeout,
         ).await {
             Ok(r) => r,
             Err(e) => { yield Err(e); return; }
         };
 
-        let mut lines = Box::pin(response_lines(resp, chunk_timeout, max_sse_line_bytes));
+        let mut lines = Box::pin(response_lines_with_policy(resp, chunk_timeout, max_sse_line_bytes, transport.response_policy));
         while let Some(line) = lines.next().await {
             yield line;
         }
@@ -261,6 +322,15 @@ pub(super) fn response_lines(
     chunk_timeout: Duration,
     max_sse_line_bytes: usize,
 ) -> impl Stream<Item = Result<String, ExecutorError>> + Send + 'static {
+    response_lines_with_policy(resp, chunk_timeout, max_sse_line_bytes, ResponsePolicy::Compatible)
+}
+
+fn response_lines_with_policy(
+    resp: reqwest::Response,
+    chunk_timeout: Duration,
+    max_sse_line_bytes: usize,
+    policy: ResponsePolicy,
+) -> impl Stream<Item = Result<String, ExecutorError>> + Send + 'static {
     stream! {
         let mut bytes = resp.bytes_stream();
         let mut buf = Vec::with_capacity(8192);
@@ -269,13 +339,18 @@ pub(super) fn response_lines(
         loop {
             let chunk = match next_chunk(&mut bytes, chunk_timeout).await {
                 Ok(Some(c)) => c,
-                Ok(None) => break,
+                Ok(None) => {
+                    if !buf.is_empty() && matches!(policy, ResponsePolicy::Opaque) {
+                        yield Err(ExecutorError::StreamError("upstream SSE ended within a line".to_owned()));
+                    }
+                    break;
+                }
                 Err(e) => { yield Err(e); return; }
             };
 
             buf.extend_from_slice(&chunk);
 
-            let lines = match drain_complete_utf8_lines_limited(&mut buf, &mut scanned, max_sse_line_bytes) {
+            let lines = match drain_complete_utf8_lines_limited(&mut buf, &mut scanned, max_sse_line_bytes, policy) {
                 Ok(lines) => lines,
                 Err(error) => {
                     yield Err(error);

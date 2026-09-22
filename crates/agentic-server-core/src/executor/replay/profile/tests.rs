@@ -276,3 +276,28 @@ async fn round_annotations_use_profile_identity_and_fail_atomically() {
     assert!(serde_json::to_string(&payload).unwrap().contains("opaque-secret"));
     assert!(!serde_json::to_string(&payload).unwrap().contains("replay_provenance"));
 }
+
+#[tokio::test]
+async fn a_round_without_reasoning_still_requires_the_pinned_reported_model() {
+    let context = context();
+    let mut default_context = context.clone();
+    default_context.responses_config = ResponsesConfig::default();
+    let request = crate::executor::rehydrate::rehydrate_conversation(request(), &default_context)
+        .await
+        .unwrap();
+    let mut payload: crate::types::ResponsePayload = serde_json::from_value(serde_json::json!({
+        "id":"resp_test", "object":"response", "model":PROFILE.model(), "created_at":0,
+        "status":"completed", "output":[]
+    }))
+    .unwrap();
+    for reported in [None, Some(UpstreamModelId::new("wrong-model".into()).unwrap())] {
+        assert!(matches!(
+            record_round_provenance(&mut payload, reported.as_ref(), &context, &request, Some(SECRET)),
+            Err(ExecutorError::ReasoningReplay(
+                ReasoningReplayError::ReportedModelMismatch
+            ))
+        ));
+    }
+    let model = UpstreamModelId::new(PROFILE.model().into()).unwrap();
+    record_round_provenance(&mut payload, Some(&model), &context, &request, Some(SECRET)).unwrap();
+}

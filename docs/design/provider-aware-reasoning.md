@@ -155,7 +155,7 @@ its backend, establish compatible model families, or authorize opaque replay.
 Opaque replay remains disabled. The metadata projection follows the response objects
 in the [official streaming reference](https://developers.openai.com/api/reference/resources/responses/streaming-events).
 
-## Current slice: candidate profile and compatibility preflight
+## Candidate profile and compatibility preflight
 
 The server now accepts one closed **candidate**, not an enabled capability:
 
@@ -196,8 +196,9 @@ profile validation does not perform URL normalization or model-family inference.
   borrow input without cloning, mutation, filtering, or reordering. Plaintext or a
   summary cannot establish opaque compatibility.
 - The engine's post-ingestion observation is fallible for a candidate opaque profile:
-  a reasoning-bearing round requires exact, consistently reported terminal model
-  evidence before any of its reasoning items receives profile provenance.
+  every round, including rounds without reasoning, requires exact, consistently
+  reported terminal model evidence before execution can advance. Reasoning items
+  receive profile provenance only after that check succeeds.
 
 Profile identities hash a separate domain, the fixed compatibility-contract domain,
 and the existing routing/credential/model observation. Thus old observational
@@ -216,29 +217,68 @@ unavailable execution is a 500. Messages are static and redact item IDs, URLs,
 credentials, model input, and opaque state. Input/model errors identify the relevant
 parameter when unambiguous.
 
-This slice does **not** implement opaque request projection, upstream `store: false`,
-strict profile ingestion, redirect suppression, or qualification. It does not claim
-that a configured HTTP client, proxy, default authorization header, or organization/
-project header is covered by the bearer-only fingerprint. Those transport constraints
-must be settled before enablement. vLLM projection, public output, persistence,
-session behavior, SSE framing/normalization/ingestion/delivery, and cancellation
-ownership remain unchanged. Rust struct literals for `ResponsesConfig` must include
-the optional profile or use `..ResponsesConfig::default()`.
+Rust struct literals for `ResponsesConfig` must include the optional profile or use
+`..ResponsesConfig::default()`.
+
+## Current slice: stateless projection and isolated transport
+
+The candidate remains unavailable, but its adapter now has the following implemented
+components. Unit tests exercise them directly; no execution feature flag bypasses
+the availability gate and no live provider qualification is claimed.
+
+- `types/upstream_input.rs::UpstreamInput` serializes a borrowed upstream-only view.
+  Reasoning keeps its exact ID, summary, opaque string, optional status, and position;
+  plaintext `content` and internal provenance are omitted. Absent optional fields are
+  omitted, not serialized as null. Other item kinds use their existing serialization.
+  The single `OutputItem::to_input_item` conversion and tool normalization remain in use.
+- The candidate sends upstream `store: false`, independent of the client's gateway
+  `store` choice. Default vLLM requests still omit upstream `store`. The candidate does
+  not run the initial vLLM plaintext sanitizer, mutate canonical items, or discard
+  opaque state. Current upstream documentation describes encrypted state as the default
+  for stateless reasoning; the legacy `reasoning.encrypted_content` include remains
+  accepted. No model-specific `reasoning.context` value is inferred or injected. See the
+  [official stateless reasoning guide](https://developers.openai.com/api/docs/guides/reasoning).
+- `executor/inference/transport.rs::ResponsesTransport` isolates the candidate from
+  `ExecutionContext.client`. Its lazily initialized, shared client permits HTTPS only,
+  follows no redirects, disables automatic retries and environment proxies, and has no
+  caller default authorization, organization/project headers, or cookie store. Only the
+  preflight-checked bearer credential is supplied per request. Connect timeout is 30 s,
+  read timeout is 600 s even if the separate chunk timeout is disabled, and at most one
+  idle connection is retained per host. The default vLLM and Messages clients are unchanged.
+- Candidate non-2xx bodies and headers are discarded without being read or logged.
+  Redirects become 502 errors, not client redirects. HTTP/SSE framing remains in
+  `inference.rs`; the same framer rejects invalid UTF-8 and unfinished lines for the
+  candidate while retaining the default adapter's existing compatibility behavior.
+- `executor/upstream.rs` selects existing `Validation::Strict` for both candidate JSON
+  and SSE; default vLLM remains lenient. Normalization, synchronous ingestion, and
+  ordered delivery keep their existing owners and transitions. Invalid provider-data
+  errors are wrapped with redacted Display/Debug/API diagnostics and a retained typed
+  source. Source chains are for explicit internal inspection, not routine logging.
+  This does not promise that valid provider-generated response text or response error
+  objects are secret-free; those still require qualification through the common pipeline.
+
+There is no extra queue, task, parser, lifecycle validator, or output assembly path.
+Existing JSON/SSE byte limits and delivery backpressure apply. Dropping the inline
+consumer drops its upstream stream; the separate engine producer abort/join gap remains
+a release gate below. No storage migration or canonical-history rewrite is needed.
+
+`UpstreamRequest` and `UpstreamTool` moved to `types/upstream_request.rs`, with existing
+public import paths preserved. Rust struct literals must now supply `store: None` for
+the default contract and convert a `Cow<ResponsesInput>` with `.into()` for `input`.
+The pre-existing metadata contract was moved unchanged; no new untyped replay payload
+or public protocol field is introduced.
 
 ## Remaining slices before enabling a provider profile
 
-1. Qualify the candidate profile and enforce its transport constraints, including
-   redirect suppression and effective credential/header identity. The typed profile
-   and pre-inference provenance checks are implemented, but passing them alone does
-   not enable execution.
-2. Project compatible reasoning only in the upstream request copy. Keep the single
-   `OutputItem::to_input_item` conversion and existing ingestion path. Select strict
-   terminal validation for the opaque profile rather than introducing a second
-   state machine. Retain the vLLM default.
-3. Separate local plaintext compaction checkpoints from provider opaque compaction.
-   Reject unsupported combinations before inference. Qualify tool-round ordering,
-   branching, HTTP/SSE, and transient WebSocket continuations with recorded exchanges.
-4. Close the streaming producer abort/join gap with #244 before production enablement.
+1. Qualify the exact pinned endpoint/model and stateless projection with recorder-generated
+   initial, multi-turn, tool-loop, branching, HTTP/SSE, and transient WebSocket exchanges.
+   Verify exact reported snapshot identity, supported request parameters, tool normalization,
+   and provider terminal/error behavior. Existing gpt-5.6 recordings are regression evidence,
+   not qualification of gpt-5.4-2026-03-05. Passing local adapter tests does not enable execution.
+2. Keep local plaintext compaction distinct from provider opaque compaction. Unsupported
+   combinations already fail before inference; any future expansion requires its own
+   typed contract and recordings, not summary-based compatibility inference.
+3. Close the streaming producer abort/join gap with #244 before production enablement.
 
 The upstream contract requires preserving opaque state and limits reasoning reuse
 to compatible model families; see the
@@ -287,6 +327,16 @@ missing opaque state, compaction rejection, and unchanged input bytes/call order
 Profile observation tests prove missing or mismatched terminal evidence cannot stamp
 items. These are local compatibility and fault-injection tests, not recorded OpenAI
 qualification; they do not call a live provider or create captured YAML.
+
+`types/upstream_input/tests.rs` and `executor/upstream/opaque_tests.rs` verify stateless
+projection, optional-field omission, unchanged canonical history, default vLLM behavior,
+and replay of recorded OpenAI JSON/SSE through the existing strict ingestion path.
+In-memory faults cover invalid reasoning, missing terminals, duplicate completions,
+out-of-order completion, index mismatch, and disconnects. A bounded delivery test checks
+backpressure and dropping inline input on cancellation or client disconnect. Transport
+tests use loopback fixtures (HTTPS disabled only in those fixtures) for redirect rejection,
+redacted HTTP errors, explicit headers, byte limits, read timeouts, and invalid/truncated
+UTF-8 framing; the production constructor rejects HTTP before contacting the fixture.
 
 The workspace suite (including OpenAPI and cassette tests), Clippy with warnings
 denied, and formatting checks passed with Rust 1.98. Opt-in ignored tests were not run:
