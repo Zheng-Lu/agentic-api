@@ -35,7 +35,7 @@ use crate::executor::inference::DONE_MARKER;
 use crate::executor::persist::persist_if_needed;
 use crate::executor::pipeline::{AgentPipeline, emit_deferred_stream_events};
 use crate::executor::prepare::prepare_request_tools;
-use crate::executor::rehydrate::{prepare_reasoning_for_vllm, validate_reasoning_for_vllm};
+use crate::executor::rehydrate::prepare_reasoning_for_vllm;
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
 #[cfg(test)]
@@ -571,9 +571,7 @@ impl ExecuteRequest {
         let max_stream_event_bytes = self.effective_max_stream_event_bytes();
         let ctx =
             super::rehydrate::rehydrate_with_continuation(self.payload, &self.exec_ctx, self.continuation).await?;
-        if !ctx.enriched_request.input.has_compaction_trigger() {
-            validate_reasoning_for_vllm(&ctx.enriched_request.input)?;
-        }
+        super::replay::validate_initial_input(&self.exec_ctx, &ctx.enriched_request, self.client_auth.as_deref())?;
         let (ctx, tool_search_state) =
             prepare_request_tools(ctx, &self.exec_ctx.conv_handler, &self.exec_ctx.resp_handler).await?;
         if ctx.original_request.stream {

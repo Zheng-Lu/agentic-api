@@ -190,7 +190,7 @@ async fn session_forks_promotion_and_external_commit_preserve_each_items_origin(
 }
 
 #[tokio::test]
-async fn disabled_opaque_policy_fails_before_history_lookup_or_inference() {
+async fn opaque_policy_without_profile_fails_before_history_lookup_or_inference() {
     let fixture = support::TestFixture::new(&[]).await;
     let context = Arc::new(
         fixture
@@ -211,7 +211,7 @@ async fn disabled_opaque_policy_fails_before_history_lookup_or_inference() {
         .await;
         assert!(matches!(
             result,
-            Err(ExecutorError::ReasoningReplay(ReasoningReplayError::OpaqueNotEnabled))
+            Err(ExecutorError::ReasoningReplay(ReasoningReplayError::MissingProfile))
         ));
     }
     assert!(fixture.request_bodies().await.is_empty());
@@ -224,12 +224,12 @@ async fn disabled_opaque_policy_fails_before_history_lookup_or_inference() {
     .unwrap();
     assert!(matches!(
         commit(ctx, response, &context).await,
-        Err(ExecutorError::ReasoningReplay(ReasoningReplayError::OpaqueNotEnabled))
+        Err(ExecutorError::ReasoningReplay(ReasoningReplayError::MissingProfile))
     ));
     let request = serde_json::from_value(serde_json::json!({"model":"test-model", "input":"compact me"})).unwrap();
     assert!(matches!(
         agentic_core::executor::compact_response(request, &context, None).await,
-        Err(ExecutorError::ReasoningReplay(ReasoningReplayError::OpaqueNotEnabled))
+        Err(ExecutorError::ReasoningReplay(ReasoningReplayError::MissingProfile))
     ));
     assert!(fixture.request_bodies().await.is_empty());
 }

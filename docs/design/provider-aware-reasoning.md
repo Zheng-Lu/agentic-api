@@ -113,7 +113,7 @@ Raw storage `Item` rows now include the nullable provenance column; low-level it
 insertion is crate-private so callers use typed `ResponseStore`/`ConversationStore`
 operations instead of supplying arbitrary serialized SQL item data.
 
-## Current slice: upstream-reported model evidence
+## Completed: upstream-reported model evidence
 
 `types/upstream_identity.rs` defines the bounded `UpstreamModelId`, safe typed
 `UpstreamModelError`, and internal `IngestedResponse` result. Model identifiers retain
@@ -155,12 +155,82 @@ its backend, establish compatible model families, or authorize opaque replay.
 Opaque replay remains disabled. The metadata projection follows the response objects
 in the [official streaming reference](https://developers.openai.com/api/reference/resources/responses/streaming-events).
 
+## Current slice: candidate profile and compatibility preflight
+
+The server now accepts one closed **candidate**, not an enabled capability:
+
+```toml
+[responses]
+reasoning_replay_policy = "opaque_responses"
+reasoning_replay_profile = "openai_gpt_5_4_2026_03_05_v1"
+```
+
+**This configuration intentionally fails startup with `OpaqueNotEnabled`.** There
+is no environment variable, feature flag, or request field that bypasses the gate.
+Omitting the profile under `opaque_responses` fails with `MissingProfile`; adding
+one under `vllm_plaintext` fails with `UnexpectedProfile`. Default/generated
+configuration remains vLLM-only. The profile's pinned model is listed in the
+[official GPT-5.4 model documentation](https://developers.openai.com/api/docs/models/gpt-5.4).
+
+`types/reasoning_profile.rs::OpaqueReasoningProfile` pins the exact endpoint
+`https://api.openai.com/v1/responses`, requested model and terminal reported model
+`gpt-5.4-2026-03-05`, and the Responses `reasoning.encrypted_content` contract. Its
+`v1` is a gateway compatibility revision, **not** a provider encryption-format
+version. No ciphertext is decoded, inspected for a format marker, or translated.
+Aliases, alternate/regional endpoints, explicit port spellings, trailing slashes,
+query strings, and URL credentials do not match. The strict spelling is intentional;
+profile validation does not perform URL normalization or model-family inference.
+
+`executor/replay.rs` owns the orchestration checks:
+
+- Before rehydration, validate policy/profile consistency, exact target, and absence
+  of local compaction input, triggers, or nonempty `context_management`, then enforce
+  availability. Rejection precedes storage lookup and tool discovery.
+- After rehydration and before each JSON/SSE inference entry point, the same
+  preflight checks the canonical history against the selected profile and effective
+  nonempty bearer credential, then enforces availability again. The opaque positive
+  path is exercised directly in unit tests only: normal execution still stops at
+  the earlier availability gate.
+- Per-item checks reject unknown/client-submitted provenance, another policy or
+  identity, missing/empty opaque state, and in-progress reasoning. Matching checks
+  borrow input without cloning, mutation, filtering, or reordering. Plaintext or a
+  summary cannot establish opaque compatibility.
+- The engine's post-ingestion observation is fallible for a candidate opaque profile:
+  a reasoning-bearing round requires exact, consistently reported terminal model
+  evidence before any of its reasoning items receives profile provenance.
+
+Profile identities hash a separate domain, the fixed compatibility-contract domain,
+and the existing routing/credential/model observation. Thus old observational
+fingerprints do not qualify, even if their endpoint, model, and credential match.
+Credential rotation deliberately invalidates compatibility. This fingerprint is
+still an equality check, not an authorization token or provider attestation. The
+target retains only a fixed-size digest and profile enum; neither credentials nor
+opaque strings enter errors or `Debug`. No extra collections, queues, or tasks are
+introduced. Existing provenance storage/budget size is unchanged; no migration or
+legacy rewrite is needed.
+
+Replay errors use the existing HTTP/SSE error machinery with the machine code
+`reasoning_replay_incompatible`. Invalid input/model/credential combinations are
+400 errors, invalid reported model evidence is a 502, and server configuration or
+unavailable execution is a 500. Messages are static and redact item IDs, URLs,
+credentials, model input, and opaque state. Input/model errors identify the relevant
+parameter when unambiguous.
+
+This slice does **not** implement opaque request projection, upstream `store: false`,
+strict profile ingestion, redirect suppression, or qualification. It does not claim
+that a configured HTTP client, proxy, default authorization header, or organization/
+project header is covered by the bearer-only fingerprint. Those transport constraints
+must be settled before enablement. vLLM projection, public output, persistence,
+session behavior, SSE framing/normalization/ingestion/delivery, and cancellation
+ownership remain unchanged. Rust struct literals for `ResponsesConfig` must include
+the optional profile or use `..ResponsesConfig::default()`.
+
 ## Remaining slices before enabling a provider profile
 
-1. Extend the server-owned policy with an approved provider/model/opaque-format
-   profile and redirect rules, using the reported-model evidence now available.
-   Enforce the provenance match before any upstream I/O; the observational fingerprint
-   added here is not sufficient to enable a profile.
+1. Qualify the candidate profile and enforce its transport constraints, including
+   redirect suppression and effective credential/header identity. The typed profile
+   and pre-inference provenance checks are implemented, but passing them alone does
+   not enable execution.
 2. Project compatible reasoning only in the upstream request copy. Keep the single
    `OutputItem::to_input_item` conversion and existing ingestion path. Select strict
    terminal validation for the opaque profile rather than introducing a second
@@ -208,6 +278,15 @@ ingestion, and malformed terminal metadata emits an error without storing a resp
 Pipeline tests cover malformed
 metadata, exact UTF-8 bounds, strict/lenient terminal handling, round isolation,
 retained-budget exhaustion, upstream disconnect, and client backpressure/drop.
+
+`reasoning_profile_test.rs`, server TOML tests, and `executor/replay/profile/tests.rs`
+cover closed profile selection, exact target rejection before history/tool/inference
+work for JSON/SSE requests, availability gating, identity separation from legacy
+observations, credential rotation, redacted error envelopes, manual/legacy rejection,
+missing opaque state, compaction rejection, and unchanged input bytes/call order.
+Profile observation tests prove missing or mismatched terminal evidence cannot stamp
+items. These are local compatibility and fault-injection tests, not recorded OpenAI
+qualification; they do not call a live provider or create captured YAML.
 
 The workspace suite (including OpenAPI and cassette tests), Clippy with warnings
 denied, and formatting checks passed with Rust 1.98. Opt-in ignored tests were not run:

@@ -156,8 +156,7 @@ impl ExecutionContext {
     /// migration fails.
     pub async fn from_config(cfg: &Config) -> Result<Self, Error> {
         cfg.responses
-            .reasoning_replay_policy
-            .validate()
+            .validate_reasoning_replay()
             .map_err(|error| Error::Config(error.to_string()))?;
         let default_db_url = cfg.db_url.is_none().then(default_database_url).transpose()?;
         let db_url = cfg
@@ -292,6 +291,9 @@ mod tests {
             tools: crate::config::ToolRuntimeConfig::default(),
             responses: ResponsesConfig {
                 reasoning_replay_policy: crate::types::reasoning_replay::ReasoningReplayPolicy::OpaqueResponses,
+                reasoning_replay_profile: Some(
+                    crate::types::reasoning_profile::OpaqueReasoningProfile::OpenAiGpt54_20260305V1,
+                ),
                 ..ResponsesConfig::default()
             },
         };

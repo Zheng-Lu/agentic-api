@@ -164,7 +164,7 @@ pub(crate) async fn rehydrate_with_continuation(
     exec_ctx: &ExecutionContext,
     continuation: Option<ResponseContinuation>,
 ) -> ExecutorResult<RequestContext> {
-    exec_ctx.responses_config.reasoning_replay_policy.validate()?;
+    super::replay::validate_rehydration_request(exec_ctx, &request)?;
     super::replay::mark_client_input(&mut request.input);
     // Fail before storage work for new files; check again once history is resolved.
     validate_message_content(&request.input)?;

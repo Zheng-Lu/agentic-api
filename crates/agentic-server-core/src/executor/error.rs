@@ -3,6 +3,7 @@ use thiserror::Error;
 
 use crate::StorageError;
 use crate::tool::ToolError;
+use crate::types::reasoning_replay::ReasoningReplayError;
 use crate::utils::common::serialize_to_vec_or_default;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +157,20 @@ impl ExecutorError {
     #[must_use]
     pub fn http_status(&self) -> StatusCode {
         match self.client_visible_error() {
+            Self::ReasoningReplay(error) => match error {
+                ReasoningReplayError::ModelMismatch
+                | ReasoningReplayError::MissingCredential
+                | ReasoningReplayError::UnsupportedCompaction
+                | ReasoningReplayError::UnknownProvenance
+                | ReasoningReplayError::IncompatibleProvenance
+                | ReasoningReplayError::MissingOpaqueState
+                | ReasoningReplayError::UnfinishedReasoning => StatusCode::BAD_REQUEST,
+                ReasoningReplayError::ReportedModelMismatch => StatusCode::BAD_GATEWAY,
+                ReasoningReplayError::OpaqueNotEnabled
+                | ReasoningReplayError::UnexpectedProfile
+                | ReasoningReplayError::MissingProfile
+                | ReasoningReplayError::EndpointMismatch => StatusCode::INTERNAL_SERVER_ERROR,
+            },
             Self::Storage(e) if e.is_not_found() => StatusCode::NOT_FOUND,
             Self::LLMRequest { status, .. } | Self::LLMTransport { status, .. } => *status,
             Self::ConversationLocked { .. }
@@ -185,6 +200,11 @@ impl ExecutorError {
     #[must_use]
     pub fn error_type(&self) -> &'static str {
         match self.client_visible_error() {
+            Self::ReasoningReplay(_) => match self.http_status() {
+                StatusCode::BAD_REQUEST => "invalid_request_error",
+                StatusCode::BAD_GATEWAY => "upstream_error",
+                _ => "server_error",
+            },
             Self::ConversationLocked { .. }
             | Self::Tool(ToolError::Config(_) | ToolError::MissingOutput { .. })
             | Self::InvalidRequest(_)
@@ -215,6 +235,7 @@ impl ExecutorError {
     #[must_use]
     pub fn error_code(&self) -> &'static str {
         match self.client_visible_error() {
+            Self::ReasoningReplay(_) => "reasoning_replay_incompatible",
             Self::ConversationLocked { .. } => "conversation_locked",
             Self::PreviousResponseNotFound { .. } => "previous_response_not_found",
             Self::Conflict(_) => "response_already_stored",
@@ -228,9 +249,16 @@ impl ExecutorError {
     #[must_use]
     pub fn error_param(&self) -> Option<&'static str> {
         match self.client_visible_error() {
+            Self::ReasoningReplay(ReasoningReplayError::ModelMismatch) => Some("model"),
+            Self::ReasoningReplay(
+                ReasoningReplayError::UnknownProvenance
+                | ReasoningReplayError::IncompatibleProvenance
+                | ReasoningReplayError::MissingOpaqueState
+                | ReasoningReplayError::UnfinishedReasoning,
+            )
+            | Self::Tool(ToolError::MissingOutput { .. }) => Some("input"),
             Self::ConversationLocked { .. } => Some("conversation"),
             Self::PreviousResponseNotFound { .. } => Some("previous_response_id"),
-            Self::Tool(ToolError::MissingOutput { .. }) => Some("input"),
             _ => None,
         }
     }

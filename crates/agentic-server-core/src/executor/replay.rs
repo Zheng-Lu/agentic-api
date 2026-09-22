@@ -2,13 +2,77 @@
 //!
 //! No parsing, output-item assembly, delivery, or opaque replay happens here.
 
+mod profile;
+
 use sha2::{Digest, Sha256};
 
+use super::error::ExecutorResult;
 use super::request::{ExecutionContext, RequestContext};
-use crate::types::ResponsePayload;
 use crate::types::io::{InputItem, OutputItem, ResponsesInput};
-use crate::types::reasoning_replay::{ReasoningProvenance, ReasoningReplayIdentity, ReasoningReplayPolicy};
+use crate::types::reasoning_replay::{
+    ReasoningProvenance, ReasoningReplayError, ReasoningReplayIdentity, ReasoningReplayPolicy,
+};
 use crate::types::upstream_identity::UpstreamModelId;
+use crate::types::{RequestPayload, ResponsePayload};
+use profile::OpaqueReplayTarget;
+
+/// Reject profile/routing mistakes before loading history. No model-name heuristics.
+pub(super) fn validate_rehydration_request(
+    exec_ctx: &ExecutionContext,
+    request: &RequestPayload,
+) -> ExecutorResult<()> {
+    validate_profile_request(exec_ctx, request)?;
+    exec_ctx.responses_config.validate_reasoning_replay()?;
+    Ok(())
+}
+
+fn validate_profile_request(exec_ctx: &ExecutionContext, request: &RequestPayload) -> ExecutorResult<()> {
+    let config = &exec_ctx.responses_config;
+    config
+        .reasoning_replay_policy
+        .validate_profile(config.reasoning_replay_profile)?;
+    if let Some(profile) = config.reasoning_replay_profile {
+        profile.validate_target(&exec_ctx.responses_url(), &request.model)?;
+        if request
+            .context_management
+            .as_ref()
+            .is_some_and(|entries| !entries.is_empty())
+            || request.input.contains_compaction()
+            || request.input.has_compaction_trigger()
+        {
+            return Err(ReasoningReplayError::UnsupportedCompaction.into());
+        }
+    }
+    Ok(())
+}
+
+/// Recheck resolved canonical history before tools and before every inference round.
+/// The final availability gate is intentional: compatible is not yet qualified.
+pub(super) fn preflight_inference(
+    exec_ctx: &ExecutionContext,
+    request: &RequestPayload,
+    auth: Option<&str>,
+) -> ExecutorResult<()> {
+    validate_profile_request(exec_ctx, request)?;
+    if let Some(profile) = exec_ctx.responses_config.reasoning_replay_profile {
+        OpaqueReplayTarget::new(profile, &exec_ctx.responses_url(), &request.model, auth)?
+            .validate_input(&request.input)?;
+    }
+    exec_ctx.responses_config.validate_reasoning_replay()?;
+    Ok(())
+}
+
+pub(super) fn validate_initial_input(
+    exec_ctx: &ExecutionContext,
+    request: &RequestPayload,
+    auth: Option<&str>,
+) -> ExecutorResult<()> {
+    preflight_inference(exec_ctx, request, auth)?;
+    if !request.input.has_compaction_trigger() {
+        super::rehydrate::validate_reasoning_for_vllm(&request.input)?;
+    }
+    Ok(())
+}
 
 /// Bind exact routing inputs and both model identities without retaining secrets.
 /// Nested, fixed-width hashes make field boundaries unambiguous without allocations.
@@ -42,23 +106,34 @@ pub(super) fn record_round_provenance(
     exec_ctx: &ExecutionContext,
     request: &RequestContext,
     auth: Option<&str>,
-) {
+) -> ExecutorResult<()> {
     if !payload
         .output
         .iter()
         .any(|item| matches!(item, OutputItem::Reasoning(_)))
     {
-        return;
+        return Ok(());
     }
     let policy = exec_ctx.responses_config.reasoning_replay_policy;
-    let identity = upstream_identity(
-        policy,
-        &exec_ctx.responses_url(),
-        auth,
-        &request.enriched_request.model,
-        reported_model.map(UpstreamModelId::as_str),
-    );
+    policy.validate_profile(exec_ctx.responses_config.reasoning_replay_profile)?;
+    let identity = match exec_ctx.responses_config.reasoning_replay_profile {
+        Some(profile) => OpaqueReplayTarget::new(
+            profile,
+            &exec_ctx.responses_url(),
+            &request.enriched_request.model,
+            auth,
+        )?
+        .observed_identity(reported_model)?,
+        None => upstream_identity(
+            policy,
+            &exec_ctx.responses_url(),
+            auth,
+            &request.enriched_request.model,
+            reported_model.map(UpstreamModelId::as_str),
+        ),
+    };
     record_upstream_provenance(&mut payload.output, policy, identity);
+    Ok(())
 }
 
 /// Apply the round's server-owned observation after successful ingestion.

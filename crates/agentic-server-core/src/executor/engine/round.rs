@@ -46,7 +46,7 @@ impl EngineOrchestration<'_> {
             self.exec_ctx,
             &self.agent.request,
             auth,
-        );
+        )?;
         Ok((payload, deferred_events))
     }
 }

@@ -8,6 +8,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::reasoning_profile::OpaqueReasoningProfile;
+
 /// Maximum serialized provenance per stored reasoning item, including JSON overhead.
 pub const MAX_REASONING_PROVENANCE_BYTES: usize = 512;
 
@@ -23,6 +25,18 @@ pub enum ReasoningReplayPolicy {
 }
 
 impl ReasoningReplayPolicy {
+    /// Check policy/profile consistency without authorizing execution.
+    ///
+    /// # Errors
+    /// Opaque replay requires an explicit profile; vLLM must not have one.
+    pub fn validate_profile(self, profile: Option<OpaqueReasoningProfile>) -> Result<(), ReasoningReplayError> {
+        match (self, profile) {
+            (Self::VllmPlaintext, None) | (Self::OpaqueResponses, Some(_)) => Ok(()),
+            (Self::VllmPlaintext, Some(_)) => Err(ReasoningReplayError::UnexpectedProfile),
+            (Self::OpaqueResponses, None) => Err(ReasoningReplayError::MissingProfile),
+        }
+    }
+
     /// Validate availability before storage, tool discovery, or upstream inference.
     ///
     /// # Errors
@@ -41,6 +55,28 @@ impl ReasoningReplayPolicy {
 pub enum ReasoningReplayError {
     #[error("opaque reasoning replay is not enabled; provider qualification is incomplete")]
     OpaqueNotEnabled,
+    #[error("vllm_plaintext must not configure an opaque reasoning replay profile")]
+    UnexpectedProfile,
+    #[error("opaque_responses requires an explicit reasoning replay profile")]
+    MissingProfile,
+    #[error("configured Responses endpoint does not match the reasoning replay profile")]
+    EndpointMismatch,
+    #[error("model must match the exact snapshot pinned by the reasoning replay profile; aliases are unsupported")]
+    ModelMismatch,
+    #[error("opaque reasoning replay requires a nonempty effective upstream bearer credential")]
+    MissingCredential,
+    #[error("local compaction is unsupported by the opaque reasoning replay profile")]
+    UnsupportedCompaction,
+    #[error("reasoning replay requires gateway-observed provenance; manual and legacy opaque state is unsupported")]
+    UnknownProvenance,
+    #[error("reasoning provenance is incompatible with the selected profile, endpoint, model, or credential")]
+    IncompatibleProvenance,
+    #[error("reasoning item has no nonempty opaque state supported by the selected replay profile")]
+    MissingOpaqueState,
+    #[error("an in-progress reasoning item cannot be replayed by the opaque profile")]
+    UnfinishedReasoning,
+    #[error("upstream must consistently report the exact model snapshot pinned by the reasoning replay profile")]
+    ReportedModelMismatch,
 }
 
 /// Fixed-size fingerprint of the effective upstream routing and model identity.
@@ -56,6 +92,10 @@ pub struct ReasoningReplayIdentity([u8; 32]);
 impl ReasoningReplayIdentity {
     pub(crate) fn from_digest(digest: [u8; 32]) -> Self {
         Self(digest)
+    }
+
+    pub(crate) fn digest(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 

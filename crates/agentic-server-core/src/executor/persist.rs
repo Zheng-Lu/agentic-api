@@ -151,7 +151,7 @@ pub async fn commit(
     mut payload: ResponsePayload,
     exec_ctx: &ExecutionContext,
 ) -> ExecutorResult<ResponsePayload> {
-    exec_ctx.responses_config.reasoning_replay_policy.validate()?;
+    exec_ctx.responses_config.validate_reasoning_replay()?;
     super::replay::mark_client_items(&mut ctx.new_input_items);
     super::replay::mark_external_output(&mut payload.output);
     if ctx.response_id.is_empty() {

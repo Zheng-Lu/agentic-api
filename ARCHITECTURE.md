@@ -586,6 +586,14 @@ lenient EOF completion remain unknown. The engine binds the observation into rea
 provenance; it never treats the request-derived public `ResponsePayload.model` as
 provider evidence. The observation does not enable opaque reasoning replay.
 
+`executor/replay.rs` owns server-selected replay preflight, not ingestion or transport.
+The closed candidate profile in `types/reasoning_profile.rs` pins endpoint, model, and
+opaque wire contract. Preflight checks canonical provenance before inference can
+project it; the engine binds successful round observations to that profile. Candidate
+configuration still fails the qualification gate, so only the default vLLM policy
+executes. See [provider-aware reasoning](docs/design/provider-aware-reasoning.md) for
+the remaining projection, transport, and qualification work.
+
 The live runner polls one framed line, performs synchronous ingestion and translation,
 then awaits delivery before polling the next line. This propagates bounded sender
 backpressure to the upstream body. Ingestion remains inline; moving it to a worker is

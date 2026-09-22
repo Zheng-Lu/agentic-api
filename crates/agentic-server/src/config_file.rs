@@ -108,6 +108,8 @@ pub(crate) struct ResponsesFileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_replay_policy: Option<agentic_core::types::reasoning_replay::ReasoningReplayPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_replay_profile: Option<agentic_core::types::reasoning_profile::OpaqueReasoningProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_retained_bytes: Option<NonZeroUsize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_upstream_json_bytes: Option<NonZeroUsize>,
@@ -120,6 +122,7 @@ pub(crate) struct ResponsesFileConfig {
 impl ResponsesFileConfig {
     fn is_empty(&self) -> bool {
         self.reasoning_replay_policy.is_none()
+            && self.reasoning_replay_profile.is_none()
             && self.max_retained_bytes.is_none()
             && self.max_upstream_json_bytes.is_none()
             && self.max_upstream_sse_line_bytes.is_none()
@@ -756,6 +759,34 @@ mod tests {
             Err(ReasoningReplayError::OpaqueNotEnabled)
         );
         assert!(toml::from_str::<FileConfig>("[responses]\nreasoning_replay_policy = 'auto'").is_err());
+    }
+
+    #[test]
+    fn reasoning_replay_profile_is_closed_and_preserved_in_generated_config() {
+        use agentic_core::types::reasoning_profile::OpaqueReasoningProfile;
+
+        let profile = "openai_gpt_5_4_2026_03_05_v1";
+        let config: FileConfig =
+            toml::from_str(&format!("[responses]\nreasoning_replay_profile = '{profile}'")).unwrap();
+        assert_eq!(
+            config.responses.reasoning_replay_profile,
+            Some(OpaqueReasoningProfile::OpenAiGpt54_20260305V1)
+        );
+        assert!(!config.responses.is_empty());
+        assert!(toml::to_string(&config).unwrap().contains(profile));
+        assert!(crate::responses_config::resolve_responses_config(&config.responses).is_err());
+        let config: FileConfig = toml::from_str(&format!(
+            "[responses]\nreasoning_replay_policy = 'opaque_responses'\nreasoning_replay_profile = '{profile}'"
+        ))
+        .unwrap();
+        let error = crate::responses_config::resolve_responses_config(&config.responses).unwrap_err();
+        assert!(error.to_string().contains("not enabled"));
+        assert!(toml::from_str::<FileConfig>("[responses]\nreasoning_replay_profile = 'auto'").is_err());
+        assert!(
+            crate::responses_config::generated_responses_file_config()
+                .reasoning_replay_profile
+                .is_none()
+        );
     }
 
     #[test]

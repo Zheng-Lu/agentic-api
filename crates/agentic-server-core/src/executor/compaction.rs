@@ -340,7 +340,7 @@ pub(crate) async fn compact_items(
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
 ) -> ExecutorResult<(Vec<InputItem>, ResponseUsage)> {
-    exec_ctx.responses_config.reasoning_replay_policy.validate()?;
+    exec_ctx.responses_config.validate_reasoning_replay()?;
     let original_items = Vec::from(input);
     if !original_items.iter().any(item_has_meaningful_context) {
         return Err(ExecutorError::InvalidRequest(

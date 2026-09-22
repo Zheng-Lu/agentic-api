@@ -92,6 +92,7 @@ pub(super) async fn fetch_blocking_payload(
     registry: &ToolRegistry,
     response_budget: Option<&ExecutorResponseBudget>,
 ) -> ExecutorResult<crate::types::upstream_identity::IngestedResponse> {
+    super::replay::preflight_inference(exec_ctx, &agent.request.enriched_request, auth)?;
     agent.ensure_request_prepared()?;
     let upstream_json = upstream_request(&agent.request, false)?;
     let body = fetch_response_json_limited(
@@ -160,6 +161,7 @@ pub(super) async fn fetch_stream_payload(
     output_offset: usize,
     response_budget: &ExecutorResponseBudget,
 ) -> ExecutorResult<StreamPayload> {
+    super::replay::preflight_inference(exec_ctx, &agent.request.enriched_request, auth)?;
     agent.ensure_request_prepared()?;
     let upstream_json = upstream_request(&agent.request, true)?;
     let lines = call_inference_limited(
