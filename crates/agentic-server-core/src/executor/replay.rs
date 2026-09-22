@@ -16,14 +16,28 @@ use crate::types::upstream_identity::UpstreamModelId;
 use crate::types::{RequestPayload, ResponsePayload};
 use profile::OpaqueReplayTarget;
 
+fn validate_availability(exec_ctx: &ExecutionContext) -> ExecutorResult<()> {
+    // Only the core unit-test binary can install this loopback transport. Profile,
+    // routing, credential and provenance checks still run at their normal boundaries.
+    #[cfg(test)]
+    if exec_ctx
+        .opaque_replay_fixture
+        .as_ref()
+        .is_some_and(super::inference::transport::ResponsesTransport::is_replay_fixture)
+    {
+        return Ok(());
+    }
+    exec_ctx.responses_config.validate_reasoning_replay()?;
+    Ok(())
+}
+
 /// Reject profile/routing mistakes before loading history. No model-name heuristics.
 pub(super) fn validate_rehydration_request(
     exec_ctx: &ExecutionContext,
     request: &RequestPayload,
 ) -> ExecutorResult<()> {
     validate_profile_request(exec_ctx, request)?;
-    exec_ctx.responses_config.validate_reasoning_replay()?;
-    Ok(())
+    validate_availability(exec_ctx)
 }
 
 fn validate_profile_request(exec_ctx: &ExecutionContext, request: &RequestPayload) -> ExecutorResult<()> {
@@ -58,8 +72,7 @@ pub(super) fn preflight_inference(
         OpaqueReplayTarget::new(profile, &exec_ctx.responses_url(), &request.model, auth)?
             .validate_input(&request.input)?;
     }
-    exec_ctx.responses_config.validate_reasoning_replay()?;
-    Ok(())
+    validate_availability(exec_ctx)
 }
 
 pub(super) fn validate_initial_input(

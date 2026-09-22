@@ -151,7 +151,13 @@ impl ConversationHandler {
 
         let mut new_items = Vec::with_capacity(ctx.new_input_items.len() + output_items.len());
         new_items.extend(ctx.new_input_items.into_iter().map(InOutItem::Input));
-        new_items.extend(output_items.into_iter().map(InOutItem::Output));
+        new_items.extend(
+            output_items
+                .into_iter()
+                .enumerate()
+                .filter(|(index, item)| ctx.recorded_output_prefix.retains_output(*index, item))
+                .map(|(_, item)| InOutItem::Output(item)),
+        );
 
         self.store
             .persist_if_version(
@@ -212,6 +218,7 @@ mod tests {
             response_id: "resp_test".into(),
             conversation_id: conversation_id.map(str::to_string),
             conversation_version: None,
+            recorded_output_prefix: crate::types::turn_history::RecordedOutputPrefix::default(),
             continuation: None,
         }
     }

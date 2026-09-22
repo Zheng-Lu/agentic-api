@@ -190,6 +190,7 @@ pub(crate) async fn rehydrate_with_continuation(
         response_id,
         conversation_id: None,
         conversation_version: None,
+        recorded_output_prefix: crate::types::turn_history::RecordedOutputPrefix::default(),
         continuation,
     };
 

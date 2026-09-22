@@ -5,6 +5,7 @@ pub mod reasoning_profile;
 pub mod reasoning_replay;
 pub mod request_response;
 pub mod tools;
+pub mod turn_history;
 pub mod upstream_identity;
 pub mod upstream_input;
 pub mod upstream_request;

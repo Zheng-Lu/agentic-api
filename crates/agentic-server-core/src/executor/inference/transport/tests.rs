@@ -41,6 +41,7 @@ fn local_transport() -> ResponsesTransport {
     ResponsesTransport {
         client: Arc::new(opaque_client_builder().https_only(false).build().unwrap()),
         response_policy: ResponsePolicy::Opaque,
+        fixture_address: None,
     }
 }
 
@@ -205,6 +206,7 @@ async fn read_timeout_bounds_headers_and_body_without_a_caller_chunk_timeout() {
                 .unwrap(),
         ),
         response_policy: ResponsePolicy::Opaque,
+        fixture_address: None,
     };
     for path in ["headers", "body"] {
         let result = tokio::time::timeout(

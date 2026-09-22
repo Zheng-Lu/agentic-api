@@ -26,6 +26,9 @@ mod pipeline;
 mod response_budget;
 mod upstream;
 
+#[cfg(test)]
+mod qualification;
+
 pub use compaction::compact_response;
 pub use engine::{BoxStream, ExecuteRequest, create_conversation, execute};
 pub use error::{ExecutorError, ExecutorResult, ResourceLimit};

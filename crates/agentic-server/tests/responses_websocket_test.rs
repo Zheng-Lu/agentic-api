@@ -1075,6 +1075,7 @@ async fn test_websocket_generate_false_prewarm_redacts_mcp_runtime_credentials()
         response_id: "resp_lookup".to_owned(),
         conversation_id: None,
         conversation_version: None,
+        recorded_output_prefix: agentic_core::types::turn_history::RecordedOutputPrefix::default(),
         continuation: None,
     };
     let stored = fixture

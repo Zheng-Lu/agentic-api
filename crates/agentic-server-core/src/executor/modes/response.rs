@@ -92,6 +92,7 @@ impl ResponseHandler {
         metadata: ResponseMetadata,
     ) -> ExecutorResult<()> {
         let continuation = ctx.continuation.take();
+        let recorded_output_prefix = ctx.recorded_output_prefix;
         let write_durable = continuation.is_none() || ctx.original_request.store;
         let mut new_items = Vec::with_capacity(ctx.new_input_items.len() + output_items.len());
         new_items.extend(ctx.new_input_items.into_iter().map(InOutItem::Input));
@@ -99,11 +100,7 @@ impl ResponseHandler {
             output_items
                 .into_iter()
                 .enumerate()
-                .filter(|(index, item)| {
-                    continuation
-                        .as_ref()
-                        .is_none_or(|lease| lease.retains_output(*index, item))
-                })
+                .filter(|(index, item)| recorded_output_prefix.retains_output(*index, item))
                 .map(|(_, item)| InOutItem::Output(item)),
         );
 
@@ -206,6 +203,7 @@ mod tests {
             response_id: "resp_test".into(),
             conversation_id: None,
             conversation_version: None,
+            recorded_output_prefix: crate::types::turn_history::RecordedOutputPrefix::default(),
             continuation: None,
         }
     }

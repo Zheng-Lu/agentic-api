@@ -892,6 +892,7 @@ async fn tool_search_store_false_manual_replay_completes_without_reusable_respon
         response_id: "resp_lookup".to_owned(),
         conversation_id: None,
         conversation_version: None,
+        recorded_output_prefix: agentic_core::types::turn_history::RecordedOutputPrefix::default(),
         continuation: None,
     };
     let error = fixture
@@ -957,6 +958,7 @@ async fn test_previous_response_id_persists_inherited_tools_and_choice() {
         response_id: "resp_lookup".into(),
         conversation_id: None,
         conversation_version: None,
+        recorded_output_prefix: agentic_core::types::turn_history::RecordedOutputPrefix::default(),
         continuation: None,
     };
 
@@ -1397,6 +1399,7 @@ fn lookup_context(previous_response_id: Option<String>, conversation_id: Option<
         response_id: "resp_lookup".to_owned(),
         conversation_id: None,
         conversation_version: None,
+        recorded_output_prefix: agentic_core::types::turn_history::RecordedOutputPrefix::default(),
         continuation: None,
     }
 }

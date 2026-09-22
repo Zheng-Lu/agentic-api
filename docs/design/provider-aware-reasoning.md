@@ -188,9 +188,9 @@ profile validation does not perform URL normalization or model-family inference.
   availability. Rejection precedes storage lookup and tool discovery.
 - After rehydration and before each JSON/SSE inference entry point, the same
   preflight checks the canonical history against the selected profile and effective
-  nonempty bearer credential, then enforces availability again. The opaque positive
-  path is exercised directly in unit tests only: normal execution still stops at
-  the earlier availability gate.
+  nonempty bearer credential, then enforces availability again. Direct unit tests and
+  the core-only loopback execution fixture exercise the opaque positive path; normal
+  library/server execution still stops at the earlier availability gate.
 - Per-item checks reject unknown/client-submitted provenance, another policy or
   identity, missing/empty opaque state, and in-progress reasoning. Matching checks
   borrow input without cloning, mutation, filtering, or reordering. Plaintext or a
@@ -298,7 +298,7 @@ termination of remote model work. Shared transport/connection drivers retain the
 own lifetimes. No worker-placement performance benefit is claimed; #245 measurement
 work and the broader #244 delivery/observability scope remain separate.
 
-## Current slice: pinned reference recordings and assistant phase
+## Pinned reference recordings and assistant phase
 
 The recorder now supports bounded stateless item replay and independent branches for
 OpenAI, vLLM and gateway targets, and honors `store: false` over WebSocket. The pinned
@@ -341,10 +341,54 @@ These are provider-reference recordings, not a live gateway acceptance matrix. W
 recording uses independent connections and full item replay; it does not qualify the
 gateway's transient connection-local checkpoint routing. The candidate remains disabled.
 
+## Current slice: offline executor acceptance and canonical turn ordering
+
+`executor/qualification/` replays the pinned JSON/SSE references through full
+`ExecuteRequest` execution, rather than only the ingestion adapter. A crate-private
+`cfg(test)` transport routes the exact pinned endpoint to a loopback socket using a
+synthetic credential. Only this per-context fixture skips availability; profile,
+endpoint/model, provenance and credential checks still run. It is absent from normal
+library/server builds, has no environment/config/feature-flag switch, and leaves
+startup, external commit and compaction gates closed. Replay responses and request
+capture have explicit count/byte limits; fixture tasks are aborted and joined.
+
+The tests exposed an ordering defect in the reserved policy's durable tool history:
+gateway function calls and outputs were stored before the preceding reasoning item.
+In-turn replay was correct, but later durable continuation reordered the items.
+`engine/history.rs` now uses the existing canonical round-recording path for opaque
+durable responses and explicit conversations as well as transient sessions. It retains
+reasoning/messages/calls through `OutputItem::to_input_item`, then the existing tool
+output append path records the outputs. There is no reconstruction from public MCP
+projections and no second ingestion or delivery path.
+
+The fixed-size `types/turn_history.rs::RecordedOutputPrefix` moves output-deduplication
+bookkeeping from the session lease to `RequestContext`, where both storage modes can
+use it. The engine alone advances the prefix; persistence retains only public output
+not already represented in canonical history, plus MCP discovery metadata. Provenance,
+opaque bytes and assistant phase remain on the typed items. Public response output is
+unchanged. Existing default vLLM durable behavior is unchanged, as is its canonical
+response-session path. No database migration or rewrite of existing history occurs.
+Rust `RequestContext` struct literals must initialize `recorded_output_prefix` with
+`RecordedOutputPrefix::default()`; split contexts do so and do not serialize the marker.
+
+Coverage includes durable continuation and branching, transient forks and promotion,
+origin/credential rejection before network access, unpolled/active stream drop, failed
+fork isolation, missing/wrong terminal model evidence, and truncated responses. A
+deterministic loopback MCP tool binds the recorded function to `lookup_code` without
+editing the provider response bytes. It exercises the scheduler, two inference rounds,
+one public terminal, canonical storage ordering and validation of restored provenance
+for response, conversation and transient state. Failure in the second round stores no
+response, but does not undo an already completed tool side effect.
+
+The MCP declaration/normalization is a local test setup, not live provider qualification.
+These are offline executor acceptance tests, not actual HTTP/WebSocket handler or live
+gateway acceptance. The profile remains unavailable, and no API key is required here.
+
 ## Remaining slices before enabling a provider profile
 
-1. Complete gateway-level acceptance for durable and transient continuations, gateway-executed
-   tool loops and connection-local WebSocket routing. The reference matrix now covers the
+1. Complete live gateway acceptance and transport-level HTTP/WebSocket coverage, including
+   connection-local routing. Offline executor acceptance now covers durable/transient
+   continuations and gateway-executed tool loops, while the reference matrix covers the
    pinned provider's initial, multi-turn, function-output and branching contract, but does
    not qualify every public request parameter, tool normalization or provider error mode.
    Declare and enforce the supported profile surface before enabling it. Existing gpt-5.6

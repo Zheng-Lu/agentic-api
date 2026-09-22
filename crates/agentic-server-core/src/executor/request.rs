@@ -39,6 +39,8 @@ pub struct RequestContext {
     /// Conversation version captured with rehydrated history.
     /// `None` for non-conversation and `previous_response_id` execution.
     pub conversation_version: Option<ConversationVersion>,
+    /// Engine-owned deduplication of canonical round history; split callers use `Default`.
+    pub recorded_output_prefix: crate::types::turn_history::RecordedOutputPrefix,
     /// Optional transient-session lease and canonical parent snapshot. Never serialized.
     pub continuation: Option<super::session::ResponseContinuation>,
 }
@@ -81,11 +83,22 @@ pub struct ExecutionContext {
     pub responses_config: ResponsesConfig,
     storage_pool: Option<Arc<crate::storage::DbPool>>,
     opaque_transport: Arc<tokio::sync::OnceCell<ResponsesTransport>>,
+    /// Unit-test-only loopback routing; absent from library and server builds.
+    #[cfg(test)]
+    pub(super) opaque_replay_fixture: Option<ResponsesTransport>,
 }
 
 impl ExecutionContext {
     /// Called only after profile/provenance/availability preflight succeeds.
     pub(super) async fn responses_transport(&self) -> super::error::ExecutorResult<ResponsesTransport> {
+        #[cfg(test)]
+        if let Some(transport) = self
+            .opaque_replay_fixture
+            .as_ref()
+            .filter(|transport| transport.is_replay_fixture())
+        {
+            return Ok(transport.clone());
+        }
         match self.responses_config.reasoning_replay_policy {
             crate::types::reasoning_replay::ReasoningReplayPolicy::VllmPlaintext => {
                 Ok(ResponsesTransport::shared(Arc::clone(&self.client)))
@@ -130,6 +143,8 @@ impl ExecutionContext {
             responses_config: ResponsesConfig::default(),
             storage_pool: None,
             opaque_transport: Arc::new(tokio::sync::OnceCell::new()),
+            #[cfg(test)]
+            opaque_replay_fixture: None,
         }
     }
 
@@ -212,6 +227,8 @@ impl ExecutionContext {
             responses_config: cfg.responses,
             storage_pool: Some(pool),
             opaque_transport: Arc::new(tokio::sync::OnceCell::new()),
+            #[cfg(test)]
+            opaque_replay_fixture: None,
         })
     }
 }

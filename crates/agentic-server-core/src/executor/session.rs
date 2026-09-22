@@ -17,8 +17,8 @@ use tokio::sync::Notify;
 
 use super::{ExecutorError, ExecutorResult};
 use crate::storage::{InOutItem, ResponseMetadata};
+use crate::types::io::InputItem;
 use crate::types::io::input::latest_compaction_window;
-use crate::types::io::{InputItem, OutputItem};
 #[cfg(test)]
 use crate::utils::common::serialized_size_up_to;
 
@@ -225,7 +225,6 @@ impl ResponseSession {
             parent,
             budget: self.budget.clone(),
             history_replaced: false,
-            recorded_output_count: 0,
             finished: false,
         };
         drop(state);
@@ -276,7 +275,6 @@ pub struct ResponseContinuation {
     pub(crate) parent: Option<Arc<RetainedCheckpoint>>,
     budget: Option<Arc<CheckpointBudget>>,
     history_replaced: bool,
-    recorded_output_count: usize,
     finished: bool,
 }
 
@@ -379,16 +377,6 @@ impl ResponseContinuation {
     /// The executor has replaced this turn's input with a canonical compacted window.
     pub(crate) fn mark_history_replaced(&mut self) {
         self.history_replaced = true;
-    }
-
-    /// The loop has recorded these outputs in canonical inference-round order.
-    /// Public output remains complete, but persistence must not append it again.
-    pub(crate) fn mark_outputs_recorded(&mut self, output_count: usize) {
-        self.recorded_output_count = output_count;
-    }
-
-    pub(crate) fn retains_output(&self, index: usize, item: &OutputItem) -> bool {
-        index >= self.recorded_output_count || matches!(item, OutputItem::McpListTools(_))
     }
 
     /// Retain orchestration records across compaction without restoring the old
@@ -839,28 +827,5 @@ mod tests {
                 .unwrap()
                 .contains("private prompt")
         );
-    }
-
-    #[test]
-    fn recorded_rounds_are_not_duplicated_and_mcp_discovery_is_retained() {
-        let session = session(10, 10_000);
-        let mut lease = session.begin(None).unwrap();
-        let message: OutputItem = serde_json::from_value(json!({
-            "type":"message", "id":"msg_1", "role":"assistant", "status":"completed", "content":[]
-        }))
-        .unwrap();
-        let discovery: OutputItem = serde_json::from_value(json!({
-            "type":"mcp_list_tools", "id":"mcp_1", "server_label":"counter", "tools":[]
-        }))
-        .unwrap();
-        assert!(lease.retains_output(0, &message));
-        lease.mark_outputs_recorded(2);
-        assert!(!lease.retains_output(1, &message));
-        assert!(lease.retains_output(2, &message));
-        lease.mark_history_replaced();
-        lease.mark_outputs_recorded(4);
-        assert!(!lease.retains_output(2, &message));
-        assert!(lease.retains_output(4, &message));
-        assert!(lease.retains_output(0, &discovery));
     }
 }

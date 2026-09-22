@@ -254,6 +254,14 @@ preserving MCP discovery records needed for orchestration. Durable restoration
 and replayed compaction input select the effective compacted window before validating current calls;
 obsolete stored rows are not deleted or charged to that retained window.
 
+The candidate opaque policy uses that canonical round ordering for durable responses
+and explicit conversations too. `engine/history.rs` records output through the single
+`OutputItem::to_input_item` conversion before tool outputs are appended. The fixed-size,
+non-wire `RequestContext.recorded_output_prefix` tracks which public outputs are already
+represented; both persistence handlers consult it to avoid duplication, while retaining
+MCP discovery records. This bookkeeping belongs to the turn, not the session lease.
+Default vLLM non-session persistence remains unchanged.
+
 For response-scoped session execution, `store: false` has no durable writes or
 database fallback. A stored child of a transient parent persists the complete
 canonical window without creating a row or dangling database reference for that
@@ -605,6 +613,14 @@ phase on non-assistant messages; legacy messages and newly constructed user mess
 do not acquire one. In streamed provider references the reasoning bytes in
 `output_item.done` differ from the terminal envelope; ingestion keeps completed items
 as before, and qualification replays those exact item-completion bytes.
+
+Core `cfg(test)` builds additionally provide a per-context loopback fixture to run
+recordings through `ExecuteRequest`, inference framing, ingestion, the tool loop,
+storage and sessions. Only that fixture skips availability; routing, credentials,
+provenance and exact terminal-model checks still run. The fixture accepts a loopback
+socket address, never an arbitrary upstream URL, and is absent from library/server
+builds. No runtime flag enables the candidate. These offline tests do not qualify
+live gateway execution or WebSocket transport routing.
 
 The live runner polls one framed line, performs synchronous ingestion and translation,
 then awaits delivery before polling the next line. This propagates bounded sender

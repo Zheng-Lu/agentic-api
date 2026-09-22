@@ -5,9 +5,11 @@
 //! primary entry point; [`execute`] is a convenience shim for callers that don't
 //! need per-request configuration.
 
+mod history;
 mod round;
 mod streaming;
 mod usage;
+use history::record_round_history;
 use streaming::run_stream;
 use usage::accumulate_usage;
 
@@ -18,9 +20,9 @@ use tracing::debug;
 
 use super::compaction::{compact_items, maybe_compact_context};
 use super::gateway::{
-    GatewayCallResult, GatewayScheduler, append_gateway_calls_to_new_input, append_output_items_to_input,
-    append_tool_outputs, compaction_event_plans, emit_gateway_completed_events, emit_gateway_start_events,
-    emit_response_start_events, execute_and_emit_output_calls, has_client_owned_calls, public_output_items,
+    GatewayCallResult, GatewayScheduler, append_output_items_to_input, append_tool_outputs, compaction_event_plans,
+    emit_gateway_completed_events, emit_gateway_start_events, emit_response_start_events,
+    execute_and_emit_output_calls, has_client_owned_calls, public_output_items,
 };
 use crate::events::EventFrame;
 use crate::executor::error::ExecutorResult;
@@ -138,34 +140,6 @@ async fn build_tool_registry(
     Ok(registry)
 }
 
-fn record_round_history(
-    ctx: &mut RequestContext,
-    output_items: &[OutputItem],
-    registry: &ToolRegistry,
-    public_output_count: usize,
-) {
-    // Explicit conversations append public output through their durable handler;
-    // the session lease still serializes execution but must not record it twice.
-    if let Some(continuation) = ctx
-        .continuation
-        .as_mut()
-        .filter(|_| ctx.original_request.conversation_id.is_none())
-    {
-        // The canonical sequence includes reasoning and intermediate messages in
-        // their original positions, followed by this round's tool call outputs.
-        // Discovery records are appended separately from the public response.
-        ctx.new_input_items.extend(
-            output_items
-                .iter()
-                .filter(|item| !matches!(item, OutputItem::McpListTools(_)))
-                .filter_map(OutputItem::to_input_item),
-        );
-        continuation.mark_outputs_recorded(public_output_count);
-    } else {
-        append_gateway_calls_to_new_input(ctx, output_items, registry);
-    }
-}
-
 /// Request-scoped owner of registry-backed tool orchestration and its shared byte budget.
 struct EngineOrchestration<'a> {
     agent: &'a mut AgentPipeline,
@@ -231,6 +205,7 @@ impl<'a> EngineOrchestration<'a> {
                 &current_output,
                 &self.registry,
                 combined_output.len(),
+                self.exec_ctx.responses_config.reasoning_replay_policy,
             );
 
             // A terminal incomplete response may still contain completed gateway
@@ -718,6 +693,7 @@ mod tests {
             response_id: "resp_test".to_owned(),
             conversation_id: None,
             conversation_version: None,
+            recorded_output_prefix: crate::types::turn_history::RecordedOutputPrefix::default(),
             continuation: None,
         };
         let mut exec_ctx = ExecutionContext::new(
@@ -781,6 +757,7 @@ mod tests {
             response_id: "resp_mcp".to_owned(),
             conversation_id: None,
             conversation_version: None,
+            recorded_output_prefix: crate::types::turn_history::RecordedOutputPrefix::default(),
             continuation: None,
         };
         let plain_payload: RequestPayload = serde_json::from_value(serde_json::json!({
@@ -796,6 +773,7 @@ mod tests {
             response_id: "resp_plain".to_owned(),
             conversation_id: None,
             conversation_version: None,
+            recorded_output_prefix: crate::types::turn_history::RecordedOutputPrefix::default(),
             continuation: None,
         };
         let mut exec_ctx = ExecutionContext::new(

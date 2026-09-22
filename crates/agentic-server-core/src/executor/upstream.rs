@@ -379,6 +379,7 @@ pub(super) mod tests {
             response_id: "resp_test".to_owned(),
             conversation_id: None,
             conversation_version: None,
+            recorded_output_prefix: crate::types::turn_history::RecordedOutputPrefix::default(),
             continuation: None,
         }
     }
