@@ -31,6 +31,9 @@ impl std::fmt::Display for ResourceLimit {
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ExecutorError {
+    /// Request-owned streaming orchestration panicked. Never forward panic data.
+    #[error("stream producer panicked")]
+    StreamProducerPanicked,
     /// Invalid provider data with redacted diagnostics and a retained typed cause.
     #[error(transparent)]
     OpaqueUpstream(#[from] OpaqueUpstreamError),

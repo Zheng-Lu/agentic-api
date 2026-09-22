@@ -220,7 +220,7 @@ parameter when unambiguous.
 Rust struct literals for `ResponsesConfig` must include the optional profile or use
 `..ResponsesConfig::default()`.
 
-## Current slice: stateless projection and isolated transport
+## Stateless projection and isolated transport
 
 The candidate remains unavailable, but its adapter now has the following implemented
 components. Unit tests exercise them directly; no execution feature flag bypasses
@@ -259,14 +259,44 @@ the availability gate and no live provider qualification is claimed.
 
 There is no extra queue, task, parser, lifecycle validator, or output assembly path.
 Existing JSON/SSE byte limits and delivery backpressure apply. Dropping the inline
-consumer drops its upstream stream; the separate engine producer abort/join gap remains
-a release gate below. No storage migration or canonical-history rewrite is needed.
+consumer drops its upstream stream; the engine now owns the producer directly as
+described below. No storage migration or canonical-history rewrite is needed.
 
 `UpstreamRequest` and `UpstreamTool` moved to `types/upstream_request.rs`, with existing
 public import paths preserved. Rust struct literals must now supply `store: None` for
 the default contract and convert a `Cow<ResponsesInput>` with `.into()` for `input`.
 The pre-existing metadata contract was moved unchanged; no new untyped replay payload
 or public protocol field is introduced.
+
+## Current slice: stream-owned producer lifecycle
+
+The producer abort/join gap tracked as a prerequisite with #244 is removed from the
+Responses executor. `engine/streaming/producer.rs` polls the existing orchestration
+future and bounded event receiver on the caller's task, rather than spawning a producer
+whose `JoinHandle` is only aborted on stream drop. This applies to the default vLLM
+path as well as the reserved adapter; it does not enable opaque replay.
+
+- An unpolled stream starts no inference. Dropping it releases captured request state.
+- An active or backpressured stream owns its upstream/tool futures and continuation
+  lease. Drop disposes them synchronously; there is no cleanup task or unbounded reaper
+  queue. While the caller is not polling, the producer makes no background progress.
+- The bounded channel and configured per-event size ceiling are unchanged. Completion
+  or panic drops the producer before draining accepted events in order and exposing
+  exactly one outcome; no second emission or ingestion path is introduced.
+- Panics become `ExecutorError::StreamProducerPanicked`, using the existing SSE error
+  envelope without copying panic payloads into client diagnostics. The process-wide
+  panic hook is unchanged; this is not a guarantee about arbitrary panicking tool logs.
+- The engine still validates terminal event size, then persists and publishes session
+  checkpoints, before emitting completion. A cancelled storage wait releases its local
+  future and session reservation. No transaction-cancellation semantics were weakened.
+- WebSocket transports continue to abort and join their own request tasks and retain
+  session-idle fences. Those joins now also dispose of the stream's orchestration work;
+  there is no nested producer task still releasing request state afterward.
+
+These are local ownership guarantees, not rollback of remote tool effects or immediate
+termination of remote model work. Shared transport/connection drivers retain their
+own lifetimes. No worker-placement performance benefit is claimed; #245 measurement
+work and the broader #244 delivery/observability scope remain separate.
 
 ## Remaining slices before enabling a provider profile
 
@@ -278,7 +308,10 @@ or public protocol field is introduced.
 2. Keep local plaintext compaction distinct from provider opaque compaction. Unsupported
    combinations already fail before inference; any future expansion requires its own
    typed contract and recordings, not summary-based compatibility inference.
-3. Close the streaming producer abort/join gap with #244 before production enablement.
+3. Extend the recorder's currently tool-search-only manual item replay workflow for
+   pinned stateless reasoning, function outputs, and branches, then validate and stage
+   actual captured exchanges. Live reference recording requires an `OPENAI_API_KEY`
+   available only in the local recording environment, never in fixtures or chat.
 
 The upstream contract requires preserving opaque state and limits reasoning reuse
 to compatible model families; see the
@@ -337,6 +370,14 @@ backpressure and dropping inline input on cancellation or client disconnect. Tra
 tests use loopback fixtures (HTTPS disabled only in those fixtures) for redirect rejection,
 redacted HTTP errors, explicit headers, byte limits, read timeouts, and invalid/truncated
 UTF-8 framing; the production constructor rejects HTTP before contacting the fixture.
+
+`engine/streaming/producer/tests.rs` checks unpolled, suspended and backpressured
+producer disposal, no background progress, ordered queue draining, closed-channel
+completion, and panic isolation. `stream_producer_lifecycle_test.rs` replays existing
+Qwen reasoning and vLLM tool-call cassettes to check immediate session/tool cleanup,
+panic event numbering and redaction, cancellation during storage waits, unchanged
+persistence-before-completion, and retention of a source checkpoint after a cancelled
+fork. No captured YAML was added or modified for this lifecycle change.
 
 The workspace suite (including OpenAPI and cassette tests), Clippy with warnings
 denied, and formatting checks passed with Rust 1.98. Opt-in ignored tests were not run:
