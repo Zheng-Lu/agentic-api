@@ -4,7 +4,7 @@ mod support;
 
 use agentic_core::config::ResponsesConfig;
 use agentic_core::executor::{ExecuteRequest, ExecutorError};
-use agentic_core::types::reasoning_profile::OpaqueReasoningProfile;
+use agentic_core::types::reasoning_profile::{OpaqueReasoningProfile, OpaqueReplayRequestField};
 use agentic_core::types::reasoning_replay::{ReasoningReplayError, ReasoningReplayPolicy};
 use std::sync::Arc;
 
@@ -82,7 +82,7 @@ async fn target_rejection_precedes_history_tool_discovery_and_json_or_sse_infere
             // must not be discovered when the replay profile is rejected.
             request.tools = Some(
                 serde_json::from_value(serde_json::json!([
-                    {"type":"mcp", "server_label":"unreachable", "server_url":"http://127.0.0.1:1/mcp"}
+                    {"type":"mcp", "server_label":"unreachable", "server_url":"http://127.0.0.1:1/mcp", "require_approval":"never"}
                 ]))
                 .unwrap(),
             );
@@ -142,6 +142,12 @@ fn replay_failures_have_safe_typed_http_and_stream_error_contracts() {
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             None,
+        ),
+        (
+            ReasoningReplayError::UnsupportedParameter(OpaqueReplayRequestField::ReasoningMode),
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            Some("reasoning.mode"),
         ),
         (
             ReasoningReplayError::ReportedModelMismatch,

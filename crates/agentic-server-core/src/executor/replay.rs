@@ -56,6 +56,7 @@ fn validate_profile_request(exec_ctx: &ExecutionContext, request: &RequestPayloa
         {
             return Err(ReasoningReplayError::UnsupportedCompaction.into());
         }
+        profile::parameters::validate(profile, request)?;
     }
     Ok(())
 }

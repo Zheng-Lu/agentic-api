@@ -170,6 +170,7 @@ impl ExecutorError {
                 ReasoningReplayError::ModelMismatch
                 | ReasoningReplayError::MissingCredential
                 | ReasoningReplayError::UnsupportedCompaction
+                | ReasoningReplayError::UnsupportedParameter(_)
                 | ReasoningReplayError::UnknownProvenance
                 | ReasoningReplayError::IncompatibleProvenance
                 | ReasoningReplayError::MissingOpaqueState
@@ -262,6 +263,7 @@ impl ExecutorError {
     pub fn error_param(&self) -> Option<&'static str> {
         match self.client_visible_error() {
             Self::ReasoningReplay(ReasoningReplayError::ModelMismatch) => Some("model"),
+            Self::ReasoningReplay(ReasoningReplayError::UnsupportedParameter(field)) => Some(field.as_str()),
             Self::ReasoningReplay(
                 ReasoningReplayError::UnknownProvenance
                 | ReasoningReplayError::IncompatibleProvenance

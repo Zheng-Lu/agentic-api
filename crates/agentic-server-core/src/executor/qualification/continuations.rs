@@ -3,6 +3,7 @@ use crate::executor::{ExecuteRequest, ExecutorError, rehydrate_conversation, reh
 use crate::storage::{InOutItem, ResponseStore};
 use crate::types::{
     io::{InputItem, OutputItem, ResponsesInput},
+    reasoning_profile::OpaqueReplayRequestField as Field,
     reasoning_replay::{ReasoningProvenance, ReasoningReplayError, ReasoningReplayPolicy, ReasoningSource},
 };
 use std::sync::Arc;
@@ -202,4 +203,70 @@ async fn pinned_execution_without_fixture_still_fails_closed() {
         assert!(fixture.requests().await.is_empty());
         fixture.stop().await;
     }
+}
+
+#[tokio::test]
+async fn pinned_execution_rejects_unsupported_parameters_before_history_or_network() {
+    use serde_json::{Value, json};
+
+    let capture = capture("continuation", false);
+    let cases = [
+        (Field::ReasoningContext, json!({"reasoning":{"context":"all_turns"}})),
+        (Field::ReasoningEffort, json!({"reasoning":{"effort":"high"}})),
+        (
+            Field::ReasoningGenerateSummary,
+            json!({"reasoning":{"generate_summary":"concise"}}),
+        ),
+        (Field::ReasoningMode, json!({"reasoning":{"mode":"pro"}})),
+        (Field::ReasoningSummary, json!({"reasoning":{"summary":"detailed"}})),
+        (Field::Include, json!({"include":["file_search_call.results"]})),
+        (Field::Text, json!({"text":{"format":{"type":"text"}}})),
+        (Field::Temperature, json!({"temperature":0.5})),
+        (Field::TopP, json!({"top_p":0.5})),
+        (Field::MaxOutputTokens, json!({"max_output_tokens":128_001})),
+        (Field::IgnoreEos, json!({"ignore_eos":false})),
+        (Field::Truncation, json!({"truncation":"auto"})),
+        (Field::Metadata, json!({"metadata":{"private":"do-not-forward"}})),
+        (Field::ParallelToolCalls, json!({"parallel_tool_calls":true})),
+        (Field::CacheSalt, json!({"cache_salt":"vllm-only"})),
+        (Field::Tools, json!({"tools":[{"type":"file_search"}]})),
+        (
+            Field::Tools,
+            json!({"tools":[{"type":"function","name":"lookup","defer_loading":true}]}),
+        ),
+        (
+            Field::Tools,
+            json!({"tools":[{"type":"function","name":"lookup","future_field":true}]}),
+        ),
+        (Field::Tools, json!({"tools":[{"type":"mcp","server_label":"fixture"}]})),
+        (
+            Field::ToolChoice,
+            json!({"tool_choice":{"type":"custom","name":"lookup"}}),
+        ),
+    ];
+    let fixture = Fixture::new([]).await;
+    for streaming in [false, true] {
+        for (field, override_fields) in &cases {
+            let mut request = serde_json::to_value(request(&capture.turns[0], true)).unwrap();
+            let Value::Object(override_fields) = override_fields else {
+                panic!("object override");
+            };
+            for (key, value) in override_fields {
+                request[key.as_str()] = value.clone();
+            }
+            let mut request: crate::types::RequestPayload = serde_json::from_value(request).unwrap();
+            request.stream = streaming;
+            request.previous_response_id = Some("resp_missing".to_owned());
+            let error = fixture.run(request, None).await.err().unwrap();
+            assert!(matches!(
+                &error,
+                ExecutorError::ReasoningReplay(ReasoningReplayError::UnsupportedParameter(actual)) if actual == field
+            ));
+            assert_eq!(error.http_status(), http::StatusCode::BAD_REQUEST);
+            assert_eq!(error.error_param(), Some(field.as_str()));
+        }
+    }
+    assert!(fixture.requests().await.is_empty());
+    assert_eq!(fixture.row_count().await, 0);
+    fixture.stop().await;
 }

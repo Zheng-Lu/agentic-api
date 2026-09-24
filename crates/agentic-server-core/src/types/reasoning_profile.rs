@@ -7,6 +7,62 @@ use serde::{Deserialize, Serialize};
 
 use super::reasoning_replay::ReasoningReplayError;
 
+/// Request field outside the qualified surface of a pinned opaque profile.
+///
+/// This is an internal validation name, never a caller-provided string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpaqueReplayRequestField {
+    ReasoningContext,
+    ReasoningEffort,
+    ReasoningGenerateSummary,
+    ReasoningMode,
+    ReasoningSummary,
+    Include,
+    Text,
+    Temperature,
+    TopP,
+    MaxOutputTokens,
+    IgnoreEos,
+    Truncation,
+    Metadata,
+    ParallelToolCalls,
+    CacheSalt,
+    Tools,
+    ToolChoice,
+}
+
+impl OpaqueReplayRequestField {
+    /// Exact public request parameter for a client-safe error envelope.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReasoningContext => "reasoning.context",
+            Self::ReasoningEffort => "reasoning.effort",
+            Self::ReasoningGenerateSummary => "reasoning.generate_summary",
+            Self::ReasoningMode => "reasoning.mode",
+            Self::ReasoningSummary => "reasoning.summary",
+            Self::Include => "include",
+            Self::Text => "text",
+            Self::Temperature => "temperature",
+            Self::TopP => "top_p",
+            Self::MaxOutputTokens => "max_output_tokens",
+            Self::IgnoreEos => "ignore_eos",
+            Self::Truncation => "truncation",
+            Self::Metadata => "metadata",
+            Self::ParallelToolCalls => "parallel_tool_calls",
+            Self::CacheSalt => "cache_salt",
+            Self::Tools => "tools",
+            Self::ToolChoice => "tool_choice",
+        }
+    }
+}
+
+impl std::fmt::Display for OpaqueReplayRequestField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// A pinned candidate. Aliases, regional endpoints, proxies with another URL,
 /// compatible model families, and arbitrary user-defined profiles are not implied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

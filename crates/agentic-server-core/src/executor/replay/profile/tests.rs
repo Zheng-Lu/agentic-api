@@ -56,6 +56,26 @@ fn request() -> RequestPayload {
 }
 
 #[test]
+fn pinned_request_surface_accepts_recorded_settings_without_opening_the_gate() {
+    let request: RequestPayload = serde_json::from_value(serde_json::json!({
+        "model": PROFILE.model(),
+        "input": "hello",
+        "reasoning": {"effort": "low", "summary": "concise"},
+        "include": ["reasoning.encrypted_content"],
+        "max_output_tokens": 128_000,
+        "truncation": "disabled",
+        "parallel_tool_calls": false,
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        "tool_choice": {"type": "function", "name": "lookup"}
+    }))
+    .unwrap();
+    assert!(matches!(
+        validate_rehydration_request(&context(), &request),
+        Err(ExecutorError::ReasoningReplay(ReasoningReplayError::OpaqueNotEnabled))
+    ));
+}
+
+#[test]
 fn target_requires_exact_endpoint_model_and_effective_credential() {
     for endpoint in [
         "http://api.openai.com/v1/responses",

@@ -341,7 +341,7 @@ These are provider-reference recordings, not a live gateway acceptance matrix. W
 recording uses independent connections and full item replay; it does not qualify the
 gateway's transient connection-local checkpoint routing. The candidate remains disabled.
 
-## Current slice: offline executor acceptance and canonical turn ordering
+## Offline executor acceptance and canonical turn ordering
 
 `executor/qualification/` replays the pinned JSON/SSE references through full
 `ExecuteRequest` execution, rather than only the ingestion adapter. A crate-private
@@ -384,6 +384,46 @@ The MCP declaration/normalization is a local test setup, not live provider quali
 These are offline executor acceptance tests, not actual HTTP/WebSocket handler or live
 gateway acceptance. The profile remains unavailable, and no API key is required here.
 
+## Current slice: pinned request-surface preflight
+
+`executor/replay/profile/parameters.rs` now validates the candidate's modeled request fields
+before rehydration or tool discovery and again before each inference round, after
+stored settings have been resolved. It returns a typed, redacted 400 error naming the
+unsupported request parameter; values, tool names, metadata and credentials do not
+enter diagnostics. This is an allowlist for this gateway profile, not a claim that
+the pinned OpenAI model cannot accept other parameters.
+
+The candidate accepts the recorded `reasoning.effort: low` and
+`reasoning.summary: concise` settings (or omitted settings), `store` for gateway
+persistence, `stream`, `instructions`, `max_output_tokens` from 1 to 128,000, optional
+`truncation: disabled`, and optional `include: ["reasoning.encrypted_content"]`.
+`parallel_tool_calls` may be omitted or `false`. Function and locally normalized MCP
+declarations are allowed; MCP requires `require_approval: never`. A function tool
+cannot request deferred loading or use extension fields that normalization would
+drop. `tool_choice` is limited to `auto`, `none`, `required`, or a named function
+without a namespace. The existing profile and provenance checks still decide
+whether input item history is compatible.
+
+The candidate rejects unqualified reasoning context, effort and summary values,
+`reasoning.mode`, `reasoning.generate_summary`, other include values, `text`,
+sampling overrides, `ignore_eos`, automatic truncation, metadata, enabled parallel
+tool calls, `cache_salt`, and other tool kinds. Some of these are supported by the
+provider but lack this gateway's qualification; some are vLLM extensions or would
+lose semantics during normalization. The [official GPT-5.4 model page](https://developers.openai.com/api/docs/models/gpt-5.4)
+documents the pinned snapshot and 128,000-token maximum output, while the
+[reasoning guide](https://developers.openai.com/api/docs/guides/reasoning) documents
+stateless encrypted reasoning and the legacy include value.
+
+The positive recorded JSON/SSE executor matrix remains green. A new rejection
+matrix covers every excluded modeled field in both request modes and confirms errors occur
+before missing-history lookup or network access. The ordinary library/server
+availability gate remains closed; this preflight is not profile enablement.
+
+The existing `RequestPayload` decoder ignores unknown top-level and nested fields
+before this preflight sees them. Strict, typed decoding for the selected opaque
+profile is therefore still required before enabling it; this modeled-field allowlist
+does not claim to catch unknown wire fields.
+
 ## Remaining slices before enabling a provider profile
 
 1. Complete live gateway acceptance and transport-level HTTP/WebSocket coverage, including
@@ -391,7 +431,8 @@ gateway acceptance. The profile remains unavailable, and no API key is required 
    continuations and gateway-executed tool loops, while the reference matrix covers the
    pinned provider's initial, multi-turn, function-output and branching contract, but does
    not qualify every public request parameter, tool normalization or provider error mode.
-   Declare and enforce the supported profile surface before enabling it. Existing gpt-5.6
+   Reject unknown wire fields in the opaque profile's typed decoder and expand the pinned
+   request surface only with qualification evidence before enabling it. Existing gpt-5.6
    recordings remain regression evidence, not evidence for the pinned model.
 2. Keep local plaintext compaction distinct from provider opaque compaction. Unsupported
    combinations already fail before inference; any future expansion requires its own

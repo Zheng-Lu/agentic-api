@@ -1,5 +1,7 @@
 //! I/O-free compatibility checks. Passing them does not bypass availability gating.
 
+pub(super) mod parameters;
+
 use sha2::{Digest, Sha256};
 
 use super::upstream_identity;

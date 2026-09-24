@@ -8,7 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::reasoning_profile::OpaqueReasoningProfile;
+use super::reasoning_profile::{OpaqueReasoningProfile, OpaqueReplayRequestField};
 
 /// Maximum serialized provenance per stored reasoning item, including JSON overhead.
 pub const MAX_REASONING_PROVENANCE_BYTES: usize = 512;
@@ -67,6 +67,8 @@ pub enum ReasoningReplayError {
     MissingCredential,
     #[error("local compaction is unsupported by the opaque reasoning replay profile")]
     UnsupportedCompaction,
+    #[error("request parameter `{0}` is unsupported by the opaque reasoning replay profile")]
+    UnsupportedParameter(OpaqueReplayRequestField),
     #[error("reasoning replay requires gateway-observed provenance; manual and legacy opaque state is unsupported")]
     UnknownProvenance,
     #[error("reasoning provenance is incompatible with the selected profile, endpoint, model, or credential")]

@@ -605,6 +605,10 @@ configuration still fails the qualification gate, so only the default vLLM polic
 executes. The reserved adapter has a typed stateless projection, isolated HTTPS client,
 and strict ingestion selection; see [provider-aware reasoning](docs/design/provider-aware-reasoning.md)
 for pinned-provider reference evidence and remaining gateway acceptance work.
+`executor/replay/profile/parameters.rs` checks the candidate's request surface before
+history lookup and tool discovery. It returns typed, parameter-specific errors for
+settings outside that surface and rechecks effective settings before each round.
+It does not change default vLLM request handling, normalization, or delivery.
 
 Assistant `MessagePhase` is a bounded optional enum in the message types, retained by
 the existing authoritative typed completion and output-to-input conversion. Storage
