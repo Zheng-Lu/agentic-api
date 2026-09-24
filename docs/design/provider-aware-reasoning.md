@@ -262,6 +262,11 @@ the availability gate and no live provider qualification is claimed.
   source. Source chains are for explicit internal inspection, not routine logging.
   This does not promise that valid provider-generated response text or response error
   objects are secret-free; those still require qualification through the common pipeline.
+- A streamed candidate `response.failed` is logged with only the gateway response ID and
+  an identifier-shaped error code. Its provider message, upstream ID, and incomplete
+  reason stay out of gateway logs because they can reflect request data. Default vLLM
+  failure logging is unchanged. The failure returned to the requesting client is not
+  rewritten.
 
 There is no extra queue, task, parser, lifecycle validator, or output assembly path.
 Existing JSON/SSE byte limits and delivery backpressure apply. Dropping the inline
@@ -471,6 +476,8 @@ remains closed pending live gateway and provider error-mode qualification.
 3. Keep live qualification opt-in and credential-local. The expanded recorder and pinned
    reference fixtures are available; future scenarios must use that workflow and staged
    validation, never hand-authored captured YAML.
+4. Qualify provider `response.failed` error objects before exposing them unchanged to
+   clients. Failed responses are not persisted, but the object can reflect request data.
 
 The upstream contract requires preserving opaque state and limits reasoning reuse
 to compatible model families; see the

@@ -11,7 +11,12 @@ pub(super) enum Fault {
     MissingModel,
     WrongModel,
     MissingTerminal,
+    /// A well-formed terminal failure whose provider message reflects request data.
+    ProviderFailure,
 }
+
+/// Stands in for request data or opaque state that a provider echoes in an error.
+const REFLECTED: &str = "reflected-opaque-state-sentinel";
 
 pub(super) fn fault(mut response: Response, fault: Fault) -> Response {
     let mutate = |body: &mut Value| match fault {
@@ -21,6 +26,10 @@ pub(super) fn fault(mut response: Response, fault: Fault) -> Response {
         Fault::WrongModel => body["model"] = json!("not-the-qualified-snapshot"),
         Fault::MissingTerminal => {
             body.as_object_mut().unwrap().remove("status");
+        }
+        Fault::ProviderFailure => {
+            body["status"] = json!("failed");
+            body["error"] = json!({"code": "invalid_encrypted_content", "message": REFLECTED});
         }
     };
     if let Some(body) = &mut response.body {
@@ -39,7 +48,12 @@ pub(super) fn fault(mut response: Response, fault: Fault) -> Response {
             if matches!(fault, Fault::MissingTerminal) && event["type"] == "response.completed" {
                 continue;
             }
-            if let Some(body) = event.get_mut("response") {
+            if matches!(fault, Fault::ProviderFailure) {
+                if event["type"] == "response.completed" {
+                    event["type"] = json!("response.failed");
+                    mutate(&mut event["response"]);
+                }
+            } else if let Some(body) = event.get_mut("response") {
                 mutate(body);
             }
             events.push(format!("data: {event}\n\n"));
@@ -163,4 +177,30 @@ async fn pinned_execution_active_drop_discards_partial_round_and_releases_lease(
         Err(ExecutorError::PreviousResponseNotFound { .. })
     ));
     fixture.stop().await;
+}
+
+#[tokio::test]
+async fn pinned_execution_failure_logs_withhold_reflected_provider_text() {
+    for streaming in [false, true] {
+        let capture = capture("continuation", streaming);
+        let fixture = Fixture::new([fault(capture.turns[0].response.clone(), Fault::ProviderFailure)]).await;
+        let logs = crate::executor::log_capture::LogCapture::default();
+        let guard = logs.install();
+        let client_output = match fixture.run(request(&capture.turns[0], true), None).await.unwrap() {
+            Either::Left(payload) => serde_json::to_string(&payload).unwrap(),
+            Either::Right(stream) => stream.collect::<Vec<_>>().await.concat(),
+        };
+        drop(guard);
+        let logs = logs.text();
+        // The requesting client still receives the provider's failure; only logs are withheld.
+        assert!(client_output.contains(REFLECTED));
+        assert!(!logs.contains(REFLECTED), "{logs}");
+        if streaming {
+            assert!(logs.contains("provider error details withheld"), "{logs}");
+            assert!(logs.contains("invalid_encrypted_content"), "{logs}");
+        }
+        assert_eq!(fixture.requests().await.len(), 1);
+        assert_eq!(fixture.row_count().await, 0);
+        fixture.stop().await;
+    }
 }

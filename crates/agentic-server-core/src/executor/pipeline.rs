@@ -2,7 +2,7 @@
 mod delivery;
 mod ingest;
 
-pub(super) use delivery::{emit_deferred_stream_events, emit_gateway_event};
+pub(super) use delivery::{UpstreamFailureLog, emit_deferred_stream_events, emit_gateway_event};
 pub(super) use ingest::RoundIngestion;
 
 use crate::events::{ClassifiedSseLine, EventFrame, SseLine};
@@ -60,6 +60,11 @@ impl AgentPipeline {
             delivery: StreamDelivery::with_max_stream_event_bytes(sender, max_stream_event_bytes),
             round: None,
         }
+    }
+
+    /// The engine's replay policy decides how much provider failure text delivery may log.
+    pub(super) fn set_upstream_failure_log(&mut self, failure_log: UpstreamFailureLog) {
+        self.delivery.failure_log = failure_log;
     }
 
     pub(super) fn tool_search_state(&self) -> Option<&ToolSearchState> {

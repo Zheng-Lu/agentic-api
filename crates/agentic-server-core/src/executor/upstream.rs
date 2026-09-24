@@ -2,7 +2,7 @@ use crate::executor::accumulator::Validation;
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::gateway_accumulator::StreamEvent;
 use crate::executor::inference::call_inference_with_transport;
-use crate::executor::pipeline::{AgentPipeline, StreamPayload};
+use crate::executor::pipeline::{AgentPipeline, StreamPayload, UpstreamFailureLog};
 use crate::executor::rehydrate::validate_message_content;
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
@@ -82,6 +82,13 @@ fn validation_for_policy(policy: ReasoningReplayPolicy) -> Validation {
     match policy {
         ReasoningReplayPolicy::VllmPlaintext => Validation::Lenient,
         ReasoningReplayPolicy::OpaqueResponses => Validation::Strict,
+    }
+}
+
+fn failure_log_for_policy(policy: ReasoningReplayPolicy) -> UpstreamFailureLog {
+    match policy {
+        ReasoningReplayPolicy::VllmPlaintext => UpstreamFailureLog::Detailed,
+        ReasoningReplayPolicy::OpaqueResponses => UpstreamFailureLog::CodeOnly,
     }
 }
 
@@ -206,6 +213,7 @@ pub(super) async fn fetch_stream_payload(
         exec_ctx.streaming_timeout,
         exec_ctx.responses_config.max_upstream_sse_line_bytes,
     );
+    agent.set_upstream_failure_log(failure_log_for_policy(policy));
     provider_result(
         policy,
         agent

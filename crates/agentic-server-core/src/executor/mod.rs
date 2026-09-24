@@ -27,6 +27,8 @@ mod response_budget;
 mod upstream;
 
 #[cfg(test)]
+mod log_capture;
+#[cfg(test)]
 mod qualification;
 
 pub use compaction::compact_response;
