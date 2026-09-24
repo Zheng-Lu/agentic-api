@@ -1938,12 +1938,16 @@ async fn websocket_selected_opaque_profile_rejects_unknown_fields_before_executi
     for request in [
         r#"{"type":"response.create","stream_id":"lane","model":"gpt-5.4-2026-03-05","input":"hi","unknown":true}"#,
         r#"{"type":"response.create","stream_id":"lane","model":"gpt-5.4-2026-03-05","input":"hi","model":"other"}"#,
+        r#"{"type":"response.create","stream_id":"lane","model":"gpt-5.4-2026-03-05","input":[{"type":"message","role":"user","content":"hi","unknown":true}]}"#,
+        r#"{"type":"response.create","stream_id":"lane","model":"gpt-5.4-2026-03-05","input":"hi","tools":[{"type":"function","name":"lookup","unknown":true}]}"#,
+        r#"{"type":"response.create","stream_id":"lane","model":"gpt-5.4-2026-03-05","input":"hi","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","type":"array"}}]}"#,
+        r#"{"type":"response.create","stream_id":"lane","model":"gpt-5.4-2026-03-05","input":"hi","tool_choice":{"type":"function","name":"lookup","unknown":true}}"#,
     ] {
         ws.send(Message::Text(request.into())).await.expect("send request");
         let error = recv_json(&mut ws).await;
         assert_eq!(error["type"], "error");
         assert_eq!(error["status"], StatusCode::BAD_REQUEST.as_u16());
-        assert_eq!(error["stream_id"], "lane");
+        assert!(error.get("stream_id").is_none());
         assert_eq!(error["error"]["code"], "reasoning_replay_incompatible");
         assert!(!error.to_string().contains("unknown"));
     }

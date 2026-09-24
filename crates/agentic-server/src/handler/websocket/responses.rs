@@ -898,6 +898,13 @@ mod tests {
         }
         let valid = r#"{"type":"response.create","stream_id":"lane","generate":false,"model":"m","input":"hi"}"#;
         assert!(parse_ws_request(valid, true).is_ok());
+
+        let duplicate_routing = r#"{"type":"response.create","stream_id":"lane-a","stream_id":"lane-b","previous_response_id":"resp_a","previous_response_id":"resp_b","model":"m","input":"hi"}"#;
+        let error = parse_ws_request(duplicate_routing, true)
+            .err()
+            .expect("ambiguous opaque request must fail");
+        assert!(error.stream_id.is_none());
+        assert!(error.previous_response_id.is_none());
     }
 
     #[test]

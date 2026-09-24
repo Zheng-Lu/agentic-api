@@ -419,19 +419,35 @@ matrix covers every excluded modeled field in both request modes and confirms er
 before missing-history lookup or network access. The ordinary library/server
 availability gate remains closed; this preflight is not profile enablement.
 
-The selected profile now has a transport-level wire guard on both HTTP and WebSocket
+The selected profile has a transport-level wire guard on both HTTP and WebSocket
 `response.create`. It rejects unknown and duplicate top-level request keys before
 `RequestPayload` can discard them, while allowing `type`, `stream_id`, and `generate`
-only in the WebSocket envelope. Unknown or duplicate `reasoning` keys are rejected,
-and the executor rejects unknown input-item kinds before rehydration. Errors do not
-echo caller-supplied field names or values. HTTP `store: false` also takes the
-executor route whenever an opaque profile is selected; it cannot bypass preflight
-through transparent proxying. The default vLLM proxy route is unchanged.
+only in the WebSocket envelope. Its closed nested Serde sentinels admit only the
+recorded user/assistant text-message, opaque reasoning, function call/output, function/MCP
+declaration, and named-function-choice shapes. They reject unknown or duplicate
+fields at those object levels and keep explicit item caps on input, content,
+reasoning summary, and tool arrays. Function JSON Schema and MCP headers remain
+open documents, but a bounded visitor rejects duplicate keys within them. Empty
+captured `reasoning.content`, `output_text.annotations`, and `output_text.logprobs`
+are admitted; nonempty variants still need qualification. The existing typed
+`RequestPayload` remains authoritative for values and semantics. All 18 requests
+in the six recorder-generated pinned reference cassettes pass this wire guard.
 
-This is not yet a fully closed profile decoder. Nested fields inside input items,
-content parts, tool declarations, and object-form `tool_choice` can still be ignored
-by their existing decoders. Those shapes need a typed, profile-specific closed
-validation path and replay coverage before the candidate can be enabled.
+The executor also checks the corresponding typed input surface, including direct
+core callers and effective history after rehydration: unqualified item kinds,
+content parts, structured function-call outputs, namespaced calls, plaintext
+reasoning content, and unexpected content extensions fail before inference. Errors
+do not echo caller-supplied field names or values. HTTP `store: false` takes the
+executor route whenever an opaque profile is selected, so it cannot bypass
+preflight through transparent proxying. Default vLLM behavior is unchanged.
+WebSocket shape failures carry no `stream_id` or `previous_response_id` into
+admission: those routing fields are read only after the raw guard succeeds, so
+duplicate-key requests cannot select a lane or evict a cached checkpoint.
+
+This closes silent nested-field dropping for the candidate's currently admitted
+wire shapes; it does not qualify other input item kinds, multimodal content,
+nonempty metadata arrays, or arbitrary provider tool settings. The profile gate
+remains closed pending live gateway and provider error-mode qualification.
 
 ## Remaining slices before enabling a provider profile
 
@@ -440,8 +456,8 @@ validation path and replay coverage before the candidate can be enabled.
    continuations and gateway-executed tool loops, while the reference matrix covers the
    pinned provider's initial, multi-turn, function-output and branching contract, but does
    not qualify every public request parameter, tool normalization or provider error mode.
-   Finish nested unknown-wire-field validation in the opaque profile and expand the pinned
-   request surface only with qualification evidence before enabling it. Existing gpt-5.6
+   Expand the pinned request surface only with qualification evidence before
+   enabling it. Existing gpt-5.6
    recordings remain regression evidence, not evidence for the pinned model.
 2. Keep local plaintext compaction distinct from provider opaque compaction. Unsupported
    combinations already fail before inference; any future expansion requires its own

@@ -47,14 +47,6 @@ fn validate_profile_request(exec_ctx: &ExecutionContext, request: &RequestPayloa
         .validate_profile(config.reasoning_replay_profile)?;
     if let Some(profile) = config.reasoning_replay_profile {
         profile.validate_target(&exec_ctx.responses_url(), &request.model)?;
-        if let ResponsesInput::Items(items) = &request.input {
-            if items.iter().any(|item| matches!(item, InputItem::Unknown)) {
-                return Err(ReasoningReplayError::UnsupportedParameter(
-                    crate::types::reasoning_profile::OpaqueReplayRequestField::Input,
-                )
-                .into());
-            }
-        }
         if request
             .context_management
             .as_ref()

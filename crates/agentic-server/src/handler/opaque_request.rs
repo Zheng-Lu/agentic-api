@@ -8,7 +8,11 @@ use serde::Deserialize;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde_json::Deserializer;
 
+use agentic_core::types::reasoning_profile::MAX_OPAQUE_TOOLS;
 use agentic_core::types::reasoning_replay::ReasoningReplayError;
+
+mod nested;
+use nested::{BoundedSequence, ClosedInput, ClosedTool, ClosedToolChoice};
 
 /// The WebSocket transport adds three envelope keys to the Responses request.
 #[derive(Clone, Copy)]
@@ -103,19 +107,31 @@ impl<'de> Visitor<'de> for RequestFields {
                 return Err(serde::de::Error::custom("duplicate request field"));
             }
             seen |= bit;
-            if key == "reasoning" {
-                let reasoning = map.next_value::<Option<ReasoningFields>>()?;
-                if let Some(reasoning) = reasoning {
-                    let _ = (
-                        reasoning.context,
-                        reasoning.effort,
-                        reasoning.generate_summary,
-                        reasoning.mode,
-                        reasoning.summary,
-                    );
+            match key.as_str() {
+                "input" => {
+                    map.next_value::<ClosedInput>()?;
                 }
-            } else {
-                map.next_value::<IgnoredAny>()?;
+                "tools" => {
+                    map.next_value::<Option<BoundedSequence<ClosedTool, MAX_OPAQUE_TOOLS>>>()?;
+                }
+                "tool_choice" => {
+                    map.next_value::<Option<ClosedToolChoice>>()?;
+                }
+                "reasoning" => {
+                    let reasoning = map.next_value::<Option<ReasoningFields>>()?;
+                    if let Some(reasoning) = reasoning {
+                        let _ = (
+                            reasoning.context,
+                            reasoning.effort,
+                            reasoning.generate_summary,
+                            reasoning.mode,
+                            reasoning.summary,
+                        );
+                    }
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
             }
         }
         Ok(())
@@ -157,5 +173,34 @@ mod tests {
         assert!(validate(br#"{"model":"m","input":"hi"}"#, Transport::Http).is_ok());
         assert!(validate(br#"{"model":"m"} {}"#, Transport::Http).is_err());
         assert!(validate(br#"["not an object"]"#, Transport::Http).is_err());
+    }
+
+    #[test]
+    fn all_recorded_pinned_provider_requests_fit_the_closed_wire_surface() {
+        for scenario in ["continuation", "function"] {
+            for mode in ["json", "sse", "websocket"] {
+                let path = format!(
+                    "{}/../agentic-server-core/tests/cassettes/reasoning/opaque/gpt-5.4-2026-03-05/{scenario}-{mode}.yaml",
+                    env!("CARGO_MANIFEST_DIR")
+                );
+                let source = std::fs::read(path).expect("recorded pinned cassette");
+                assert!(source.len() < 1_000_000, "bounded cassette");
+                let cassette: serde_json::Value = serde_yml::from_slice(&source).expect("recorded cassette parses");
+                let turns = cassette["turns"].as_array().expect("three recorded turns");
+                assert_eq!(turns.len(), 3);
+                let transport = if mode == "websocket" {
+                    Transport::WebSocket
+                } else {
+                    Transport::Http
+                };
+                for turn in turns {
+                    let request = serde_json::to_vec(&turn["request"]["body"]).expect("recorded request JSON");
+                    assert!(
+                        validate(&request, transport).is_ok(),
+                        "closed wire guard rejected recorded {scenario}-{mode} request"
+                    );
+                }
+            }
+        }
     }
 }

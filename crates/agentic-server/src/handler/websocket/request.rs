@@ -39,6 +39,15 @@ pub(super) fn parse_ws_request(text: &str, opaque_profile_selected: bool) -> Res
         previous_response_id: None,
         stream_id: None,
     })?;
+    if opaque_profile_selected {
+        validate_opaque_request_fields(text.as_bytes(), OpaqueRequestTransport::WebSocket).map_err(|error| {
+            WsRequestParseError {
+                error: WsError::from(ExecutorError::from(error)),
+                previous_response_id: None,
+                stream_id: None,
+            }
+        })?;
+    }
     let stream_id = value
         .get("stream_id")
         .map(|value| {
@@ -69,15 +78,6 @@ pub(super) fn parse_ws_request(text: &str, opaque_profile_selected: bool) -> Res
         .and_then(Value::as_str)
         .map(str::to_owned);
     let generate = value.get("generate").and_then(Value::as_bool);
-    if opaque_profile_selected {
-        validate_opaque_request_fields(text.as_bytes(), OpaqueRequestTransport::WebSocket).map_err(|error| {
-            WsRequestParseError {
-                error: WsError::from(ExecutorError::from(error)),
-                previous_response_id: previous_response_id.clone(),
-                stream_id: stream_id.clone(),
-            }
-        })?;
-    }
     let mut payload = serde_json::from_value::<RequestPayload>(value).map_err(|error| WsRequestParseError {
         error: WsError::from(ExecutorError::from(error)),
         previous_response_id,

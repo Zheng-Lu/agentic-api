@@ -93,6 +93,90 @@ fn unknown_input_item_is_rejected_before_the_closed_profile_gate() {
 }
 
 #[test]
+fn unqualified_nested_input_is_rejected_before_the_closed_profile_gate() {
+    let inputs = [
+        serde_json::json!([{"type":"message","role":"system","content":"hi"}]),
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"output_text","text":"hi"}]}]),
+        serde_json::json!([{"type":"message","role":"assistant","content":[{"type":"input_text","text":"hi"}]}]),
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"hi","extra":1}]}]),
+        serde_json::json!([{"type":"message","role":"user","content":[{"type":"input_image","image_url":"https://example.test/image"}]}]),
+        serde_json::json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi","extra":1}]}]),
+        serde_json::json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi","logprobs":[{"token":"hi"}]}]}]),
+        serde_json::json!([{"type":"reasoning","content":[{"type":"reasoning_text","text":"private"}],"encrypted_content":"opaque"}]),
+        serde_json::json!([{"type":"function_call","call_id":"c","name":"f","namespace":"foreign","arguments":"{}"}]),
+        serde_json::json!([{"type":"function_call_output","call_id":"c","output":[{"type":"input_text","text":"hi"}]}]),
+        serde_json::json!([{"type":"custom_tool_call_output","call_id":"c","output":"hi"}]),
+    ];
+    for input in inputs {
+        let request: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": PROFILE.model(),
+            "input": input
+        }))
+        .unwrap();
+        assert!(matches!(
+            validate_rehydration_request(&context(), &request),
+            Err(ExecutorError::ReasoningReplay(
+                ReasoningReplayError::UnsupportedParameter(
+                    crate::types::reasoning_profile::OpaqueReplayRequestField::Input
+                )
+            ))
+        ));
+    }
+}
+
+#[test]
+fn direct_core_calls_obey_the_same_profile_item_caps_as_wire_requests() {
+    use crate::types::io::{InputContent, InputMessage, InputMessageContent, InputTextContent};
+    use crate::types::reasoning_profile::{
+        MAX_OPAQUE_CONTENT_PARTS, MAX_OPAQUE_INPUT_ITEMS, MAX_OPAQUE_REASONING_SUMMARIES, MAX_OPAQUE_TOOLS,
+    };
+
+    let assert_field = |request: &RequestPayload, field| {
+        assert!(matches!(
+            validate_rehydration_request(&context(), request),
+            Err(ExecutorError::ReasoningReplay(ReasoningReplayError::UnsupportedParameter(actual))) if actual == field
+        ));
+    };
+
+    let mut oversized = request();
+    let message = InputItem::Message(InputMessage::new("user", InputMessageContent::Text("x".to_owned())));
+    oversized.input = ResponsesInput::Items(vec![message; MAX_OPAQUE_INPUT_ITEMS + 1]);
+    assert_field(
+        &oversized,
+        crate::types::reasoning_profile::OpaqueReplayRequestField::Input,
+    );
+
+    let mut oversized = request();
+    let part = InputContent::InputText(InputTextContent::new("x"));
+    oversized.input = ResponsesInput::Items(vec![InputItem::Message(InputMessage::new(
+        "user",
+        InputMessageContent::Parts(vec![part; MAX_OPAQUE_CONTENT_PARTS + 1]),
+    ))]);
+    assert_field(
+        &oversized,
+        crate::types::reasoning_profile::OpaqueReplayRequestField::Input,
+    );
+
+    let mut oversized = request();
+    let mut reasoning = ReasoningOutput::new("rs_1");
+    reasoning.summary =
+        vec![crate::types::io::ReasoningSummaryContent::new("brief"); MAX_OPAQUE_REASONING_SUMMARIES + 1];
+    oversized.input = ResponsesInput::Items(vec![InputItem::Reasoning(reasoning)]);
+    assert_field(
+        &oversized,
+        crate::types::reasoning_profile::OpaqueReplayRequestField::Input,
+    );
+
+    let mut oversized = request();
+    let tool = serde_json::from_value(serde_json::json!({"type":"function","name":"lookup"})).unwrap();
+    oversized.tools = Some(vec![tool; MAX_OPAQUE_TOOLS + 1]);
+    assert_field(
+        &oversized,
+        crate::types::reasoning_profile::OpaqueReplayRequestField::Tools,
+    );
+}
+
+#[test]
 fn target_requires_exact_endpoint_model_and_effective_credential() {
     for endpoint in [
         "http://api.openai.com/v1/responses",

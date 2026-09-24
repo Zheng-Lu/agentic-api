@@ -7,6 +7,15 @@ use serde::{Deserialize, Serialize};
 
 use super::reasoning_replay::ReasoningReplayError;
 
+/// Maximum client-supplied or rehydrated input items for the pinned opaque profile.
+pub const MAX_OPAQUE_INPUT_ITEMS: usize = 32_768;
+/// Maximum content parts in one message for the pinned opaque profile.
+pub const MAX_OPAQUE_CONTENT_PARTS: usize = 1_024;
+/// Maximum reasoning summaries in one item for the pinned opaque profile.
+pub const MAX_OPAQUE_REASONING_SUMMARIES: usize = 1_024;
+/// Maximum declared tools for the pinned opaque profile.
+pub const MAX_OPAQUE_TOOLS: usize = 256;
+
 /// Request field outside the qualified surface of a pinned opaque profile.
 ///
 /// This is an internal validation name, never a caller-provided string.

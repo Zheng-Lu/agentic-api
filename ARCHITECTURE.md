@@ -613,8 +613,14 @@ The server's profile-only HTTP/WebSocket wire guard rejects unknown or duplicate
 top-level fields and unknown reasoning settings before the normal typed request
 decode can discard them. The HTTP handler always routes a selected opaque profile
 through the executor, including `store: false`; the ordinary vLLM proxy path is
-unchanged. Nested item and tool fields remain unqualified and the profile gate
-stays closed.
+unchanged. Closed, bounded nested wire sentinels reject unknown or duplicate fields
+inside the candidate's admitted item, content, tool, and tool-choice shapes; open
+JSON Schema and MCP-header documents reject duplicate keys without constraining
+their vocabularies. Core preflight independently enforces the typed input surface
+for programmatic callers and rehydrated history. Other wire shapes remain
+unqualified and the profile gate stays closed. The WebSocket guard runs before
+extracting stream or previous-response IDs; rejected wire shapes cannot select
+a lane or evict a cached checkpoint through ambiguous metadata.
 
 Assistant `MessagePhase` is a bounded optional enum in the message types, retained by
 the existing authoritative typed completion and output-to-input conversion. Storage

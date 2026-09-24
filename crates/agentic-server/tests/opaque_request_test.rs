@@ -21,6 +21,13 @@ async fn selected_profile_rejects_unknown_wire_fields_before_routing() {
         r#"{"model":"gpt-5.4-2026-03-05","input":"hi","store":false,"unknown":true}"#,
         r#"{"model":"gpt-5.4-2026-03-05","input":"hi","store":false,"unknown":true,"unknown":false}"#,
         r#"{"model":"gpt-5.4-2026-03-05","input":"hi","store":false,"reasoning":{"effort":"low","unknown":true}}"#,
+        r#"{"model":"gpt-5.4-2026-03-05","input":[{"type":"message","role":"user","content":"hi","unknown":true}],"store":false}"#,
+        r#"{"model":"gpt-5.4-2026-03-05","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi","unknown":true}]}],"store":false}"#,
+        r#"{"model":"gpt-5.4-2026-03-05","input":[{"type":"function_call_output","call_id":"c","output":"ok","unknown":true}],"store":false}"#,
+        r#"{"model":"gpt-5.4-2026-03-05","input":"hi","tools":[{"type":"function","name":"lookup","unknown":true}],"store":false}"#,
+        r#"{"model":"gpt-5.4-2026-03-05","input":"hi","tools":[{"type":"function","name":"lookup","parameters":{"type":"object","type":"array"}}],"store":false}"#,
+        r#"{"model":"gpt-5.4-2026-03-05","input":"hi","tools":[{"type":"mcp","server_label":"local","require_approval":"never","unknown":true}],"store":false}"#,
+        r#"{"model":"gpt-5.4-2026-03-05","input":"hi","tool_choice":{"type":"function","name":"lookup","unknown":true},"store":false}"#,
     ] {
         let response = client
             .post(format!("{gateway_url}/v1/responses"))
