@@ -1,10 +1,9 @@
-use serde::Deserialize;
 use serde_json::Value;
 
 use super::types::{EventFrame, EventPayload, SSEEventType, SSEItemType, ShellCommandUpdate, WireEvent};
 use super::{ClassifiedSseLine, SseLine};
 use crate::types::io::OutputItem;
-use crate::types::upstream_identity::{UpstreamModelError, UpstreamResponseIdentity};
+use crate::types::upstream_identity::UpstreamResponseIdentity;
 use crate::utils::common::{deserialize_from_str_opt, deserialize_from_value_opt};
 
 /// Normalize a raw SSE data line into a typed [`EventFrame`].
@@ -25,8 +24,6 @@ pub fn normalize_sse_line(line: &str) -> Option<EventFrame> {
 pub(crate) enum NormalizationError {
     #[error("upstream stream has an invalid 'output_index': expected an unsigned 32-bit integer")]
     InvalidOutputIndex,
-    #[error(transparent)]
-    Model(#[from] UpstreamModelError),
 }
 
 /// Shares normalization with the public adapter while preserving invalid-index
@@ -77,7 +74,7 @@ fn extract_payload(event_type: SSEEventType, json: &Value) -> Result<EventPayloa
         | SSEEventType::ResponseInProgress
         | SSEEventType::ResponseCompleted
         | SSEEventType::ResponseFailed
-        | SSEEventType::ResponseIncomplete => return extract_response_payload(json),
+        | SSEEventType::ResponseIncomplete => return Ok(extract_response_payload(json)),
 
         SSEEventType::OutputItemAdded => extract_output_item_added(json),
         SSEEventType::OutputItemDone => extract_output_item_done(json),
@@ -146,25 +143,24 @@ fn json_u32(json: &Value, key: &str) -> u32 {
     u32::try_from(json[key].as_u64().unwrap_or(0)).unwrap_or(u32::MAX)
 }
 
-fn extract_response_payload(json: &Value) -> Result<EventPayload, NormalizationError> {
+fn extract_response_payload(json: &Value) -> EventPayload {
     let response = &json["response"];
     // A missing response object remains the existing lifecycle validator's concern.
-    let model = if response.is_object() {
-        UpstreamResponseIdentity::deserialize(response)
-            .map_err(|_| UpstreamModelError::Invalid)?
-            .model
+    let identity = if response.is_object() {
+        UpstreamResponseIdentity::observe(response)
     } else {
-        None
+        UpstreamResponseIdentity::observe(&Value::Null)
     };
-    Ok(EventPayload::Response {
+    EventPayload::Response {
         id: json_str(response, "id"),
         status: json_str(response, "status"),
         usage: response
             .get("usage")
             .filter(|v| !v.is_null())
             .and_then(|v| deserialize_from_value_opt(v.clone())),
-        model,
-    })
+        model: identity.model,
+        model_invalid: identity.invalid_model,
+    }
 }
 
 fn extract_output_item_added(json: &Value) -> EventPayload {

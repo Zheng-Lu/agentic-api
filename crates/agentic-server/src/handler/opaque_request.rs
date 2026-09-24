@@ -10,6 +10,7 @@ use serde_json::Deserializer;
 
 use agentic_core::types::reasoning_profile::MAX_OPAQUE_TOOLS;
 use agentic_core::types::reasoning_replay::ReasoningReplayError;
+use agentic_core::types::request_response::REQUEST_PAYLOAD_FIELDS;
 
 mod nested;
 use nested::{BoundedSequence, ClosedInput, ClosedTool, ClosedToolChoice};
@@ -21,30 +22,8 @@ pub(super) enum OpaqueRequestTransport {
     WebSocket,
 }
 
-const REQUEST_FIELDS: &[&str] = &[
-    "model",
-    "input",
-    "instructions",
-    "previous_response_id",
-    "conversation_id",
-    "tools",
-    "tool_choice",
-    "stream",
-    "store",
-    "include",
-    "reasoning",
-    "text",
-    "temperature",
-    "top_p",
-    "max_output_tokens",
-    "ignore_eos",
-    "truncation",
-    "metadata",
-    "parallel_tool_calls",
-    "cache_salt",
-    "context_management",
-];
 const WEBSOCKET_FIELDS: &[&str] = &["type", "stream_id", "generate"];
+const _: () = assert!(REQUEST_PAYLOAD_FIELDS.len() + WEBSOCKET_FIELDS.len() <= u32::BITS as usize);
 
 /// Reject unknown and duplicate top-level keys before `RequestPayload` drops them.
 /// The body/frame byte limits are enforced by the transport before this scan.
@@ -89,7 +68,7 @@ impl<'de> Visitor<'de> for RequestFields {
     fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
         let mut seen = 0_u32;
         while let Some(key) = map.next_key::<String>()? {
-            let index = REQUEST_FIELDS
+            let index = REQUEST_PAYLOAD_FIELDS
                 .iter()
                 .position(|field| *field == key)
                 .or_else(|| match self.0 {
@@ -97,7 +76,7 @@ impl<'de> Visitor<'de> for RequestFields {
                     OpaqueRequestTransport::WebSocket => WEBSOCKET_FIELDS
                         .iter()
                         .position(|field| *field == key)
-                        .map(|index| REQUEST_FIELDS.len() + index),
+                        .map(|index| REQUEST_PAYLOAD_FIELDS.len() + index),
                 });
             let Some(index) = index else {
                 return Err(serde::de::Error::custom("unsupported request field"));
@@ -151,6 +130,13 @@ mod tests {
         ] {
             assert!(validate(request, Transport::Http).is_err());
         }
+    }
+
+    #[test]
+    fn prompt_cache_key_reaches_typed_preflight_in_http_and_websocket() {
+        let request = br#"{"model":"m","input":"hi","prompt_cache_key":"workspace-a"}"#;
+        assert!(validate(request, Transport::Http).is_ok());
+        assert!(validate(request, Transport::WebSocket).is_ok());
     }
 
     #[test]

@@ -594,12 +594,13 @@ async fn response_rehydration_rejects_invalid_or_missing_history() -> Result<(),
         .await?;
     let item_id = store.get("resp_corrupt").await?.history_item_ids.remove(0);
 
-    // Formerly accepted untyped reasoning must fail closed, not disappear from history.
+    // A malformed current row carrying provenance must fail closed. NULL-provenance
+    // pre-0006 rows use the bounded legacy compatibility projection instead.
     let malformed = serde_json::json!({
         "type": "reasoning", "id": "rs_1", "encrypted_content": {"ciphertext": "sensitive-state"}
     })
     .to_string();
-    sqlx::query("UPDATE items SET data = $1 WHERE id = $2")
+    sqlx::query("UPDATE items SET data = $1, reasoning_provenance = '{}' WHERE id = $2")
         .bind(malformed)
         .bind(&item_id)
         .execute(pool.as_ref())
@@ -635,7 +636,7 @@ async fn conversation_rehydration_rejects_invalid_reasoning() -> Result<(), Box<
         "type": "reasoning", "id": "rs_1", "summary": [{"text": "sensitive-state"}]
     })
     .to_string();
-    sqlx::query("UPDATE items SET data = $1 WHERE conversation_id = $2")
+    sqlx::query("UPDATE items SET data = $1, reasoning_provenance = '{}' WHERE conversation_id = $2")
         .bind(malformed)
         .bind(&conversation.conversation_id)
         .execute(pool.as_ref())

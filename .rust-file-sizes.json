@@ -1,7 +1,7 @@
 {
   "version": 1,
   "baseline": {
-    "crates/agentic-server-core/src/executor/accumulator/mod.rs": 631,
+    "crates/agentic-server-core/src/executor/accumulator/mod.rs": 617,
     "crates/agentic-server-core/src/executor/engine.rs": 569,
     "crates/agentic-server-core/src/executor/gateway.rs": 653,
     "crates/agentic-server-core/src/executor/messages_stream.rs": 501,

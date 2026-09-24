@@ -85,8 +85,9 @@ pub enum ReasoningReplayError {
 
 /// Fixed-size fingerprint of the effective upstream routing and model identity.
 ///
-/// The executor binds policy, endpoint, effective bearer credential, requested model,
-/// and optional model reported consistently by explicit upstream terminal metadata.
+/// The executor binds policy, endpoint, requested model, and optional model reported
+/// consistently by explicit upstream terminal metadata. Opaque replay additionally
+/// binds the effective bearer credential; plaintext replay does not.
 /// This is not an authentication credential or a cross-provider compatibility claim.
 /// No original identity components are retained here.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

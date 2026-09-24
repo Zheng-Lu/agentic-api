@@ -22,6 +22,14 @@ async fn sqlite_upgrade_preserves_legacy_data_and_repeated_startup() {
         .execute(pool.as_ref())
         .await
         .unwrap();
+    let legacy = r#"{"type":"reasoning","id":"rs_old","content":[{"type":"legacy_text","text":"keep this"}],"summary":[{"type":"other","text":"old"}],"encrypted_content":{"provider":"old"},"status":"legacy_status"}"#;
+    sqlx::query("INSERT INTO items (id, data, created_at) VALUES ($1, $2, $3)")
+        .bind("item_old_shape")
+        .bind(legacy)
+        .bind(2_i64)
+        .execute(pool.as_ref())
+        .await
+        .unwrap();
     for _ in 0..2 {
         SchemaManager::new(&pool).run_migrations().await.unwrap();
         let item: Item = sqlx::query_as("SELECT * FROM items WHERE id = $1")
@@ -35,6 +43,24 @@ async fn sqlite_upgrade_preserves_legacy_data_and_repeated_startup() {
             item.as_inout().unwrap().reasoning_provenance().is_none(),
             "JSON cannot backfill provenance"
         );
+        let old_shape: Item = sqlx::query_as("SELECT * FROM items WHERE id = $1")
+            .bind("item_old_shape")
+            .fetch_one(pool.as_ref())
+            .await
+            .unwrap();
+        let item = old_shape.as_inout().expect("legacy reasoning remains readable");
+        assert!(item.reasoning_provenance().is_none());
+        let serialized = match item {
+            agentic_core::storage::InOutItem::Output(output) => serde_json::to_value(output).unwrap(),
+            agentic_core::storage::InOutItem::Input(input) => serde_json::to_value(input).unwrap(),
+        };
+        assert_eq!(serialized["content"][0]["text"], "keep this");
+        assert_eq!(serialized["content"][0]["type"], "reasoning_text");
+        let continuation = agentic_core::storage::InOutItem::into_input_items(vec![
+            old_shape.as_inout().expect("legacy continuation item"),
+        ]);
+        assert_eq!(continuation.len(), 1);
+        assert!(matches!(continuation[0], agentic_core::types::InputItem::Reasoning(_)));
     }
     let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
         .fetch_all(pool.as_ref())

@@ -10,8 +10,6 @@ use agentic_core::storage::InOutItem;
 use agentic_core::types::InputItem;
 use agentic_core::types::reasoning_replay::ReasoningProvenance;
 use agentic_core::types::upstream_identity::UpstreamModelError;
-use either::Either;
-use futures::StreamExt;
 use serde_json::{Value, json};
 
 fn cassette(streaming: bool) -> support::Cassette {
@@ -165,57 +163,22 @@ async fn recorded_gateway_alias_rewrite_is_unknown_in_lenient_and_rejected_in_st
 }
 
 #[tokio::test]
-async fn malformed_model_metadata_fails_before_persistence_in_both_body_formats() {
+async fn malformed_model_metadata_persists_unknown_evidence_in_both_body_formats() {
     let json = cassette(false);
     let sse = cassette(true);
     let fixture = support::TestFixture::new_with_responses(vec![
         fault_injected_response(&json.turns[0], Some(&json!({"sensitive":"invalid"})), false),
+        fault_injected_response(&json.turns[0], None, false),
         fault_injected_response(&sse.turns[0], Some(&json!({"sensitive":"invalid"})), true),
+        fault_injected_response(&sse.turns[0], None, false),
     ])
     .await;
-    let result = ExecuteRequest::new(
-        support::make_request("HELLO", true, false, None, None),
-        Arc::clone(&fixture.exec_ctx),
-    )
-    .run()
-    .await;
-    assert!(matches!(
-        result,
-        Err(ExecutorError::UpstreamModel(UpstreamModelError::Invalid))
-    ));
-
-    let result = ExecuteRequest::new(
-        support::make_request("HELLO", true, true, None, None),
-        Arc::clone(&fixture.exec_ctx),
-    )
-    .run()
-    .await
-    .unwrap();
-    let Either::Right(mut stream) = result else {
-        panic!("stream expected")
-    };
-    let mut response_id = None;
-    let mut failed = false;
-    while let Some(chunk) = stream.next().await {
-        assert!(!chunk.contains("sensitive"));
-        if let Some(event) = support::streamed_sse_event(&chunk) {
-            assert_ne!(event["type"], "response.completed");
-            if event["type"] == "response.created" {
-                response_id = event["response"]["id"].as_str().map(str::to_owned);
-            }
-            if event["type"] == "error" {
-                failed = true;
-            }
-        }
-    }
-    assert!(failed);
-    let response_id = response_id.expect("created arrived before the invalid terminal metadata");
-    let error = rehydrate_conversation(
-        support::make_request("continue", true, false, Some(response_id), None),
-        &fixture.exec_ctx,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.http_status(), http::StatusCode::NOT_FOUND);
-    assert_eq!(fixture.request_bodies().await.len(), 2);
+    let invalid_json = execute_and_read_provenance(&fixture, false).await;
+    let missing_json = execute_and_read_provenance(&fixture, false).await;
+    let invalid_sse = execute_and_read_provenance(&fixture, true).await;
+    let missing_sse = execute_and_read_provenance(&fixture, true).await;
+    assert_eq!(invalid_json, missing_json);
+    assert_eq!(invalid_sse, missing_sse);
+    assert_eq!(invalid_json, invalid_sse);
+    assert_eq!(fixture.request_bodies().await.len(), 4);
 }

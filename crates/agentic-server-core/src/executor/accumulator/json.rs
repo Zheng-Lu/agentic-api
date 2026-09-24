@@ -40,12 +40,16 @@ impl ResponseAccumulator {
         if validation == Validation::Strict {
             ensure_strict_response(&json)?;
         }
-        let identity = UpstreamResponseIdentity::deserialize(&json).map_err(|_| UpstreamModelError::Invalid)?;
+        let identity = UpstreamResponseIdentity::observe(&json);
+        if identity.invalid_model && validation == Validation::Strict {
+            return Err(UpstreamModelError::Invalid.into());
+        }
         let response_id = json["id"]
             .as_str()
             .ok_or_else(|| ExecutorError::ParseError("missing 'id' field in response".into()))?
             .to_owned();
         let mut acc = Self::with_validation(response_id, conversation_id, validation);
+        acc.model_evidence_invalidated = identity.invalid_model;
         acc.terminal_model_reported =
             identity.model.is_some() && matches!(json["status"].as_str(), Some("completed" | "failed" | "incomplete"));
         acc.upstream_model = identity.model;

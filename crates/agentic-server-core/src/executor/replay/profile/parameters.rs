@@ -26,6 +26,7 @@ pub(in crate::executor::replay) fn validate(
 }
 
 fn validate_gpt54(request: &RequestPayload) -> Result<(), ReasoningReplayError> {
+    cover_request_fields(request);
     if !supported_input(&request.input) {
         return Err(unsupported(Field::Input));
     }
@@ -46,6 +47,38 @@ fn validate_gpt54(request: &RequestPayload) -> Result<(), ReasoningReplayError> 
             return Err(unsupported(Field::ReasoningSummary));
         }
     }
+    validate_gpt54_optional_fields(request)
+}
+
+fn cover_request_fields(request: &RequestPayload) {
+    // An added typed request field must be explicitly reviewed for this closed profile.
+    let RequestPayload {
+        model: _,
+        input: _,
+        instructions: _,
+        previous_response_id: _,
+        conversation_id: _,
+        tools: _,
+        tool_choice: _,
+        stream: _,
+        store: _,
+        include: _,
+        reasoning: _,
+        text: _,
+        temperature: _,
+        top_p: _,
+        max_output_tokens: _,
+        ignore_eos: _,
+        truncation: _,
+        metadata: _,
+        parallel_tool_calls: _,
+        prompt_cache_key: _,
+        cache_salt: _,
+        context_management: _,
+    } = request;
+}
+
+fn validate_gpt54_optional_fields(request: &RequestPayload) -> Result<(), ReasoningReplayError> {
     if request
         .include
         .as_ref()
@@ -79,6 +112,9 @@ fn validate_gpt54(request: &RequestPayload) -> Result<(), ReasoningReplayError> 
     }
     if request.parallel_tool_calls == Some(true) {
         return Err(unsupported(Field::ParallelToolCalls));
+    }
+    if request.prompt_cache_key.is_some() {
+        return Err(unsupported(Field::PromptCacheKey));
     }
     if request.cache_salt.is_some() {
         return Err(unsupported(Field::CacheSalt));

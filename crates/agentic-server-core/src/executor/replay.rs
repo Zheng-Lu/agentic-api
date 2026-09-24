@@ -105,7 +105,7 @@ pub(super) fn prepare_initial_reasoning(
 
 /// Bind exact routing inputs and both model identities without retaining secrets.
 /// Nested, fixed-width hashes make field boundaries unambiguous without allocations.
-/// Missing auth is distinct from an explicitly supplied empty bearer credential.
+/// Only opaque replay binds the credential; plaintext replay survives key rotation.
 pub(super) fn upstream_identity(
     policy: ReasoningReplayPolicy,
     endpoint: &str,
@@ -120,8 +120,10 @@ pub(super) fn upstream_identity(
         ReasoningReplayPolicy::OpaqueResponses => 1,
     }]);
     digest.update(Sha256::digest(endpoint.as_bytes()));
-    digest.update([u8::from(auth.is_some())]);
-    digest.update(Sha256::digest(auth.unwrap_or_default().as_bytes()));
+    if policy == ReasoningReplayPolicy::OpaqueResponses {
+        digest.update([u8::from(auth.is_some())]);
+        digest.update(Sha256::digest(auth.unwrap_or_default().as_bytes()));
+    }
     digest.update(Sha256::digest(requested_model.as_bytes()));
     digest.update([u8::from(reported_model.is_some())]);
     digest.update(Sha256::digest(reported_model.unwrap_or_default().as_bytes()));

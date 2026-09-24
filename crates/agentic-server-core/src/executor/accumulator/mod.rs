@@ -29,7 +29,9 @@ use crate::utils::uuid7_str;
 mod active;
 mod active_text;
 mod identity;
-use identity::{invalid_lifecycle, invalid_lifecycle_or_id, invalid_stream, item_identity, output_item_call_id};
+use identity::{
+    CallIdObservation, invalid_lifecycle, invalid_lifecycle_or_id, invalid_stream, item_identity, output_item_call_id,
+};
 mod completion;
 mod details;
 mod json;
@@ -44,25 +46,6 @@ use slot::{OutputIndex, SlotMap, SlotState};
 pub(super) enum Validation {
     Strict,
     Lenient,
-}
-
-#[derive(Debug, Default)]
-struct CallIdObservation {
-    first: Option<String>,
-    changed: bool,
-}
-
-impl CallIdObservation {
-    fn observe(&mut self, call_id: Option<&str>) {
-        let Some(call_id) = call_id.filter(|call_id| !call_id.is_empty()) else {
-            return;
-        };
-        match self.first.as_deref() {
-            Some(first) if first != call_id => self.changed = true,
-            None => self.first = Some(call_id.to_owned()),
-            Some(_) => {}
-        }
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -276,7 +259,6 @@ impl ResponseAccumulator {
             return Ok(None);
         };
         let Some(frame) = normalize_sse_data_checked(&data).map_err(|error| match error {
-            crate::events::normalize::NormalizationError::Model(error) => ExecutorError::UpstreamModel(error),
             error @ crate::events::normalize::NormalizationError::InvalidOutputIndex => {
                 invalid_stream(error.to_string())
             }
@@ -305,9 +287,13 @@ impl ResponseAccumulator {
             }
             Validation::Lenient => None,
         };
-        if let EventPayload::Response { model, .. } = &frame.payload {
-            self.observe_upstream_model(
+        if let EventPayload::Response {
+            model, model_invalid, ..
+        } = &frame.payload
+        {
+            self.observe_response_model(
                 model.as_ref(),
+                *model_invalid,
                 matches!(
                     frame.event_type,
                     SSEEventType::ResponseCompleted | SSEEventType::ResponseFailed | SSEEventType::ResponseIncomplete

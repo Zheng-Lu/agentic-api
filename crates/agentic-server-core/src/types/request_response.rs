@@ -224,6 +224,33 @@ pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
     pub context_management: Option<Vec<ContextManagement>>,
 }
 
+/// Typed request keys accepted by the closed opaque-profile wire guard.
+/// Keep this list in sync with the exhaustive profile preflight destructure.
+pub const REQUEST_PAYLOAD_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "instructions",
+    "previous_response_id",
+    "conversation_id",
+    "tools",
+    "tool_choice",
+    "stream",
+    "store",
+    "include",
+    "reasoning",
+    "text",
+    "temperature",
+    "top_p",
+    "max_output_tokens",
+    "ignore_eos",
+    "truncation",
+    "metadata",
+    "parallel_tool_calls",
+    "prompt_cache_key",
+    "cache_salt",
+    "context_management",
+];
+
 impl<T: ?Sized> RequestPayload<T> {
     /// Names the feature in this request that only the in-process executor
     /// implements, if any — neither the passthrough proxy nor split execution

@@ -6,6 +6,21 @@ use crate::executor::response_budget::RETAINED_CONTAINER_OVERHEAD_BYTES;
 use crate::types::upstream_identity::{UpstreamModelError, UpstreamModelId};
 
 impl ResponseAccumulator {
+    pub(super) fn observe_response_model(
+        &mut self,
+        model: Option<&UpstreamModelId>,
+        invalid: bool,
+        terminal: bool,
+    ) -> ExecutorResult<()> {
+        if invalid {
+            if self.validation == Validation::Strict {
+                return Err(UpstreamModelError::Invalid.into());
+            }
+            self.model_evidence_invalidated = true;
+        }
+        self.observe_upstream_model(model, terminal)
+    }
+
     pub(super) fn observe_upstream_model(
         &mut self,
         model: Option<&UpstreamModelId>,

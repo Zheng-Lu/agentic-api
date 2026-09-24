@@ -131,13 +131,15 @@ fn malformed_metadata_fails_closed_and_conflicts_follow_validation_policy() {
             json!("sensitive".repeat(MAX_UPSTREAM_MODEL_BYTES)),
         ] {
             let mut json = round(validation, None);
-            assert_invalid(
-                &json
-                    .load_json_body(
-                        &json!({"id":"upstream","status":"completed","model":model,"output":[]}).to_string(),
-                    )
-                    .unwrap_err(),
-            );
+            let result = json
+                .load_json_body(&json!({"id":"upstream","status":"completed","model":model,"output":[]}).to_string());
+            match validation {
+                Validation::Strict => assert_invalid(&result.unwrap_err()),
+                Validation::Lenient => {
+                    result.unwrap();
+                    assert!(json.finish("requested", None, None).unwrap().upstream_model.is_none());
+                }
+            }
             for kind in ["created", "in_progress", "completed"] {
                 let mut stream = round(validation, None);
                 if kind != "created" {
@@ -146,7 +148,16 @@ fn malformed_metadata_fails_closed_and_conflicts_follow_validation_policy() {
                 if kind == "completed" {
                     push(&mut stream, "in_progress", None).unwrap();
                 }
-                assert_invalid(&push(&mut stream, kind, Some(model.clone())).unwrap_err());
+                let result = push(&mut stream, kind, Some(model.clone()));
+                match validation {
+                    Validation::Strict => assert_invalid(&result.unwrap_err()),
+                    Validation::Lenient => {
+                        result.unwrap();
+                        if kind == "completed" {
+                            assert!(stream.finish("requested", None, None).unwrap().upstream_model.is_none());
+                        }
+                    }
+                }
             }
         }
         for kind in ["in_progress", "completed", "failed", "incomplete"] {

@@ -76,6 +76,20 @@ fn pinned_request_surface_accepts_recorded_settings_without_opening_the_gate() {
 }
 
 #[test]
+fn prompt_cache_key_is_rejected_by_typed_opaque_preflight() {
+    let mut request = request();
+    request.prompt_cache_key = Some("workspace-a".to_owned());
+    assert!(matches!(
+        validate_rehydration_request(&context(), &request),
+        Err(ExecutorError::ReasoningReplay(
+            ReasoningReplayError::UnsupportedParameter(
+                crate::types::reasoning_profile::OpaqueReplayRequestField::PromptCacheKey
+            )
+        ))
+    ));
+}
+
+#[test]
 fn unknown_input_item_is_rejected_before_the_closed_profile_gate() {
     let request: RequestPayload = serde_json::from_value(serde_json::json!({
         "model": PROFILE.model(),

@@ -3,6 +3,7 @@
 mod insert;
 pub(crate) use insert::InsertItem;
 mod conversation;
+mod legacy_reasoning;
 pub use conversation::{detach_from_conversation_in_tx, get_for_conversation, list_for_conversation};
 
 use serde_json::Value;
@@ -60,7 +61,10 @@ impl Item {
     /// Deserialize data column as `InputItem`.
     #[must_use]
     pub fn as_input(&self) -> Option<InputItem> {
-        let mut item = serde_json::from_value(self.data_without_storage_marker()?).ok()?;
+        let data = self.data_without_storage_marker()?;
+        let mut item = serde_json::from_value(data.clone())
+            .ok()
+            .or_else(|| self.legacy_reasoning(&data).map(InputItem::Reasoning))?;
         self.restore_provenance(match &mut item {
             InputItem::Reasoning(reasoning) => Some(reasoning),
             _ => None,
@@ -71,7 +75,10 @@ impl Item {
     /// Deserialize data column as `OutputItem`.
     #[must_use]
     pub fn as_output(&self) -> Option<OutputItem> {
-        let mut item = serde_json::from_value(self.data_without_storage_marker()?).ok()?;
+        let data = self.data_without_storage_marker()?;
+        let mut item = serde_json::from_value(data.clone())
+            .ok()
+            .or_else(|| self.legacy_reasoning(&data).map(OutputItem::Reasoning))?;
         self.restore_provenance(match &mut item {
             OutputItem::Reasoning(reasoning) => Some(reasoning),
             _ => None,

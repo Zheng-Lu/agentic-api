@@ -3,6 +3,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Deserializer};
+use serde_json::Value;
 use thiserror::Error;
 
 use super::request_response::ResponsePayload;
@@ -57,10 +58,34 @@ pub enum UpstreamModelError {
 }
 
 /// Shared typed projection of JSON bodies and SSE response lifecycle objects.
-#[derive(Deserialize)]
 pub(crate) struct UpstreamResponseIdentity {
-    #[serde(default)]
     pub(crate) model: Option<UpstreamModelId>,
+    pub(crate) invalid_model: bool,
+}
+
+impl UpstreamResponseIdentity {
+    pub(crate) fn observe(response: &Value) -> Self {
+        match response.get("model") {
+            None | Some(Value::Null) => Self {
+                model: None,
+                invalid_model: false,
+            },
+            Some(Value::String(model)) => match UpstreamModelId::new(model.clone()) {
+                Ok(model) => Self {
+                    model: Some(model),
+                    invalid_model: false,
+                },
+                Err(_) => Self {
+                    model: None,
+                    invalid_model: true,
+                },
+            },
+            Some(_) => Self {
+                model: None,
+                invalid_model: true,
+            },
+        }
+    }
 }
 
 /// The consuming ingestion result; evidence is never serialized into public JSON.

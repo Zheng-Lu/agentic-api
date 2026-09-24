@@ -145,6 +145,35 @@ fn lifecycle_accumulator(strict: bool) -> ResponseAccumulator {
 }
 
 #[test]
+fn invalid_reported_model_respects_json_validation_policy() {
+    use serde_json::json;
+
+    for invalid in [json!(42), json!("  "), json!("x".repeat(1025))] {
+        let body = json!({"id":"resp_1","status":"completed","output":[],"model":invalid}).to_string();
+        let mut lenient = ResponseAccumulator::read_json(&body, None, Validation::Lenient).unwrap();
+        assert!(lenient.take_upstream_model().is_none());
+        assert!(ResponseAccumulator::read_json(&body, None, Validation::Strict).is_err());
+    }
+}
+
+#[test]
+fn invalid_reported_model_respects_sse_validation_policy_without_losing_terminal_event() {
+    use serde_json::json;
+
+    let created =
+        json!({"type":"response.created","response":{"id":"resp_1","status":"in_progress","model":"snapshot"}});
+    let terminal = json!({"type":"response.completed","response":{"id":"resp_1","status":"completed","model":42}});
+    let mut lenient = ResponseAccumulator::with_validation("resp_1".to_owned(), None, Validation::Lenient);
+    push_lifecycle_event(&mut lenient, &created, false).unwrap();
+    assert!(push_lifecycle_event(&mut lenient, &terminal, false).unwrap().is_some());
+    assert!(lenient.take_upstream_model().is_none());
+
+    let mut strict = ResponseAccumulator::with_validation("resp_1".to_owned(), None, Validation::Strict);
+    push_lifecycle_event(&mut strict, &created, true).unwrap();
+    assert!(push_lifecycle_event(&mut strict, &terminal, true).is_err());
+}
+
+#[test]
 fn completed_slots_cannot_be_reopened_by_id_or_index() {
     use serde_json::json;
 
@@ -378,6 +407,7 @@ fn test_process_event_response_created_sets_id() {
         event_type: SSEEventType::ResponseCreated,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: "resp_new".into(),
             status: "in_progress".into(),
             usage: None,
@@ -395,6 +425,7 @@ fn test_process_event_response_created_empty_id_no_overwrite() {
         event_type: SSEEventType::ResponseCreated,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: String::new(),
             status: "in_progress".into(),
             usage: None,
@@ -412,6 +443,7 @@ fn test_empty_id_response_created_allows_subsequent_created() {
         event_type: SSEEventType::ResponseCreated,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: String::new(),
             status: "in_progress".into(),
             usage: None,
@@ -426,6 +458,7 @@ fn test_empty_id_response_created_allows_subsequent_created() {
         event_type: SSEEventType::ResponseCreated,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: "resp_real".into(),
             status: "in_progress".into(),
             usage: None,
@@ -480,6 +513,7 @@ fn test_process_event_text_delta_accumulates() {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
@@ -914,6 +948,7 @@ fn test_process_event_completed_with_usage() {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: Some(ResponseUsage {
@@ -938,6 +973,7 @@ fn test_process_event_failed_sets_error_status() {
         event_type: SSEEventType::ResponseFailed,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: "resp_1".into(),
             status: "failed".into(),
             usage: None,
@@ -954,6 +990,7 @@ fn test_process_event_incomplete_sets_incomplete_status() {
         event_type: SSEEventType::ResponseIncomplete,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: "resp_1".into(),
             status: "incomplete".into(),
             usage: None,
@@ -1380,6 +1417,7 @@ fn test_function_call_accumulation_basic() {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
@@ -1509,6 +1547,7 @@ fn test_function_call_multiple_parallel() {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
@@ -1578,6 +1617,7 @@ fn test_function_call_interleaved_with_message() {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
@@ -1776,6 +1816,7 @@ fn test_function_call_finalized_on_response_completed() {
         event_type: SSEEventType::ResponseCompleted,
         payload: EventPayload::Response {
             model: None,
+            model_invalid: false,
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,

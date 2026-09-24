@@ -2,7 +2,7 @@ use super::*;
 use crate::types::io::ReasoningOutput;
 
 #[test]
-fn identities_bind_policy_endpoint_effective_auth_and_both_models() {
+fn identities_bind_policy_endpoint_and_both_models_without_plaintext_auth() {
     let baseline = upstream_identity(
         ReasoningReplayPolicy::VllmPlaintext,
         "https://provider/v1/responses",
@@ -38,20 +38,6 @@ fn identities_bind_policy_endpoint_effective_auth_and_both_models() {
         upstream_identity(
             ReasoningReplayPolicy::VllmPlaintext,
             "https://provider/v1/responses",
-            Some("other"),
-            "alias",
-            Some("snapshot"),
-        ),
-        upstream_identity(
-            ReasoningReplayPolicy::VllmPlaintext,
-            "https://provider/v1/responses",
-            None,
-            "alias",
-            Some("snapshot"),
-        ),
-        upstream_identity(
-            ReasoningReplayPolicy::VllmPlaintext,
-            "https://provider/v1/responses",
             Some("secret"),
             "other",
             Some("snapshot"),
@@ -66,6 +52,18 @@ fn identities_bind_policy_endpoint_effective_auth_and_both_models() {
     ] {
         assert_ne!(baseline, changed);
     }
+    for auth in [None, Some(""), Some("other")] {
+        assert_eq!(
+            baseline,
+            upstream_identity(
+                ReasoningReplayPolicy::VllmPlaintext,
+                "https://provider/v1/responses",
+                auth,
+                "alias",
+                Some("snapshot")
+            )
+        );
+    }
     assert!(!format!("{baseline:?}").contains("secret"));
     assert!(!serde_json::to_string(&baseline).unwrap().contains("secret"));
 }
@@ -74,7 +72,7 @@ fn identities_bind_policy_endpoint_effective_auth_and_both_models() {
 fn identity_field_boundaries_and_missing_auth_are_unambiguous() {
     let identity = |auth, requested, reported| {
         upstream_identity(
-            ReasoningReplayPolicy::VllmPlaintext,
+            ReasoningReplayPolicy::OpaqueResponses,
             "https://provider/v1/responses",
             auth,
             requested,

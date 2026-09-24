@@ -68,13 +68,14 @@ reasoning_replay_policy = "vllm_plaintext"
 
 Each upstream observation includes its policy and a fixed-size SHA-256 identity
 fingerprint. Domain-separated, fixed-width component hashes bind the configured
-Responses endpoint, effective per-request credential (including missing vs empty),
-requested model, and an optional consistently reported terminal model. The latter now
-comes from upstream metadata, separately from the public `response.model` that the
-pipeline rebuilds from the request. Unknown and reported model identities hash
-differently. Credential rotation, endpoint changes, policy changes,
-and requested-model changes also produce distinct identities. Neither credentials
-nor original identity strings are stored, and identity `Debug` output is redacted.
+Responses endpoint, requested model, and an optional consistently reported terminal
+model. The reported model comes from upstream metadata, separately from the public
+`response.model` that the pipeline rebuilds from the request. Opaque replay also binds
+the effective per-request credential (including missing vs empty). Unknown and
+reported model identities hash differently. Endpoint, policy, and requested-model
+changes produce distinct identities. Credential rotation changes opaque identities,
+but not plaintext identities. Neither credentials nor original identity strings are
+stored, and identity `Debug` output is redacted.
 This is an equality fingerprint, not an authorization grant, integrity MAC, provider
 attestation, or model-family compatibility claim. It observes the configured endpoint,
 not any final redirect destination. Redirect policy, approved snapshots, opaque format identity, and
@@ -94,6 +95,11 @@ item, including batched inserts. Unknown versions/fields, malformed or oversized
 envelopes (maximum 512 UTF-8 bytes), and provenance on non-reasoning items fail closed
 with redacted `InvalidHistoryItem` errors. Missing provenance remains readable under
 the default vLLM policy but cannot qualify opaque state for future replay.
+Pre-0006 NULL-provenance reasoning rows with legacy content discriminators or
+untyped state/status use a bounded compatibility projection (16 MiB JSON, at most
+4096 content parts). It retains plaintext text in order, drops unsupported legacy
+fields, and never infers provenance. Rows with a provenance column value do not
+take this fallback and still fail closed on malformed typed data.
 
 Supervisor-managed schemas must apply migration 0006 before this gateway starts.
 Startup compatibility checks and readiness probes require the new column. Do not
@@ -490,7 +496,7 @@ validated and replayed through Rust before promotion; older captures were not ed
 
 The `reasoning_provenance_*_test.rs` suites cover policy gating, JSON/OpenAPI exclusion,
 closed envelope decoding, exact opaque bytes, mixed-origin storage batches, branches,
-corrupt history, and a real pre-0005 SQLite upgrade with repeated startup. Execution
+corrupt history, and a real pre-0006 SQLite upgrade with repeated startup. Execution
 tests replay existing recorder-generated Qwen and OpenAI JSON/SSE exchanges, checking
 durable and transient history, cancelled forks, promotion, and external-commit
 demotion. Unit tests additionally exercise fingerprint separation and non-wire budget
