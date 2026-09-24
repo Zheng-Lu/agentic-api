@@ -171,6 +171,7 @@ impl ExecutorError {
                 | ReasoningReplayError::MissingCredential
                 | ReasoningReplayError::UnsupportedCompaction
                 | ReasoningReplayError::UnsupportedParameter(_)
+                | ReasoningReplayError::UnsupportedWireField
                 | ReasoningReplayError::UnknownProvenance
                 | ReasoningReplayError::IncompatibleProvenance
                 | ReasoningReplayError::MissingOpaqueState

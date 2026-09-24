@@ -32,10 +32,12 @@ use agentic_core::storage::{
 use agentic_core::tool::{WebSearchHandler, model_visible_namespace_member_name};
 use agentic_core::types::RequestPayload;
 use agentic_core::types::io::{CompactionItem, InputItem, ResponsesInput};
+use agentic_core::types::reasoning_profile::OpaqueReasoningProfile;
+use agentic_core::types::reasoning_replay::ReasoningReplayPolicy;
 use agentic_core::types::tools::ResponsesTool;
 use agentic_server::app::{AppState, DEFAULT_MAX_REQUEST_BODY_SIZE, WebSocketTracker};
 
-use common::{spawn_gateway, test_config};
+use common::{spawn_gateway, test_config, test_state};
 
 struct MockResponsesServer {
     url: String,
@@ -1922,6 +1924,48 @@ async fn websocket_invalid_stream_ids_return_400_and_leave_connection_usable() {
     let events = recv_until_completed(&mut ws).await;
     assert!(events.iter().all(|event| event["stream_id"] == "x"));
     assert_eq!(mock.request_bodies().await.len(), 1);
+}
+
+#[tokio::test]
+async fn websocket_selected_opaque_profile_rejects_unknown_fields_before_execution() {
+    let (llm_url, _llm) = common::spawn_mock_llm().await;
+    let mut config = test_config(&llm_url);
+    config.responses.reasoning_replay_policy = ReasoningReplayPolicy::OpaqueResponses;
+    config.responses.reasoning_replay_profile = Some(OpaqueReasoningProfile::OpenAiGpt54_20260305V1);
+    let (gateway_url, _gateway) = spawn_gateway(test_state(&config)).await;
+    let mut ws = connect_responses_ws(&gateway_url).await;
+
+    for request in [
+        r#"{"type":"response.create","stream_id":"lane","model":"gpt-5.4-2026-03-05","input":"hi","unknown":true}"#,
+        r#"{"type":"response.create","stream_id":"lane","model":"gpt-5.4-2026-03-05","input":"hi","model":"other"}"#,
+    ] {
+        ws.send(Message::Text(request.into())).await.expect("send request");
+        let error = recv_json(&mut ws).await;
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["status"], StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(error["stream_id"], "lane");
+        assert_eq!(error["error"]["code"], "reasoning_replay_incompatible");
+        assert!(!error.to_string().contains("unknown"));
+    }
+
+    send_json(
+        &mut ws,
+        json!({
+            "type": "response.create",
+            "stream_id": "lane",
+            "model": "gpt-5.4-2026-03-05",
+            "input": "hi"
+        }),
+    )
+    .await;
+    let error = recv_json(&mut ws).await;
+    assert_eq!(error["status"], StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("endpoint")
+    );
 }
 
 #[tokio::test]

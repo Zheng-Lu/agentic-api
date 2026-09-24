@@ -419,10 +419,19 @@ matrix covers every excluded modeled field in both request modes and confirms er
 before missing-history lookup or network access. The ordinary library/server
 availability gate remains closed; this preflight is not profile enablement.
 
-The existing `RequestPayload` decoder ignores unknown top-level and nested fields
-before this preflight sees them. Strict, typed decoding for the selected opaque
-profile is therefore still required before enabling it; this modeled-field allowlist
-does not claim to catch unknown wire fields.
+The selected profile now has a transport-level wire guard on both HTTP and WebSocket
+`response.create`. It rejects unknown and duplicate top-level request keys before
+`RequestPayload` can discard them, while allowing `type`, `stream_id`, and `generate`
+only in the WebSocket envelope. Unknown or duplicate `reasoning` keys are rejected,
+and the executor rejects unknown input-item kinds before rehydration. Errors do not
+echo caller-supplied field names or values. HTTP `store: false` also takes the
+executor route whenever an opaque profile is selected; it cannot bypass preflight
+through transparent proxying. The default vLLM proxy route is unchanged.
+
+This is not yet a fully closed profile decoder. Nested fields inside input items,
+content parts, tool declarations, and object-form `tool_choice` can still be ignored
+by their existing decoders. Those shapes need a typed, profile-specific closed
+validation path and replay coverage before the candidate can be enabled.
 
 ## Remaining slices before enabling a provider profile
 
@@ -431,7 +440,7 @@ does not claim to catch unknown wire fields.
    continuations and gateway-executed tool loops, while the reference matrix covers the
    pinned provider's initial, multi-turn, function-output and branching contract, but does
    not qualify every public request parameter, tool normalization or provider error mode.
-   Reject unknown wire fields in the opaque profile's typed decoder and expand the pinned
+   Finish nested unknown-wire-field validation in the opaque profile and expand the pinned
    request surface only with qualification evidence before enabling it. Existing gpt-5.6
    recordings remain regression evidence, not evidence for the pinned model.
 2. Keep local plaintext compaction distinct from provider opaque compaction. Unsupported

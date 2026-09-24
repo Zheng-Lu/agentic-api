@@ -12,6 +12,7 @@ use super::reasoning_replay::ReasoningReplayError;
 /// This is an internal validation name, never a caller-provided string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpaqueReplayRequestField {
+    Input,
     ReasoningContext,
     ReasoningEffort,
     ReasoningGenerateSummary,
@@ -36,6 +37,7 @@ impl OpaqueReplayRequestField {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Input => "input",
             Self::ReasoningContext => "reasoning.context",
             Self::ReasoningEffort => "reasoning.effort",
             Self::ReasoningGenerateSummary => "reasoning.generate_summary",

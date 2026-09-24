@@ -76,6 +76,23 @@ fn pinned_request_surface_accepts_recorded_settings_without_opening_the_gate() {
 }
 
 #[test]
+fn unknown_input_item_is_rejected_before_the_closed_profile_gate() {
+    let request: RequestPayload = serde_json::from_value(serde_json::json!({
+        "model": PROFILE.model(),
+        "input": [{"type": "unqualified_future_item", "secret": "not forwarded"}]
+    }))
+    .unwrap();
+    assert!(matches!(
+        validate_rehydration_request(&context(), &request),
+        Err(ExecutorError::ReasoningReplay(
+            ReasoningReplayError::UnsupportedParameter(
+                crate::types::reasoning_profile::OpaqueReplayRequestField::Input
+            )
+        ))
+    ));
+}
+
+#[test]
 fn target_requires_exact_endpoint_model_and_effective_credential() {
     for endpoint in [
         "http://api.openai.com/v1/responses",

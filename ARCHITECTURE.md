@@ -609,6 +609,12 @@ for pinned-provider reference evidence and remaining gateway acceptance work.
 history lookup and tool discovery. It returns typed, parameter-specific errors for
 settings outside that surface and rechecks effective settings before each round.
 It does not change default vLLM request handling, normalization, or delivery.
+The server's profile-only HTTP/WebSocket wire guard rejects unknown or duplicate
+top-level fields and unknown reasoning settings before the normal typed request
+decode can discard them. The HTTP handler always routes a selected opaque profile
+through the executor, including `store: false`; the ordinary vLLM proxy path is
+unchanged. Nested item and tool fields remain unqualified and the profile gate
+stays closed.
 
 Assistant `MessagePhase` is a bounded optional enum in the message types, retained by
 the existing authoritative typed completion and output-to-input conversion. Storage

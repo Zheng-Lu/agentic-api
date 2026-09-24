@@ -69,6 +69,8 @@ pub enum ReasoningReplayError {
     UnsupportedCompaction,
     #[error("request parameter `{0}` is unsupported by the opaque reasoning replay profile")]
     UnsupportedParameter(OpaqueReplayRequestField),
+    #[error("opaque reasoning replay request contains an unsupported or duplicate wire field")]
+    UnsupportedWireField,
     #[error("reasoning replay requires gateway-observed provenance; manual and legacy opaque state is unsupported")]
     UnknownProvenance,
     #[error("reasoning provenance is incompatible with the selected profile, endpoint, model, or credential")]
