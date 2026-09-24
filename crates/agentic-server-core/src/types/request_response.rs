@@ -5,11 +5,15 @@ use serde_json::{Map, Value, json};
 
 #[cfg(test)]
 use super::io::FunctionTool;
-use super::io::{InputItem, InputMessage, InputMessageContent, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
+use super::io::{InputItem, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use super::tools::ResponsesTool;
 pub use super::upstream_request::{UpstreamRequest, UpstreamTool};
 use crate::tool::{CodexNamespaceHandler, CustomHandler, ToolError};
 use crate::utils::common::serialize_to_string;
+
+const fn default_true() -> bool {
+    true
+}
 
 /// Standard Responses API reasoning generation settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +169,7 @@ impl utoipa::PartialSchema for RequestPayload {
                 ObjectBuilder::new().schema_type(SchemaType::from_iter([Type::Object, Type::Null])),
             )
             .property("parallel_tool_calls", nullable_bool())
+            .property("prompt_cache_key", nullable_str())
             .property("cache_salt", nullable_str())
             .property(
                 "context_management",
@@ -212,13 +217,11 @@ pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
     pub metadata: Option<Value>,
     pub parallel_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_salt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Vec<ContextManagement>>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl<T: ?Sized> RequestPayload<T> {
@@ -282,6 +285,7 @@ impl<T: ?Sized> RequestPayload<T> {
             truncation: self.truncation,
             metadata: self.metadata,
             parallel_tool_calls: self.parallel_tool_calls,
+            prompt_cache_key: self.prompt_cache_key,
             cache_salt: self.cache_salt,
             context_management: self.context_management,
         })
@@ -352,6 +356,7 @@ impl RequestPayload {
             truncation: self.truncation.as_deref(),
             metadata: self.metadata.as_ref(),
             parallel_tool_calls,
+            prompt_cache_key: self.prompt_cache_key.as_deref(),
             cache_salt: self.cache_salt.as_deref(),
         })
     }
@@ -461,52 +466,6 @@ impl ResponsePayload {
     }
 }
 
-impl From<&ResponsesInput> for Vec<InputItem> {
-    fn from(input: &ResponsesInput) -> Self {
-        match input {
-            ResponsesInput::Text(text) => vec![InputItem::Message(InputMessage::new(
-                "user",
-                InputMessageContent::Text(text.clone()),
-            ))],
-            ResponsesInput::Items(items) => items
-                .iter()
-                .filter_map(|item| match item {
-                    InputItem::Unknown => None,
-                    InputItem::ShellCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
-                    InputItem::ShellCallOutput(output) => Some(InputItem::FunctionCallOutput(output.clone().into())),
-                    InputItem::CustomToolCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
-                    InputItem::CustomToolCallOutput(output) => {
-                        Some(InputItem::FunctionCallOutput(output.clone().into()))
-                    }
-                    item => Some(item.clone()),
-                })
-                .collect(),
-        }
-    }
-}
-
-impl From<ResponsesInput> for Vec<InputItem> {
-    fn from(input: ResponsesInput) -> Self {
-        match input {
-            ResponsesInput::Text(text) => vec![InputItem::Message(InputMessage::new(
-                "user",
-                InputMessageContent::Text(text),
-            ))],
-            ResponsesInput::Items(items) => items
-                .into_iter()
-                .filter_map(|item| match item {
-                    InputItem::Unknown => None,
-                    InputItem::ShellCall(call) => Some(InputItem::FunctionCall(call.into())),
-                    InputItem::ShellCallOutput(output) => Some(InputItem::FunctionCallOutput(output.into())),
-                    InputItem::CustomToolCall(call) => Some(InputItem::FunctionCall(call.into())),
-                    InputItem::CustomToolCallOutput(output) => Some(InputItem::FunctionCallOutput(output.into())),
-                    item => Some(item),
-                })
-                .collect(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +548,55 @@ mod tests {
             .expect("upstream request should serialize");
 
         assert_eq!(upstream["cache_salt"], "tenant-a");
+    }
+
+    #[test]
+    fn request_payload_omits_absent_and_forwards_present_prompt_cache_key_upstream() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello"
+        }))
+        .expect("request should deserialize");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert!(upstream.get("prompt_cache_key").is_none());
+
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "prompt_cache_key": "workspace-a"
+        }))
+        .expect("request should deserialize");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert_eq!(upstream["prompt_cache_key"], "workspace-a");
+
+        let null_payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "prompt_cache_key": null
+        }))
+        .expect("null should deserialize as an absent key");
+        let upstream = serde_json::to_value(
+            null_payload
+                .to_upstream_request(false)
+                .expect("request should normalize"),
+        )
+        .expect("upstream request should serialize");
+        assert!(upstream.get("prompt_cache_key").is_none());
+
+        for invalid in [
+            serde_json::json!(1),
+            serde_json::json!(true),
+            serde_json::json!({"tenant": "a"}),
+        ] {
+            let result = serde_json::from_value::<RequestPayload>(serde_json::json!({
+                "model": "test-model",
+                "input": "hello",
+                "prompt_cache_key": invalid
+            }));
+            assert!(result.is_err(), "non-string prompt_cache_key must be rejected");
+        }
     }
 
     #[test]

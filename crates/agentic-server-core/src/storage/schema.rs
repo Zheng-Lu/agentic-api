@@ -18,12 +18,13 @@ use crate::config::DEFAULT_POSTGRES_MIGRATION_TIMEOUT_SECONDS;
 type DbResult<T> = Result<T, sqlx::Error>;
 
 const POSTGRES_SCHEMA_ADVISORY_LOCK: i64 = 7_194_963_546_799_751;
-const REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT: i64 = 21;
+const REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT: i64 = 22;
 const REQUIRED_POSTGRES_CONSTRAINT_COUNT: i64 = 7;
-const REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT: i64 = 4;
+const REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT: i64 = 5;
 const POSTGRES_INTEGER_WIDENING_SQL: &str = "
     ALTER TABLE conversations
-        ALTER COLUMN created_at TYPE BIGINT USING created_at::BIGINT;
+        ALTER COLUMN created_at TYPE BIGINT USING created_at::BIGINT,
+        ALTER COLUMN revision TYPE BIGINT USING revision::BIGINT;
     ALTER TABLE items
         ALTER COLUMN created_at TYPE BIGINT USING created_at::BIGINT,
         ALTER COLUMN seq TYPE BIGINT USING seq::BIGINT;
@@ -74,6 +75,7 @@ where
                  ('conversations', 'tenant_id', 'text', 'YES'), \
                  ('conversations', 'metadata', 'text', 'YES'), \
                  ('conversations', 'latest_response_id', 'text', 'YES'), \
+                 ('conversations', 'revision', 'integer', 'NO'), \
                  ('items', 'id', 'text', 'NO'), \
                  ('items', 'data', 'text', 'NO'), \
                  ('items', 'created_at', 'integer', 'NO'), \
@@ -160,7 +162,7 @@ where
          JOIN pg_namespace table_namespace \
            ON table_namespace.oid = table_relation.relnamespace \
           AND table_namespace.nspname = actual.table_schema \
-         WHERE (actual.table_name = 'conversations' AND actual.column_name = 'created_at') \
+         WHERE (actual.table_name = 'conversations' AND actual.column_name IN ('created_at', 'revision')) \
             OR (actual.table_name = 'items' AND actual.column_name IN ('created_at', 'seq')) \
             OR (actual.table_name = 'responses' AND actual.column_name = 'created_at')",
     )
@@ -598,7 +600,8 @@ mod tests {
             include_str!("../../migrations/0002_add_placeholders.sql"),
             include_str!("../../migrations/0003_index_conversation_sequence.sql"),
             include_str!("../../migrations/0004_link_conversation_latest_response.sql"),
-            include_str!("../../migrations/0005_reasoning_provenance.sql"),
+            include_str!("../../migrations/0005_conversation_revision.sql"),
+            include_str!("../../migrations/0006_reasoning_provenance.sql"),
         ] {
             sqlx::raw_sql(migration)
                 .execute(&mut *connection)
@@ -721,7 +724,7 @@ mod tests {
         let bigint_columns: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.columns \
              WHERE table_schema = $1 AND data_type = 'bigint' \
-             AND ((table_name = 'conversations' AND column_name = 'created_at') \
+             AND ((table_name = 'conversations' AND column_name IN ('created_at', 'revision')) \
                OR (table_name = 'items' AND column_name IN ('created_at', 'seq')) \
                OR (table_name = 'responses' AND column_name = 'created_at'))",
         )
@@ -729,13 +732,13 @@ mod tests {
         .fetch_one(&mut *connection)
         .await
         .expect("inspect widened PostgreSQL columns");
-        assert_eq!(bigint_columns, 4);
+        assert_eq!(bigint_columns, REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT);
         assert!(
             validate_supervisor_schema(
                 REQUIRED_POSTGRES_SCHEMA_COLUMN_COUNT,
                 REQUIRED_POSTGRES_CONSTRAINT_COUNT,
                 REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT,
-                4 - bigint_columns,
+                REQUIRED_POSTGRES_INTEGER_COLUMN_COUNT - bigint_columns,
                 true,
             )
             .is_ok()
@@ -842,7 +845,7 @@ mod tests {
         let bigint_columns: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM information_schema.columns \
              WHERE table_schema = $1 AND data_type = 'bigint' \
-             AND ((table_name = 'conversations' AND column_name = 'created_at') \
+             AND ((table_name = 'conversations' AND column_name IN ('created_at', 'revision')) \
                OR (table_name = 'items' AND column_name IN ('created_at', 'seq')) \
                OR (table_name = 'responses' AND column_name = 'created_at'))",
         )

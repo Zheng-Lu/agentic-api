@@ -123,7 +123,7 @@ mod tests {
         let mut migrations = sqlx::migrate!("./migrations");
         migrations.migrations = migrations
             .iter()
-            .filter(|migration| migration.version < 5)
+            .filter(|migration| migration.version < 6)
             .cloned()
             .collect::<Vec<_>>()
             .into();

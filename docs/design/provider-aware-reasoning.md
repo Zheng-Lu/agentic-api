@@ -87,7 +87,7 @@ resubmission and the public split-execution persistence APIs always demote new o
 to client-submitted origin. Existing ancestor items retain their own origin through
 ephemeral-to-durable promotion and branching.
 
-Migration `0005_reasoning_provenance.sql` adds nullable `items.reasoning_provenance`
+Migration `0006_reasoning_provenance.sql` adds nullable `items.reasoning_provenance`
 TEXT, separately from public item JSON. It rewrites no existing data and establishes
 no provenance for legacy rows. Both stores insert and restore it atomically with each
 item, including batched inserts. Unknown versions/fields, malformed or oversized
@@ -95,7 +95,7 @@ envelopes (maximum 512 UTF-8 bytes), and provenance on non-reasoning items fail 
 with redacted `InvalidHistoryItem` errors. Missing provenance remains readable under
 the default vLLM policy but cannot qualify opaque state for future replay.
 
-Supervisor-managed schemas must apply migration 0005 before this gateway starts.
+Supervisor-managed schemas must apply migration 0006 before this gateway starts.
 Startup compatibility checks and readiness probes require the new column. Do not
 drop it on rollback: older writers can leave NULL, which must remain unknown to a
 future opaque profile. No public JSON field or SSE/WebSocket event is added.

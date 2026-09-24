@@ -9,7 +9,7 @@ async fn sqlite_upgrade_preserves_legacy_data_and_repeated_startup() {
     // Apply the exact embedded legacy migrations with their SQLx checksums.
     migrations.migrations = migrations
         .iter()
-        .filter(|migration| migration.version < 5)
+        .filter(|migration| migration.version < 6)
         .cloned()
         .collect::<Vec<_>>()
         .into();
@@ -40,5 +40,5 @@ async fn sqlite_upgrade_preserves_legacy_data_and_repeated_startup() {
         .fetch_all(pool.as_ref())
         .await
         .unwrap();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
 }

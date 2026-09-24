@@ -1,4 +1,6 @@
+pub mod conversations;
 pub mod event;
+mod input_conversion;
 pub mod io;
 pub mod messages;
 pub mod reasoning_profile;
@@ -10,6 +12,10 @@ pub mod upstream_identity;
 pub mod upstream_input;
 pub mod upstream_request;
 
+pub use conversations::{
+    ConversationItem, ConversationResponse, CreateConversationRequest, CreateItemRequest, DeletedResponse,
+    ItemResponse, ListItemsResponse, UpdateConversationRequest,
+};
 pub use io::{
     AllowedTool, AllowedToolsMode, CompactionItem, CustomToolCall, CustomToolCallOutputMessage, FunctionTool,
     FunctionToolCall, FunctionToolResultMessage, GatewayCallStatus, InputContent, InputFileContent,
