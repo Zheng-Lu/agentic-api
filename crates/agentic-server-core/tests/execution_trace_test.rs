@@ -227,6 +227,7 @@ fn request(stream: bool) -> RequestPayload {
         truncation: None,
         metadata: None,
         parallel_tool_calls: None,
+        prompt_cache_key: None,
         cache_salt: None,
         context_management: None,
     }
@@ -271,7 +272,7 @@ async fn run(
 ) -> agentic_core::executor::ExecutorResult<
     Either<agentic_core::types::request_response::ResponsePayload, agentic_core::executor::BoxStream>,
 > {
-    traces.run(ExecuteRequest::new(payload, exec_ctx).run()).await
+    Box::pin(traces.run(ExecuteRequest::new(payload, exec_ctx).run())).await
 }
 
 /// Drain a stream inside the test subscriber's scope, as the transport would
