@@ -397,6 +397,22 @@ struct DeliveryTimer {
     handed_at: Option<Instant>,
 }
 
+impl DeliveryTimer {
+    /// The transport asked for the next frame: add the wait since it took
+    /// the previous one.
+    fn resumed(&mut self) {
+        if let Some(handed_at) = self.handed_at.take() {
+            self.clock.transport_waited(handed_at.elapsed());
+        }
+    }
+
+    /// The transport took a frame.
+    fn handed(&mut self) {
+        self.clock.frame_handed();
+        self.handed_at = Some(Instant::now());
+    }
+}
+
 impl<S> InstrumentedStream<S> {
     pub fn new(inner: S, span: Span) -> Self {
         Self {
@@ -425,15 +441,12 @@ impl<S: Stream + Unpin> Stream for InstrumentedStream<S> {
         // Before polling: the outcome guard inside `inner` may finalize on
         // this poll and must see the wait that led up to it.
         if let Some(delivery) = &mut this.delivery {
-            if let Some(handed_at) = delivery.handed_at.take() {
-                delivery.clock.transport_waited(handed_at.elapsed());
-            }
+            delivery.resumed();
         }
         let _entered = this.span.enter();
         let polled = Pin::new(&mut this.inner).poll_next(cx);
         if let (Some(delivery), Poll::Ready(Some(_))) = (&mut this.delivery, &polled) {
-            delivery.clock.frame_handed();
-            delivery.handed_at = Some(Instant::now());
+            delivery.handed();
         }
         polled
     }
