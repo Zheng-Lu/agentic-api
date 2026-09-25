@@ -31,11 +31,17 @@ and opaque bytes are charged through `RetainedSize`. No new queue, task, parser,
 delivery path, or inference policy is introduced. The 16 MiB per-value ceiling is not
 a claim about aggregate process memory; the usual retained-response budget is smaller.
 
-Both stores now return `StorageError::InvalidHistoryItem` instead of skipping a row
-that fails item decoding. Response history also rejects a missing referenced row.
-This prevents legacy malformed reasoning from silently disappearing after schema
-tightening. Database rows are neither rewritten nor deleted, and no SQL migration
-is required for this slice. Valid existing records keep their wire representation.
+Reasoning rows written by earlier releases stay readable. When a stored reasoning
+row fails typed decoding, a bounded compatibility projection (at most 16 MiB of JSON
+and 4096 content parts) keeps its plaintext in order as `reasoning_text` and keeps
+every summary part, string opaque state, and status value that still decodes. It
+drops only untyped values, so such history remains continuable on the vLLM path.
+
+Rows that cannot be read even this way now fail closed: both stores return
+`StorageError::InvalidHistoryItem` instead of skipping them, and response history
+also rejects a missing referenced row. Reasoning therefore never silently disappears
+from a continuation. Database rows are neither rewritten nor deleted, and no SQL
+migration is required for this slice. Valid existing records keep their wire representation.
 Response history references and effective metadata now also decode fallibly. Malformed
 JSON, wrong field types, and explicit JSON `null` fail closed instead of becoming empty
 history or default settings. SQL NULL retains its existing legacy behavior; it does not
@@ -80,6 +86,9 @@ stateful and session tests retain the existing vLLM continuation behavior.
 references, legacy SQL NULL handling, missing/foreign captured turns, error redaction,
 and refusal to persist a child of an invalid parent. A recorded initial exchange checks
 that malformed continuation metadata fails before either JSON or SSE inference starts.
+`legacy_reasoning_rows_test.rs` rewrites stored rows to shapes earlier releases accepted
+and checks that each decodes with its valid fields kept, and that a `previous_response_id`
+continuation replays its plaintext to vLLM as `reasoning_text`.
 
 No captured YAML was hand-authored or modified for this slice. Future provider replay
 scenarios must use the cassette README's recorder workflow and staged validation.

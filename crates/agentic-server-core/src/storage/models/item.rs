@@ -1,5 +1,8 @@
 //! Conversation history item stored in the database.
 
+mod legacy_reasoning;
+
+use serde::Deserialize;
 use serde_json::Value;
 use std::convert::TryFrom;
 use std::fmt::Write;
@@ -61,16 +64,22 @@ impl Item {
         Some(value)
     }
 
-    /// Deserialize data column as `InputItem`.
+    /// Deserialize data column as `InputItem`, projecting pre-typed reasoning rows.
     #[must_use]
     pub fn as_input(&self) -> Option<InputItem> {
-        serde_json::from_value(self.data_without_storage_marker()?).ok()
+        let data = self.data_without_storage_marker()?;
+        InputItem::deserialize(&data)
+            .ok()
+            .or_else(|| self.legacy_reasoning(&data).map(InputItem::Reasoning))
     }
 
-    /// Deserialize data column as `OutputItem`.
+    /// Deserialize data column as `OutputItem`, projecting pre-typed reasoning rows.
     #[must_use]
     pub fn as_output(&self) -> Option<OutputItem> {
-        serde_json::from_value(self.data_without_storage_marker()?).ok()
+        let data = self.data_without_storage_marker()?;
+        OutputItem::deserialize(&data)
+            .ok()
+            .or_else(|| self.legacy_reasoning(&data).map(OutputItem::Reasoning))
     }
 
     /// Deserialize data column as either `InputItem` or `OutputItem`.
