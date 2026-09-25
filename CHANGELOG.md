@@ -39,7 +39,8 @@ All notable changes to Agentic API are documented here.
   placed in the body. `allowed_domains` / `blocked_domains` and the model's `include_domains` / `exclude_domains` are
   forwarded to Tavily's native `include_domains` / `exclude_domains` and re-checked client-side, `count` is clamped
   to Tavily's maximum of 20, `freshness` maps to `time_range` or to `start_date` / `end_date` widened by one day on
-  each side because Tavily's bounds are exclusive, `language` keeps Tavily's documented compound tags (`zh-cn`) and
+  each side because Tavily's bounds are exclusive and sent with `filter_by_published_date` so undated results cannot
+  bypass the requested recency window, `language` keeps Tavily's documented compound tags (`zh-cn`) and
   otherwise reduces to its primary subtag, `safesearch` maps to the boolean `safe_search`, and `country` plus the
   You.com-specific
   `livecrawl`, `livecrawl_formats`, `crawl_timeout`, and `boost_domains` arguments are ignored. Results fill

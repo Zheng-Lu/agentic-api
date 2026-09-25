@@ -10,7 +10,8 @@
 //! - `include_domains` / `exclude_domains` are applied server-side and are
 //!   still enforced client-side through [`DomainFilter`] as defense in depth;
 //! - `max_results` is capped at [`TAVILY_MAX_RESULTS`] and clamped instead of rejected;
-//! - `freshness` maps to `time_range` or a `start_date` / `end_date` pair;
+//! - `freshness` maps to `time_range` or a `start_date` / `end_date` pair, with
+//!   `filter_by_published_date` so undated results cannot bypass the filter;
 //! - one `topic: "general"` request serves each query, so every hit lands in
 //!   the `web` section and `news` stays empty (a second `news` request would
 //!   double the credits spent per query);
@@ -204,6 +205,17 @@ struct TavilySearchBody {
     /// Requested on every search so `page_age` is populated for the
     /// `general` topic too (Tavily enables it automatically only for `news`).
     include_published_date: bool,
+    /// Sent only alongside a date window. Tavily then drops results whose
+    /// published date falls outside it, including results with no detectable
+    /// date, so a recency filter is a hard contract rather than a hint.
+    #[serde(skip_serializing_if = "is_false")]
+    filter_by_published_date: bool,
+}
+
+/// `skip_serializing_if` predicate keeping `false` flags out of the payload.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde requires a reference predicate")]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl TavilySearchRequest {
@@ -240,6 +252,7 @@ impl TavilySearchRequest {
         }
         log_ignored_arguments(args, config);
         let (time_range, start_date, end_date) = args.freshness.map(tavily_freshness).unwrap_or_default();
+        let filter_by_published_date = args.freshness.is_some();
         let domain_filter = DomainFilter::new(include_domains.as_deref(), exclude_domains.as_deref());
 
         Ok(Self {
@@ -256,6 +269,7 @@ impl TavilySearchRequest {
                 language: args.language.as_deref().map(tavily_language),
                 safe_search: args.safesearch.as_deref().map(tavily_safe_search),
                 include_published_date: true,
+                filter_by_published_date,
             },
             domain_filter,
         })
@@ -471,7 +485,8 @@ mod tests {
                 "exclude_domains": ["Spam.example"],
                 "language": "en",
                 "safe_search": true,
-                "include_published_date": true
+                "include_published_date": true,
+                "filter_by_published_date": true
             })
         );
         assert!(!request.domain_filter.allows("https://spam.example/x"));
@@ -490,7 +505,8 @@ mod tests {
                 "search_depth": "basic",
                 "topic": "general",
                 "include_published_date": true
-            })
+            }),
+            "without a freshness filter no date window is sent, so filter_by_published_date stays off"
         );
         assert!(request.domain_filter.is_empty());
         assert!(!serde_json::to_string(&request.body).unwrap().contains("api_key"));
@@ -564,6 +580,10 @@ mod tests {
         assert_eq!(body["start_date"], "2026-01-01");
         assert_eq!(body["end_date"], "2026-02-04");
         assert!(body.get("time_range").is_none());
+        assert_eq!(
+            body["filter_by_published_date"], true,
+            "an explicit date window is enforced against undated results too"
+        );
     }
 
     #[test]

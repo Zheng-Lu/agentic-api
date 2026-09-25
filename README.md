@@ -383,6 +383,9 @@ key sent as a bearer token. The gateway adapts the shared tool contract to Tavil
   exclusive and the gateway's range is inclusive; `language` keeps Tavily's documented compound tags (`zh-CN` →
   `zh-cn`) and otherwise reduces to its primary subtag (`en-GB` → `en`); `safesearch` becomes Tavily's boolean
   `safe_search` (anything but `off` enables it).
+- A `freshness` filter is a hard contract: the date window is sent with `filter_by_published_date`, so Tavily drops
+  results published outside it *and* results with no detectable publication date rather than letting them through.
+  Like an allowlist, this can return fewer than `count` results.
 - Every query is one `topic: "general"` search, so all hits land in `results.web` and `results.news` is always empty;
   a second news search per query would double the credits spent. `page_age` carries Tavily's `published_date`.
 - `country` is ignored (Tavily expects full country names rather than ISO codes), as are the You.com-specific

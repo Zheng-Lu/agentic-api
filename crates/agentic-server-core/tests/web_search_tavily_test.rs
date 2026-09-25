@@ -191,7 +191,8 @@ async fn tavily_handler_posts_json_and_maps_results_and_public_sources() {
             "exclude_domains": ["spam.example"],
             "language": "en",
             "safe_search": true,
-            "include_published_date": true
+            "include_published_date": true,
+            "filter_by_published_date": true
         }),
         "count is clamped to 20, freshness maps to time_range, country and You.com-only arguments are dropped"
     );
@@ -252,6 +253,10 @@ async fn tavily_handler_sends_date_bounds_for_a_freshness_range() {
     );
     assert_eq!(request.body["end_date"], "2026-02-04");
     assert!(request.body.get("time_range").is_none());
+    assert_eq!(
+        request.body["filter_by_published_date"], true,
+        "undated results must not bypass an explicit date window"
+    );
     assert!(
         request.body.get("max_results").is_none(),
         "no count means Tavily's default"
@@ -329,6 +334,10 @@ async fn tavily_handler_forwards_domain_filters_and_reapplies_them_client_side()
         .unwrap();
 
     let request = captured.recv().await.unwrap();
+    assert!(
+        request.body.get("filter_by_published_date").is_none(),
+        "no freshness filter means no date window and no date-based filtering"
+    );
     assert_eq!(
         request.body["include_domains"],
         serde_json::json!(["rust-lang.org"]),
