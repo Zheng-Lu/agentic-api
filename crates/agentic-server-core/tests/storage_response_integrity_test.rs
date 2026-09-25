@@ -123,16 +123,23 @@ async fn missing_or_foreign_captured_response_is_not_empty_metadata() -> Result<
         let error = store
             .response_metadata_at_version(
                 &other.conversation_id,
-                &ConversationVersion::LastResponse {
-                    response_id: response_id.to_owned(),
+                &ConversationVersion {
+                    response_id: Some(response_id.to_owned()),
                     last_sequence: None,
+                    revision: 0,
                 },
             )
             .await
             .unwrap_err();
         assert!(matches!(error, StorageError::InvalidResponseMetadata { .. }));
     }
-    for version in [ConversationVersion::Empty, ConversationVersion::LastSequence(0)] {
+    for version in [
+        ConversationVersion::default(),
+        ConversationVersion {
+            last_sequence: Some(0),
+            ..ConversationVersion::default()
+        },
+    ] {
         assert!(
             store
                 .response_metadata_at_version(&first.conversation_id, &version)
