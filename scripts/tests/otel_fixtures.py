@@ -80,6 +80,12 @@ class Upstream(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
+    def setup(self) -> None:
+        super().setup()
+        # Headers and body are separate writes; without this, Nagle's algorithm
+        # and delayed ACKs add ~40 ms to every keep-alive response.
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
     def do_GET(self) -> None:  # noqa: N802 - http.server API
         self._send(200, "application/json", b"{}")
 
