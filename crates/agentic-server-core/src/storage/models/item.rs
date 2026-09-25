@@ -1,5 +1,8 @@
 //! Conversation history item stored in the database.
 
+mod legacy_reasoning;
+
+use serde::Deserialize;
 use serde_json::Value;
 use std::convert::TryFrom;
 use std::fmt::Write;
@@ -64,18 +67,22 @@ impl Item {
         Some((value, gateway_origin))
     }
 
-    /// Deserialize data column as `InputItem`.
+    /// Deserialize data column as `InputItem`, projecting pre-typed reasoning rows.
     #[must_use]
     pub fn as_input(&self) -> Option<InputItem> {
-        let (value, _) = self.data_without_storage_marker()?;
-        serde_json::from_value(value).ok()
+        let (data, _) = self.data_without_storage_marker()?;
+        InputItem::deserialize(&data)
+            .ok()
+            .or_else(|| self.legacy_reasoning(&data).map(InputItem::Reasoning))
     }
 
-    /// Deserialize data column as `OutputItem`.
+    /// Deserialize data column as `OutputItem`, projecting pre-typed reasoning rows.
     #[must_use]
     pub fn as_output(&self) -> Option<OutputItem> {
-        let (value, gateway_origin) = self.data_without_storage_marker()?;
-        let mut output: OutputItem = serde_json::from_value(value).ok()?;
+        let (data, gateway_origin) = self.data_without_storage_marker()?;
+        let mut output = OutputItem::deserialize(&data)
+            .ok()
+            .or_else(|| self.legacy_reasoning(&data).map(OutputItem::Reasoning))?;
         if gateway_origin && let OutputItem::CodeInterpreterCall(call) = &mut output {
             call.origin = CodeInterpreterCallOrigin::Gateway;
         }
