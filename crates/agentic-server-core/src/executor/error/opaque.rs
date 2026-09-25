@@ -15,6 +15,11 @@ pub struct OpaqueUpstreamError {
 }
 
 impl OpaqueUpstreamError {
+    /// The typed cause, for bounded internal classification only; never log it.
+    pub(crate) fn cause(&self) -> &ExecutorError {
+        &self.source
+    }
+
     pub(crate) fn redact(error: ExecutorError) -> ExecutorError {
         match error {
             // These variants have bounded, structured, non-payload diagnostics.

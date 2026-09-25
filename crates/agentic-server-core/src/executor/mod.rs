@@ -17,6 +17,7 @@ pub mod rehydrate;
 mod replay;
 pub mod request;
 pub mod session;
+pub mod telemetry;
 pub mod translate;
 
 mod gateway;

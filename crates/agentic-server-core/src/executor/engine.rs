@@ -5,16 +5,18 @@
 //! primary entry point; [`execute`] is a convenience shim for callers that don't
 //! need per-request configuration.
 
+mod execute;
 mod history;
 mod round;
 mod streaming;
 mod usage;
+
 use history::record_round_history;
-use streaming::run_stream;
 use usage::accumulate_usage;
 
-use std::sync::Arc;
+pub use execute::{ExecuteRequest, execute};
 
+#[cfg(test)]
 use either::Either;
 use tracing::debug;
 
@@ -28,7 +30,6 @@ use crate::events::EventFrame;
 use crate::executor::error::ExecutorResult;
 use crate::executor::persist::persist_if_needed;
 use crate::executor::pipeline::{AgentPipeline, emit_deferred_stream_events};
-use crate::executor::prepare::prepare_request_tools;
 use crate::executor::replay::prepare_initial_reasoning;
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
@@ -39,7 +40,9 @@ use crate::executor::upstream::agent_pipeline;
 use crate::executor::upstream::agent_pipeline_with_limits;
 use crate::tool::{ToolRegistry, ToolSearchMetadata, ToolSearchState, mcp};
 use crate::types::io::{InputItem, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
-use crate::types::request_response::{IncompleteDetails, RequestPayload, ResponsePayload};
+#[cfg(test)]
+use crate::types::request_response::RequestPayload;
+use crate::types::request_response::{IncompleteDetails, ResponsePayload};
 use crate::utils::common::utcnow_str;
 
 pub use crate::executor::inference::BoxStream;
@@ -424,7 +427,7 @@ fn finalize_loop(
     ctx.inject_ids(payload);
 }
 
-async fn run_blocking(
+pub(super) async fn run_blocking(
     ctx: RequestContext,
     tool_search_state: Option<ToolSearchState>,
     exec_ctx: &ExecutionContext,
@@ -452,123 +455,6 @@ async fn run_blocking(
 /// Returns [`crate::executor::error::ExecutorError`] if the conversation store is unavailable.
 pub async fn create_conversation(exec_ctx: &ExecutionContext) -> ExecutorResult<crate::ConversationData> {
     exec_ctx.conv_handler.create().await
-}
-
-/// Builder for a stateful conversation turn.
-///
-/// ```ignore
-/// ExecuteRequest::new(payload, exec_ctx).with_auth(token).run().await
-/// ```
-pub struct ExecuteRequest {
-    payload: RequestPayload,
-    exec_ctx: Arc<ExecutionContext>,
-    client_auth: Option<String>,
-    continuation: Option<super::session::ResponseContinuation>,
-    max_stream_event_bytes: Option<usize>,
-}
-
-impl ExecuteRequest {
-    #[must_use]
-    pub fn new(payload: RequestPayload, exec_ctx: Arc<ExecutionContext>) -> Self {
-        Self {
-            payload,
-            exec_ctx,
-            client_auth: None,
-            continuation: None,
-            max_stream_event_bytes: None,
-        }
-    }
-
-    /// Bound every serialized client event, including the terminal
-    /// `response.completed`, to what the delivering transport can carry after
-    /// its own routing metadata. The configured `max_stream_event_bytes` still
-    /// applies; a larger transport limit does not raise it.
-    #[must_use]
-    pub fn with_max_stream_event_bytes(mut self, max_bytes: usize) -> Self {
-        self.max_stream_event_bytes = Some(max_bytes);
-        self
-    }
-
-    fn effective_max_stream_event_bytes(&self) -> usize {
-        let configured = self.exec_ctx.responses_config.max_stream_event_bytes;
-        self.max_stream_event_bytes
-            .map_or(configured, |transport| transport.min(configured))
-    }
-
-    /// Override the bearer token for this request only; does not touch the shared [`ExecutionContext`].
-    #[must_use]
-    pub fn with_auth(mut self, token: Option<String>) -> Self {
-        self.client_auth = token;
-        self
-    }
-
-    /// Retain this turn's continuation state in the supplied serial session.
-    ///
-    /// # Errors
-    /// Returns an error when the session is busy or closed.
-    pub fn with_session(mut self, session: &super::ResponseSession) -> ExecutorResult<Self> {
-        self.continuation = Some(session.begin(self.payload.previous_response_id.as_deref())?);
-        Ok(self)
-    }
-
-    /// Execute one stateful conversation turn.
-    ///
-    /// Returns `Either::Left(ResponsePayload)` for non-streaming requests, or
-    /// `Either::Right(BoxStream)` for streaming, where each yielded `String` is
-    /// a complete SSE frame ready to forward to the client.
-    ///
-    /// # Errors
-    /// Returns [`crate::executor::error::ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
-    pub async fn run(self) -> ExecutorResult<Either<ResponsePayload, BoxStream>> {
-        debug!(
-            model = %self.payload.model,
-            store = self.payload.store,
-            stream = self.payload.stream,
-            has_previous_response_id = self.payload.previous_response_id.is_some(),
-            has_conversation_id = self.payload.conversation_id.is_some(),
-            tools = self.payload.tools.as_ref().map_or(0, Vec::len),
-            "executor received responses request"
-        );
-        let max_stream_event_bytes = self.effective_max_stream_event_bytes();
-        let ctx =
-            super::rehydrate::rehydrate_with_continuation(self.payload, &self.exec_ctx, self.continuation).await?;
-        super::replay::validate_initial_input(&self.exec_ctx, &ctx.enriched_request, self.client_auth.as_deref())?;
-        let (ctx, tool_search_state) =
-            prepare_request_tools(ctx, &self.exec_ctx.conv_handler, &self.exec_ctx.resp_handler).await?;
-        if ctx.original_request.stream {
-            Ok(Either::Right(run_stream(
-                ctx,
-                tool_search_state,
-                self.exec_ctx,
-                self.client_auth,
-                max_stream_event_bytes,
-            )))
-        } else {
-            Ok(Either::Left(
-                Box::pin(run_blocking(
-                    ctx,
-                    tool_search_state,
-                    &self.exec_ctx,
-                    self.client_auth.as_deref(),
-                    max_stream_event_bytes,
-                ))
-                .await?,
-            ))
-        }
-    }
-}
-
-/// Execute one stateful conversation turn.
-///
-/// Thin shim over [`ExecuteRequest`] for callers that don't need per-request auth override.
-///
-/// # Errors
-/// Returns [`crate::executor::error::ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
-pub async fn execute(
-    request: RequestPayload,
-    exec_ctx: Arc<ExecutionContext>,
-) -> ExecutorResult<Either<ResponsePayload, BoxStream>> {
-    ExecuteRequest::new(request, exec_ctx).run().await
 }
 
 #[cfg(test)]

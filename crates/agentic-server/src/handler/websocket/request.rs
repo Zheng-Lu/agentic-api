@@ -9,12 +9,15 @@ use agentic_core::types::request_response::RequestPayload;
 
 use super::error::WsError;
 use super::responses::event::StreamId;
+use super::responses::telemetry::QueuedExecution;
 use crate::handler::opaque_request::{OpaqueRequestTransport, validate_opaque_request_fields};
 
 pub(super) struct WsRequest {
     pub(super) payload: RequestPayload,
     pub(super) stream_id: Option<StreamId>,
     pub(super) generate: Option<bool>,
+    /// Set when the request is queued; dispatch continues its execution span.
+    pub(super) execution: Option<QueuedExecution>,
 }
 
 #[derive(Debug)]
@@ -101,5 +104,6 @@ pub(super) fn parse_ws_request(text: &str, opaque_profile_selected: bool) -> Res
         payload,
         stream_id,
         generate,
+        execution: None,
     })
 }

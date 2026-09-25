@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};
+use tracing::Instrument as _;
 
 #[cfg(test)]
 use crate::config::DEFAULT_MAX_UPSTREAM_JSON_BYTES;
@@ -151,7 +152,22 @@ async fn send_request_with_policy(
     chunk_timeout: Duration,
     policy: ResponsePolicy,
 ) -> ExecutorResult<reqwest::Response> {
+    send_request_traced(client, url, body, auth, forwarded_headers, chunk_timeout, policy)
+        .instrument(super::telemetry::stages::http_client(url))
+        .await
+}
+
+async fn send_request_traced(
+    client: &reqwest::Client,
+    url: &str,
+    body: String,
+    auth: Option<&str>,
+    forwarded_headers: Option<&reqwest::header::HeaderMap>,
+    chunk_timeout: Duration,
+    policy: ResponsePolicy,
+) -> ExecutorResult<reqwest::Response> {
     let mut headers = forwarded_headers.cloned().unwrap_or_default();
+    super::telemetry::stages::inject_context(&mut headers);
     headers
         .entry(reqwest::header::CONTENT_TYPE)
         .or_insert(reqwest::header::HeaderValue::from_static("application/json"));
@@ -160,20 +176,30 @@ async fn send_request_with_policy(
         req = req.bearer_auth(key);
     }
 
-    let resp = req.send().await.map_err(|e| ExecutorError::LLMTransport {
-        status: if e.is_timeout() {
-            http::StatusCode::GATEWAY_TIMEOUT
-        } else {
-            http::StatusCode::BAD_GATEWAY
-        },
-        message: if e.is_timeout() {
-            "LLM timeout"
-        } else {
-            "LLM unavailable"
-        },
-    })?;
+    let resp = req
+        .send()
+        .await
+        .inspect_err(|e| {
+            tracing::Span::current().record("error.type", if e.is_timeout() { "timeout" } else { "transport" });
+            tracing::Span::current().record("otel.status_code", "ERROR");
+        })
+        .map_err(|e| ExecutorError::LLMTransport {
+            status: if e.is_timeout() {
+                http::StatusCode::GATEWAY_TIMEOUT
+            } else {
+                http::StatusCode::BAD_GATEWAY
+            },
+            message: if e.is_timeout() {
+                "LLM timeout"
+            } else {
+                "LLM unavailable"
+            },
+        })?;
 
+    tracing::Span::current().record("http.response.status_code", i64::from(resp.status().as_u16()));
     if !resp.status().is_success() {
+        tracing::Span::current().record("error.type", "upstream_status");
+        tracing::Span::current().record("otel.status_code", "ERROR");
         if matches!(policy, ResponsePolicy::Opaque) {
             // A provider can reflect input (including opaque state) in an error.
             // Never read, log, or forward that body or its headers. A redirect is

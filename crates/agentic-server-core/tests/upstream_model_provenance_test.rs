@@ -50,6 +50,8 @@ fn fault_injected_response(turn: &support::Turn, model: Option<&Value>, terminal
             }
             support::MockResponse::Sse(replay)
         }
+        // A status-only reply carries no model metadata to inject.
+        status @ support::MockResponse::Status(..) => status,
     }
 }
 

@@ -6,6 +6,7 @@ use crate::executor::error::ExecutorResult;
 use crate::executor::replay::record_round_provenance;
 use crate::executor::upstream::{fetch_blocking_payload, fetch_stream_payload};
 use crate::types::ResponsePayload;
+use tracing::Instrument as _;
 
 impl EngineOrchestration<'_> {
     pub(super) async fn fetch_round(
@@ -15,6 +16,7 @@ impl EngineOrchestration<'_> {
         round: usize,
         output_offset: usize,
     ) -> ExecutorResult<(ResponsePayload, Vec<EventFrame>)> {
+        let round_span = crate::executor::telemetry::stages::inference_round(round);
         let (mut payload, upstream_model, deferred_events) = if stream_upstream {
             let stream = fetch_stream_payload(
                 self.agent,
@@ -24,6 +26,7 @@ impl EngineOrchestration<'_> {
                 output_offset,
                 &self.response_budget,
             )
+            .instrument(round_span)
             .await?;
             if round == 0 {
                 self.registry.clear_mcp_list_tool_items();
@@ -37,6 +40,7 @@ impl EngineOrchestration<'_> {
                 &self.registry,
                 Some(&self.response_budget),
             )
+            .instrument(round_span)
             .await?;
             (response.payload, response.upstream_model, Vec::new())
         };

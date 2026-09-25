@@ -1,8 +1,8 @@
-//! Saturating usage accounting across inference and compaction rounds.
+//! Usage accumulation across inference rounds.
 
 use crate::types::io::ResponseUsage;
 
-fn add_usage(total: ResponseUsage, usage: ResponseUsage) -> ResponseUsage {
+pub(super) fn add_usage(total: ResponseUsage, usage: ResponseUsage) -> ResponseUsage {
     ResponseUsage {
         input_tokens: total.input_tokens.saturating_add(usage.input_tokens),
         output_tokens: total.output_tokens.saturating_add(usage.output_tokens),
