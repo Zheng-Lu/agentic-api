@@ -153,9 +153,15 @@ async fn session_forks_promotion_and_external_commit_preserve_each_items_origin(
         assert_upstream(provenance);
         let mut externally_completed = response.clone();
         externally_completed.id.clone_from(&ctx.response_id);
+        // An external completion has its own upstream item IDs; stored rows keep them.
         for item in &mut externally_completed.output {
-            if let OutputItem::Reasoning(item) = item {
-                item.replay_provenance = provenance;
+            match item {
+                OutputItem::Reasoning(item) => {
+                    item.replay_provenance = provenance;
+                    item.id.push_str("_external");
+                }
+                OutputItem::Message(message) => message.id.push_str("_external"),
+                _ => {}
             }
         }
         let committed = commit(ctx, externally_completed, &fixture.exec_ctx).await.unwrap();

@@ -37,19 +37,22 @@ async fn both_stores_preserve_per_item_provenance_and_opaque_bytes_across_batche
     let conversation = conversations.create().await.unwrap();
     let metadata = ResponseMetadata::default();
     // More than one portable insert batch, mixing input/output and legacy origins.
-    let items = (0..170)
-        .map(|index| {
-            item(
-                &format!("rs_{index}"),
-                index % 2 == 0,
-                match index % 3 {
-                    0 => None,
-                    1 => Some(ReasoningProvenance::client_submitted()),
-                    _ => Some(provider_provenance()),
-                },
-            )
-        })
-        .collect::<Vec<_>>();
+    let batch = |prefix: &str| {
+        (0..170)
+            .map(|index| {
+                item(
+                    &format!("{prefix}_{index}"),
+                    index % 2 == 0,
+                    match index % 3 {
+                        0 => None,
+                        1 => Some(ReasoningProvenance::client_submitted()),
+                        _ => Some(provider_provenance()),
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let items = batch("rs");
     conversations
         .persist(
             &conversation.conversation_id,
@@ -73,11 +76,13 @@ async fn both_stores_preserve_per_item_provenance_and_opaque_bytes_across_batche
         assert_eq!(responses.rehydrate(child).await.unwrap(), items);
     }
     // Also exercise inserts without a conversation, not only shared parent rows.
+    // Stored rows keep each item's public ID, so this batch needs its own IDs.
+    let standalone = batch("rs_standalone");
     responses
-        .persist("resp_standalone", None, items.clone(), &metadata)
+        .persist("resp_standalone", None, standalone.clone(), &metadata)
         .await
         .unwrap();
-    assert_eq!(responses.rehydrate("resp_standalone").await.unwrap(), items);
+    assert_eq!(responses.rehydrate("resp_standalone").await.unwrap(), standalone);
     let rows: Vec<(String, Option<String>)> = sqlx::query_as("SELECT data, reasoning_provenance FROM items")
         .fetch_all(pool.as_ref())
         .await

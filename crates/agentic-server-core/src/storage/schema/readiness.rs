@@ -24,7 +24,11 @@ pub(crate) async fn verify_persistence_writable(pool: &DbPool) -> DbResult<()> {
             )],
             Some(&conversation_id),
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            crate::storage::StorageError::Database(error) => error,
+            other => sqlx::Error::Configuration(Box::new(other)),
+        })?;
         crate::storage::models::response::create_in_tx(
             &mut transaction,
             &response_id,
@@ -123,7 +127,7 @@ mod tests {
         let mut migrations = sqlx::migrate!("./migrations");
         migrations.migrations = migrations
             .iter()
-            .filter(|migration| migration.version < 6)
+            .filter(|migration| migration.version < 7)
             .cloned()
             .collect::<Vec<_>>()
             .into();

@@ -1,6 +1,6 @@
-//! Convert Responses input into model-facing items without changing their order.
+//! Convert Responses input to the model-facing item sequence.
 
-use super::io::{InputItem, InputMessage, InputMessageContent, ResponsesInput};
+use super::{InputItem, InputMessage, InputMessageContent, ResponsesInput};
 
 impl From<&ResponsesInput> for Vec<InputItem> {
     fn from(input: &ResponsesInput) -> Self {

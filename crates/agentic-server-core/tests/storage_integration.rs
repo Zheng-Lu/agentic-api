@@ -595,7 +595,7 @@ async fn response_rehydration_rejects_invalid_or_missing_history() -> Result<(),
     let item_id = store.get("resp_corrupt").await?.history_item_ids.remove(0);
 
     // A malformed current row carrying provenance must fail closed. NULL-provenance
-    // pre-0006 rows use the bounded legacy compatibility projection instead.
+    // pre-0007 rows use the bounded legacy compatibility projection instead.
     let malformed = serde_json::json!({
         "type": "reasoning", "id": "rs_1", "encrypted_content": {"ciphertext": "sensitive-state"}
     })

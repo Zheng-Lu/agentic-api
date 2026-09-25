@@ -194,6 +194,7 @@ pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
     pub input: ResponsesInput,
     pub instructions: Option<String>,
     pub previous_response_id: Option<String>,
+    #[serde(alias = "conversation")]
     pub conversation_id: Option<String>,
     pub tools: Option<Vec<ResponsesTool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -496,6 +497,16 @@ impl ResponsePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_payload_accepts_openai_conversation_field() {
+        let request: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello", "conversation": "conv_test"
+        }))
+        .expect("OpenAI conversation field should deserialize");
+        assert_eq!(request.conversation_id.as_deref(), Some("conv_test"));
+        assert_eq!(request.in_process_feature(), Some("conversation_id"));
+    }
 
     #[test]
     fn request_payload_preserves_ignore_eos_upstream() {

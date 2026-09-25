@@ -55,6 +55,57 @@ fn fault_injected_response(turn: &support::Turn, model: Option<&Value>, terminal
     }
 }
 
+/// Stored rows keep upstream item IDs, so each replayed copy of a recording needs its own.
+fn with_unique_item_ids(responses: Vec<support::MockResponse>) -> Vec<support::MockResponse> {
+    fn rename(value: &mut Value, suffix: &str) {
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object.iter_mut() {
+                    match value {
+                        Value::String(id) if matches!(key.as_str(), "id" | "item_id") && !id.starts_with("resp") => {
+                            id.push_str(suffix);
+                        }
+                        _ => rename(value, suffix),
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|item| rename(item, suffix)),
+            _ => {}
+        }
+    }
+    responses
+        .into_iter()
+        .enumerate()
+        .map(|(index, response)| {
+            let suffix = format!("_replay{index}");
+            match response {
+                support::MockResponse::Json(body) => {
+                    let mut body: Value = serde_json::from_str(&body).unwrap();
+                    rename(&mut body, &suffix);
+                    support::MockResponse::Json(body.to_string())
+                }
+                support::MockResponse::Sse(body) => {
+                    let mut replay = String::with_capacity(body.len());
+                    for line in body.lines() {
+                        match line
+                            .strip_prefix("data: ")
+                            .and_then(|data| serde_json::from_str::<Value>(data).ok())
+                        {
+                            Some(mut event) => {
+                                rename(&mut event, &suffix);
+                                writeln!(replay, "data: {event}").unwrap();
+                            }
+                            None => writeln!(replay, "{line}").unwrap(),
+                        }
+                    }
+                    support::MockResponse::Sse(replay)
+                }
+                status @ support::MockResponse::Status(..) => status,
+            }
+        })
+        .collect()
+}
+
 async fn execute_and_read_provenance(fixture: &support::TestFixture, streaming: bool) -> ReasoningProvenance {
     let mut request = support::make_request("HELLO", true, streaming, None, None);
     request.model = "unchanged-client-alias".into();
@@ -105,7 +156,7 @@ async fn reported_model_changes_persisted_identity_even_when_request_alias_is_un
         Some(&json!("conflicting-snapshot")),
         true,
     ));
-    let fixture = support::TestFixture::new_with_responses(responses).await;
+    let fixture = support::TestFixture::new_with_responses(with_unique_item_ids(responses)).await;
     let mut identities = Vec::new();
     for index in 0..9 {
         let streaming = index % 2 == 1 || index == 8;
@@ -141,10 +192,10 @@ async fn recorded_gateway_alias_rewrite_is_unknown_in_lenient_and_rejected_in_st
         "/tests/cassettes/reasoning/responses/reasoning-gateway-gpt-5.6-streaming.yaml",
     ));
     let turn = &cassette.turns[0];
-    let fixture = support::TestFixture::new_with_responses(vec![
+    let fixture = support::TestFixture::new_with_responses(with_unique_item_ids(vec![
         support::MockResponse::from_turn(turn),
         fault_injected_response(turn, None, false),
-    ])
+    ]))
     .await;
     let ctx = rehydrate_conversation(
         support::make_request("HELLO", false, true, None, None),
@@ -168,12 +219,12 @@ async fn recorded_gateway_alias_rewrite_is_unknown_in_lenient_and_rejected_in_st
 async fn malformed_model_metadata_persists_unknown_evidence_in_both_body_formats() {
     let json = cassette(false);
     let sse = cassette(true);
-    let fixture = support::TestFixture::new_with_responses(vec![
+    let fixture = support::TestFixture::new_with_responses(with_unique_item_ids(vec![
         fault_injected_response(&json.turns[0], Some(&json!({"sensitive":"invalid"})), false),
         fault_injected_response(&json.turns[0], None, false),
         fault_injected_response(&sse.turns[0], Some(&json!({"sensitive":"invalid"})), true),
         fault_injected_response(&sse.turns[0], None, false),
-    ])
+    ]))
     .await;
     let invalid_json = execute_and_read_provenance(&fixture, false).await;
     let missing_json = execute_and_read_provenance(&fixture, false).await;

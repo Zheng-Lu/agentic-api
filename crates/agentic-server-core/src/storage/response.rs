@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::models::{item, response};
 use super::pool::DbPool;
 use super::types::{InOutItem, ResponseData, ResponseMetadata, StorageError, StoreResult};
-use crate::utils::common::{serialize_to_string, uuid7_str};
+use crate::utils::common::serialize_to_string;
 
 /// Response storage operations.
 #[derive(Clone, Debug)]
@@ -127,12 +127,8 @@ impl ResponseStore {
             Some(prev_id) => self.get(prev_id).await?.history_item_ids,
             None => Vec::new(),
         };
-        let mut items_ = Vec::new();
-        for any_item in new_items {
-            let item_id = uuid7_str("item_");
-            item_ids.push(item_id.clone());
-            items_.push(item::InsertItem::from_item(item_id, &any_item)?);
-        }
+        let items_ = item::serialize_new_items(new_items, item::ItemSource::ResponseHistory)?;
+        item_ids.extend(items_.iter().map(|item| item.id.clone()));
         let history_item_ids_json = serialize_to_string(&item_ids)?;
         let metadata_json = String::try_from(metadata)?;
 

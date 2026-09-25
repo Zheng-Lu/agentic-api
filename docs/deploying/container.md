@@ -152,7 +152,7 @@ the `revision` column from migration `0005_conversation_revision.sql`. Apply thi
 with a DDL-capable migration role before starting the DML-only gateway role. When using `psql`, pass
 `-v ON_ERROR_STOP=1` so any statement failure stops the script:
 
-Apply all repository migrations first, including `0006_reasoning_provenance.sql`, which adds nullable
+Apply all repository migrations first, including `0007_reasoning_provenance.sql`, which adds nullable
 `items.reasoning_provenance` TEXT without backfilling legacy rows. Startup and readiness require this column.
 Leave legacy values NULL; do not infer provenance from item JSON or response metadata.
 
