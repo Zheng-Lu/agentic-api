@@ -1,6 +1,7 @@
 mod context;
 mod summary;
 
+use super::telemetry::metrics::Stage;
 use super::telemetry::stages::CompactionTrigger;
 use context::item_has_meaningful_context;
 use summary::completed_summary_text;
@@ -329,6 +330,18 @@ async fn compact_items_with_trigger(
     auth: Option<&str>,
     trigger: CompactionTrigger,
 ) -> ExecutorResult<(Vec<InputItem>, ResponseUsage)> {
+    let timer = exec_ctx.metrics.stage(Stage::Compaction);
+    let summarized = summarize_items(request, input, exec_ctx, auth).await;
+    timer.finish_result(&summarized);
+    summarized
+}
+
+async fn summarize_items(
+    request: &RequestPayload,
+    input: ResponsesInput,
+    exec_ctx: &ExecutionContext,
+    auth: Option<&str>,
+) -> ExecutorResult<(Vec<InputItem>, ResponseUsage)> {
     let original_items = Vec::from(input);
     if !original_items.iter().any(item_has_meaningful_context) {
         return Err(ExecutorError::InvalidRequest(
@@ -371,6 +384,7 @@ async fn compact_items_with_trigger(
     let mut agent = agent_pipeline(ctx, None, None);
     let response =
         fetch_blocking_payload(&mut agent, exec_ctx, auth, &crate::tool::ToolRegistry::default(), None).await?;
+    exec_ctx.metrics.record_response_usage(response.usage.as_ref());
     let summary = completed_summary_text(&response)?;
 
     Ok((
