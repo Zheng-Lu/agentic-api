@@ -1,27 +1,25 @@
 mod context;
+mod explicit;
 mod summary;
 
 use super::telemetry::metrics::Stage;
 use super::telemetry::stages::CompactionTrigger;
 use context::item_has_meaningful_context;
+pub use explicit::compact_response;
 use summary::completed_summary_text;
 
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::executor::persist::persist_prepared_turn;
-use crate::executor::prepare::prepare_request_tools;
-use crate::executor::rehydrate::rehydrate_conversation;
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::upstream::{agent_pipeline, fetch_blocking_payload};
-use crate::tool::ToolSearchState;
 use crate::types::event::MessageStatus;
 use crate::types::io::input::latest_compaction_window;
 use crate::types::io::{
     CompactionItem, InputContent, InputFileContent, InputItem, InputMessage, InputMessageContent, ResponseUsage,
     ResponsesInput, ToolCallOutput, ToolOutputContent,
 };
-use crate::types::request_response::{CompactRequest, CompactedResponse, RequestPayload};
+use crate::types::request_response::RequestPayload;
 use crate::types::tools::ResponsesTool;
-use crate::utils::common::{serialize_to_value, utcnow_str, uuid7_str};
+use crate::utils::common::{serialize_to_value, uuid7_str};
 
 const COMPACTION_PROMPT: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a concise handoff summary that preserves current progress, decisions, constraints, unresolved work, and critical references for the next model. Return only the summary.";
 const ESTIMATED_BYTES_PER_TOKEN: u64 = 4;
@@ -438,67 +436,6 @@ pub(crate) async fn maybe_compact_context(
         continuation.mark_history_replaced();
     }
     Ok(Some(usage))
-}
-
-/// Compact direct input or a stored previous-response chain into a reusable item window.
-///
-/// # Errors
-///
-/// Returns an invalid-request error when neither input nor a previous response ID is supplied,
-/// and propagates history, inference, and persistence failures.
-pub async fn compact_response(
-    request: CompactRequest,
-    exec_ctx: &ExecutionContext,
-    auth: Option<&str>,
-) -> ExecutorResult<CompactedResponse> {
-    if request.input.is_none() && request.previous_response_id.is_none() {
-        return Err(ExecutorError::InvalidRequest(
-            "compaction requires input or previous_response_id".to_owned(),
-        ));
-    }
-
-    let mut payload = request_payload(
-        request.model,
-        request.input.unwrap_or_else(|| ResponsesInput::Items(Vec::new())),
-        request.instructions,
-    );
-    payload.previous_response_id = request.previous_response_id;
-    let ctx = rehydrate_conversation(payload, exec_ctx).await?;
-    let (mut ctx, tool_search_state) =
-        prepare_request_tools(ctx, &exec_ctx.conv_handler, &exec_ctx.resp_handler).await?;
-    let tool_search_metadata = tool_search_state.map(ToolSearchState::into_public_metadata);
-    let input = std::mem::replace(&mut ctx.enriched_request.input, ResponsesInput::Items(Vec::new()));
-    let (output, usage) = compact_items_with_trigger(
-        &ctx.enriched_request,
-        input,
-        exec_ctx,
-        auth,
-        CompactionTrigger::Explicit,
-    )
-    .await?;
-
-    let response_id = ctx.response_id.clone();
-    ctx.new_input_items.clone_from(&output);
-    match persist_prepared_turn(
-        ctx,
-        tool_search_metadata,
-        Vec::new(),
-        &exec_ctx.conv_handler,
-        &exec_ctx.resp_handler,
-    )
-    .await
-    {
-        Ok(()) | Err(ExecutorError::Storage(crate::StorageError::NotConfigured)) => {}
-        Err(error) => return Err(error),
-    }
-
-    Ok(CompactedResponse {
-        id: response_id,
-        object: "response.compaction".to_owned(),
-        created_at: utcnow_str(),
-        output,
-        usage,
-    })
 }
 
 #[cfg(test)]

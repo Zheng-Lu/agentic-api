@@ -171,8 +171,8 @@ impl ExecutorMetrics {
             ),
             stage_duration: seconds(
                 "agentic.stage.duration",
-                "Duration of one executor stage: rehydration, an inference round, a gateway tool call, \
-                 compaction, or persistence.",
+                "Duration of one executor stage: rehydration, an inference round, a gateway-executed tool \
+                 call, compaction, or persistence.",
                 DURATION_BOUNDARIES,
             ),
             inference_rounds: meter
@@ -299,6 +299,11 @@ impl StageTimer {
         self.finish(result.as_ref().err().map(FailureCategory::from));
     }
 
+    /// The stage turned out not to run; record nothing.
+    pub(crate) fn discard(mut self) {
+        self.finished = true;
+    }
+
     pub(crate) fn finish(mut self, failure: Option<FailureCategory>) {
         self.finished = true;
         self.metrics
@@ -417,7 +422,8 @@ impl ExecutionClock {
     }
 
     fn first(&self, seen: &AtomicBool, histogram: impl FnOnce(&Instruments) -> &Histogram<f64>) {
-        if !seen.swap(true, Ordering::Relaxed) {
+        // Every later event takes the load alone, without writing the flag.
+        if !seen.load(Ordering::Relaxed) && !seen.swap(true, Ordering::Relaxed) {
             histogram(&self.inner.metrics.instruments).record(
                 self.inner.started.elapsed().as_secs_f64(),
                 &[KeyValue::new(ATTR_API, self.inner.api.as_str())],
@@ -427,7 +433,9 @@ impl ExecutionClock {
 
     /// A frame was handed to the transport.
     pub(super) fn frame_handed(&self) {
-        self.inner.handed_frames.store(true, Ordering::Relaxed);
+        if !self.inner.handed_frames.load(Ordering::Relaxed) {
+            self.inner.handed_frames.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The transport asked for the next frame `waited` after taking the

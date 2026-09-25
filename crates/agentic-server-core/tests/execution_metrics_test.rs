@@ -332,6 +332,53 @@ async fn gateway_tool_round_counts_rounds_and_times_the_tool() {
     );
 }
 
+#[tokio::test]
+async fn explicit_compaction_times_its_stages_and_usage_without_an_execution() {
+    let metrics = Metrics::new();
+    let summary = MockResponse::Json(
+        json!({
+            "id": "resp_upstream", "object": "response", "created_at": 0, "model": "test-model",
+            "status": "completed",
+            "output": [{"id": "msg_upstream", "type": "message", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "summary", "annotations": []}]}],
+            "usage": {"input_tokens": 11, "input_tokens_details": {"cached_tokens": 0}, "output_tokens": 3,
+                      "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 14}
+        })
+        .to_string(),
+    );
+    let fixture = TestFixture::new_with_responses(vec![summary]).await;
+    let payload = serde_json::from_value(json!({"model": "test-model", "input": "compact me"})).unwrap();
+
+    Box::pin(agentic_core::executor::compact_response(
+        payload,
+        &measured(&fixture.exec_ctx, &metrics),
+        None,
+    ))
+    .await
+    .unwrap();
+
+    let points = metrics
+        .wait_for("persist stage", |points| {
+            total(points, "agentic.stage.duration", &[("agentic.stage", "persist")]) == 1
+        })
+        .await;
+    for stage in ["rehydrate", "compaction", "persist"] {
+        assert_eq!(
+            total(&points, "agentic.stage.duration", &[("agentic.stage", stage)]),
+            1,
+            "{stage}"
+        );
+    }
+    assert_eq!(
+        int_histogram_sum(&points, "gen_ai.client.token.usage", &[("gen_ai.token.type", "input")]),
+        11
+    );
+    assert!(
+        !recorded(&points, "agentic.execution.count"),
+        "compaction has no agentic.execute span"
+    );
+}
+
 async fn search_server() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
