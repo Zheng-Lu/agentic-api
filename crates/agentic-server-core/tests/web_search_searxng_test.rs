@@ -181,6 +181,7 @@ fn mixed_response() -> serde_json::Value {
 
 fn call(arguments: &str) -> FunctionToolCall {
     FunctionToolCall {
+        agent: None,
         id: "fc_searxng".to_owned(),
         call_id: "call_searxng".to_owned(),
         name: "web_search".to_owned(),

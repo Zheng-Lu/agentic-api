@@ -421,14 +421,16 @@ default You.com provider it is enabled when `YOU_API_KEY` and `YOU_API_BASE_URL`
 Secret and use the current You.com Search API base URL, `https://ydc-index.io`. To use Brave Search instead, set
 `AGENTIC_WEB_SEARCH_PROVIDER=brave` in the ConfigMap and store `BRAVE_API_KEY` in the Secret; no base URL is needed.
 The Brave free plan is rate limited to roughly one request per second, so the gateway runs batched queries serially by
-default; raise `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES` only on a paid plan. For a fully in-cluster deployment, set
-`AGENTIC_WEB_SEARCH_PROVIDER=searxng` and `AGENTIC_WEB_SEARCH_BASE_URL` to the in-cluster URL of a self-hosted SearXNG
-instance; no Secret is needed, and the server refuses to start if the base URL is missing. The SearXNG instance must
-enable the JSON format (`search.formats: [html, json]` in `settings.yml`), and if its `server.limiter` is on, the
-source address SearXNG observes for the gateway (normally the gateway Pod CIDR) must be listed in
-`botdetection.ip_lists.pass_ip` in `limiter.toml`, because the gateway never sends `Accept-Encoding: gzip` and the
-limiter otherwise rejects it. SearXNG still forwards queries to the engines it has enabled, so restrict those to
-internal or offline engines when the cluster must not reach the public internet.
+default; raise `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES` only on a paid plan. To use Tavily, set
+`AGENTIC_WEB_SEARCH_PROVIDER=tavily` and store `TAVILY_API_KEY` in the Secret; the endpoint defaults to
+`https://api.tavily.com` and batched queries inherit the gateway concurrency limit. For a deployment that reaches no
+search vendor, set `AGENTIC_WEB_SEARCH_PROVIDER=searxng` and `AGENTIC_WEB_SEARCH_BASE_URL` to the in-cluster URL of a
+self-hosted SearXNG instance; no Secret is needed, and the server refuses to start if the base URL is missing. The
+SearXNG instance must enable the JSON format (`search.formats: [html, json]` in `settings.yml`), and if its
+`server.limiter` is on, the source address SearXNG observes for the gateway (normally the gateway Pod CIDR) must be
+listed in `botdetection.ip_lists.pass_ip` in `limiter.toml`, because the gateway never sends `Accept-Encoding: gzip`
+and the limiter otherwise rejects it. SearXNG still forwards queries to the engines it has enabled, so restrict those
+to internal or offline engines when the cluster must not reach the public internet.
 
 Create the Secret from a protected environment file so the key does not enter shell history or process arguments:
 
@@ -441,10 +443,11 @@ kubectl --namespace agentic-api create secret generic agentic-api-web-search \
   kubectl apply --server-side --field-manager=agentic-api-operator --filename=-
 ```
 
-The file contains one line, `YOU_API_KEY=...` (or `BRAVE_API_KEY=...` for Brave Search). Remove it securely after
-creating the Secret. Patch the environment in the production overlay (for Brave, replace the `YOU_API_BASE_URL`
-operation with `path: /data/AGENTIC_WEB_SEARCH_PROVIDER`, `value: brave`; for SearXNG, skip the Secret and set
-`AGENTIC_WEB_SEARCH_PROVIDER` to `searxng` plus `AGENTIC_WEB_SEARCH_BASE_URL` to the instance URL):
+The file contains one line, `YOU_API_KEY=...` (or `BRAVE_API_KEY=...` for Brave Search, `TAVILY_API_KEY=...` for
+Tavily). Remove it securely after creating the Secret. Patch the environment in the production overlay (for Brave or
+Tavily, replace the `YOU_API_BASE_URL` operation with `path: /data/AGENTIC_WEB_SEARCH_PROVIDER` and `value: brave` or
+`value: tavily`; for SearXNG, skip the Secret entirely and set `AGENTIC_WEB_SEARCH_PROVIDER` to `searxng` plus
+`AGENTIC_WEB_SEARCH_BASE_URL` to the instance URL):
 
 ```yaml
 patches:
@@ -501,7 +504,8 @@ Remove the `Authorization` header when inbound OIDC validation is disabled. A to
 `status: "completed"` even when an individual `web_search_call` failed, so inspect the output item status rather than
 only the response status. A `403 Forbidden` from You.com means the external search request was rejected; confirm the
 documented base URL and refresh the Secret, restart the Deployment, and test again without printing the key. A failed
-`web_search_call` naming `BRAVE_API_KEY` means Brave rejected the key; one reporting `429` means the Brave plan's rate
-limit was hit, and the gateway does not retry it. With SearXNG, a `403` means the instance has not enabled the JSON
-format, and a `429` means its limiter blocked the gateway; the failure message names the `settings.yml` or
-`limiter.toml` change to make.
+`web_search_call` naming `BRAVE_API_KEY` or `TAVILY_API_KEY` means that provider rejected the key; one reporting `429`
+means the plan's rate limit was hit, and one reporting `432` or `433` means the Tavily plan's credit limit was
+exceeded. With SearXNG, a `403` means the instance has not enabled the JSON format and a `429` means its limiter
+blocked the gateway, with the failure message naming the `settings.yml` or `limiter.toml` change to make. The gateway
+does not retry any of these.

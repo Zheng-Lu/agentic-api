@@ -429,7 +429,25 @@ kubectl create secret generic agentic-api-secrets \
   --from-literal=brave-api-key="$BRAVE_API_KEY"
 ```
 
-To avoid a search vendor account, point the gateway at a self-hosted
+To use Tavily instead, select the provider and supply its key; the endpoint defaults
+to `https://api.tavily.com` and batched queries inherit the gateway concurrency limit:
+
+```yaml
+            - name: AGENTIC_WEB_SEARCH_PROVIDER
+              value: tavily
+            - name: TAVILY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agentic-api-secrets
+                  key: tavily-api-key
+```
+
+```console
+kubectl create secret generic agentic-api-secrets \
+  --from-literal=tavily-api-key="$TAVILY_API_KEY"
+```
+
+To avoid a search vendor account altogether, point the gateway at a self-hosted
 [SearXNG](https://docs.searxng.org/) Service instead. The gateway only talks to that
 instance; SearXNG forwards queries to the engines enabled in its `settings.yml`, so an
 air-gapped cluster must restrict it to internal or offline engines. No Secret is needed;

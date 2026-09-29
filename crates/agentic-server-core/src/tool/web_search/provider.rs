@@ -1,5 +1,5 @@
-//! Shared search-provider contract, normalized result types, and the response
-//! helpers every provider module reads its upstream replies through.
+//! Shared search-provider contract, normalized result types, and the
+//! response helpers every provider module reads through.
 
 use std::fmt;
 use std::future::Future;
@@ -124,7 +124,7 @@ where
 /// Reads a provider HTTP response body, failing as soon as it exceeds
 /// [`MAX_GATEWAY_TOOL_OUTPUT_BYTES`] so an oversized provider reply is never
 /// buffered in full. Every provider module reads its responses through here.
-pub(crate) async fn read_response_limited(
+pub(super) async fn read_response_limited(
     resp: reqwest::Response,
     provider: WebSearchProviderKind,
 ) -> Result<String, ToolError> {

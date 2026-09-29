@@ -88,6 +88,26 @@ pub(super) fn extract_store(bytes: &[u8]) -> bool {
         .unwrap_or(true)
 }
 
+#[allow(clippy::result_large_err)]
+pub(super) fn extract_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Response> {
+    serde_json::from_slice::<T>(bytes).map_err(|error| executor_error_response(ExecutorError::from(error)))
+}
+
+pub(super) fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "message": message
+        }
+    });
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("valid error response")
+}
+
 pub(super) fn extract_bearer(headers: &HeaderMap, config_key: Option<&str>) -> Option<String> {
     headers
         .get("authorization")

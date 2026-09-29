@@ -6,20 +6,52 @@ All notable changes to Agentic API are documented here.
 
 ### Added
 
-- Added SearXNG as a selectable backend for the gateway-owned `web_search` tool (#326, Phase 3 of #291). Select it
+- Added SearXNG as a selectable backend for the gateway-owned `web_search` tool (#326, part of #291). Select it
   with `AGENTIC_WEB_SEARCH_PROVIDER=searxng` or `[web_search] provider = "searxng"` and point
   `AGENTIC_WEB_SEARCH_BASE_URL` or `[web_search] base_url` at a self-hosted instance; the endpoint is mandatory
   (an absolute `http(s)` URL without a query or fragment, sub-path mounts allowed) and the server refuses to start
-  without it. No API key is needed; `SEARXNG_API_KEY` (or the variable named by
-  `api_key_env`) is sent as a `Bearer` token only when set. Web and news results come from one
-  `format=json&categories=general,news` request per query, split by category. The gateway adapts the shared tool
-  contract: `allowed_domains` / `blocked_domains` and the model's `include_domains` / `exclude_domains` are enforced
-  client-side on a label boundary, `count` is applied client-side after filtering, `freshness` maps to `time_range`
-  (date ranges are ignored), `language` is normalized to SearXNG's `xx` / `xx-YY` form, `safesearch` maps to
-  `0` / `1` / `2`, and `country` plus the You.com-specific arguments are ignored. A `403` is reported as the JSON
-  format being disabled, and a `429` explains SearXNG's bot-detection limiter, which rejects the gateway's
-  `Accept-Encoding`-free requests unless its address is on `pass_ip`; neither is retried. Each SearXNG `metadata[]`
-  entry carries `"provider": "searxng"`. Concurrency inherits `max_concurrent_gateway_calls`.
+  without it. No API key is needed; `SEARXNG_API_KEY` (or the variable named by `api_key_env`) is sent as a `Bearer`
+  token only when set. Web and news results come from one `format=json&categories=general,news` request per query,
+  split by category. The gateway adapts the shared tool contract: `allowed_domains` / `blocked_domains` and the
+  model's `include_domains` / `exclude_domains` are enforced client-side on a label boundary, `count` is applied
+  client-side after filtering, `freshness` maps to `time_range` (date ranges are ignored), `language` is normalized
+  to SearXNG's `xx` / `xx-YY` form, `safesearch` maps to `0` / `1` / `2`, and `country` plus the You.com-specific
+  arguments are ignored. A `403` is reported as the JSON format being disabled, and a `429` explains SearXNG's
+  bot-detection limiter, which rejects the gateway's `Accept-Encoding`-free requests unless its address is on
+  `pass_ip`; neither is retried. Each SearXNG `metadata[]` entry carries `"provider": "searxng"`. Concurrency
+  inherits `max_concurrent_gateway_calls`.
+
+### Changed
+
+- `WebSearchProviderKind` gains a `Searxng` variant (`"searxng"`) with no default endpoint, `SEARXNG_API_KEY` as its
+  conventional key variable, and no provider concurrency ceiling; `WebSearchProviderKind::ALL` lists it after
+  `Tavily`, so the operator-facing "expected one of" message is now `you, brave, tavily, searxng`.
+  `agentic_core::tool::SEARXNG_BASE_URL_HINT` and `validate_searxng_base_url` carry the operator-facing rules for
+  the mandatory endpoint (absolute `http(s)` URL with a host and no query or fragment), shared by the startup check
+  and the provider.
+
+## [0.8.0] - 2026-09-19
+
+### Added
+
+- Added opt-in OpenTelemetry traces and HTTP metrics with OTLP HTTP/protobuf export, optional gzip compression,
+  incoming W3C trace context, trace-correlated local logs, and deadline-bounded shutdown. Telemetry is disabled
+  by default; enable signals with `OTEL_TRACES_EXPORTER=otlp` and/or `OTEL_METRICS_EXPORTER=otlp`. Request spans
+  remain open through response-body completion or disconnect, and cancellation is distinguished from handler
+  panics. See [the observability guide](docs/deploying/observability.md) for configuration (#341).
+- Verified image preservation through the Responses gateway end to end (#253): integration coverage for mixed
+  text/image ordering, multiple images per turn, client-executed `view_image` tool output, `previous_response_id`
+  continuation, `conversation_id` rehydration, stateless `store: false` proxying, and compaction of retained
+  image-bearing user messages, over both the HTTP and WebSocket transports.
+- Recorded paired image cassettes — client → OpenAI as the reference and client → gateway → vLLM serving
+  `Qwen/Qwen2.5-VL-3B-Instruct` — for a text-and-image message, two interleaved images, a `previous_response_id`
+  follow-up, and a client-executed tool returning an image through a structured `function_call_output`, each
+  streaming and non-streaming. Replay coverage compares request shape, completed-response structure, the streaming
+  event lifecycle, and the history the gateway forwards on continuation; model wording is never compared (#253).
+  The cassette recorder accepts `--input-file` for the first of several turns and sends a tool handler's list of
+  content parts as a structured output array.
+- Added automated Docker Hub release and nightly container publishing, with optional 30-day nightly tag retention
+  when `DOCKERHUB_CLEANUP_ENABLED=true` and the credential has tag-read and tag-delete permissions (#322, #337).
 - Added typed per-model input-modality overrides to `config.toml`
   (`[models."<served-model-id>"] input_modalities = ["text", "image"]`), validated at startup:
   unknown modality names, empty lists, duplicates, and image-only lists are rejected with the
@@ -34,6 +66,23 @@ All notable changes to Agentic API are documented here.
   `crawl_timeout`, and `boost_domains` arguments are ignored. Rejected credentials and HTTP 429 responses fail the
   `web_search_call` without an automatic retry, naming the key variable or the upstream `Retry-After` value and never
   echoing the secret. Each Brave `metadata[]` entry carries `"provider": "brave"`.
+- Added Tavily as a selectable backend for the gateway-owned `web_search` tool (#327, Phase 3 of #291). Select it
+  with `AGENTIC_WEB_SEARCH_PROVIDER=tavily` or `[web_search] provider = "tavily"` and supply `TAVILY_API_KEY`; the
+  endpoint defaults to `https://api.tavily.com` and can be overridden with `AGENTIC_WEB_SEARCH_BASE_URL` or
+  `[web_search] base_url`. Each query is one `POST /search` with a JSON body and a bearer token; the key is never
+  placed in the body. `allowed_domains` / `blocked_domains` and the model's `include_domains` / `exclude_domains` are
+  forwarded to Tavily's native `include_domains` / `exclude_domains` and re-checked client-side, `count` is clamped
+  to Tavily's maximum of 20, `freshness` maps to `time_range` or to `start_date` / `end_date` widened by one day on
+  each side because Tavily's bounds are exclusive and sent with `filter_by_published_date` so undated results cannot
+  bypass the requested recency window, `language` keeps Tavily's documented compound tags (`zh-cn`) and
+  otherwise reduces to its primary subtag, `safesearch` maps to the boolean `safe_search`, and `country` plus the
+  You.com-specific
+  `livecrawl`, `livecrawl_formats`, `crawl_timeout`, and `boost_domains` arguments are ignored. Results fill
+  `results.web` with `published_date` as `page_age`; `results.news` stays empty because a second news search per
+  query would double credit usage. Rejected credentials, HTTP 429, and Tavily's 432/433 plan-limit statuses fail the
+  `web_search_call` without an automatic retry, naming the key variable or the upstream `Retry-After` value and never
+  echoing the secret. Each Tavily `metadata[]` entry carries `"provider": "tavily"`, Tavily's `request_id` as
+  `search_uuid`, and its `response_time` as `latency`. Tavily inherits the gateway concurrency limit.
 - Added `[web_search] max_concurrent_queries` and `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES` to cap concurrent
   provider requests inside one batched search. Brave defaults to `1` for its free-plan rate limit; You.com keeps
   inheriting `max_concurrent_gateway_calls`. The effective ceiling is the smallest of the gateway limit, this
@@ -41,14 +90,23 @@ All notable changes to Agentic API are documented here.
 
 ### Changed
 
-- `WebSearchProviderKind` gains a `Searxng` variant (`"searxng"`) with no default endpoint, `SEARXNG_API_KEY` as
-  its conventional key variable, and no provider concurrency ceiling. `WebSearchProviderKind::ALL` grows from
-  `[Self; 2]` to `[Self; 3]` (it enumerates every selectable provider and will grow again with each one); iterating
-  it is unaffected, but code that destructured or annotated the fixed length must be updated.
-  `agentic_core::tool::SEARXNG_BASE_URL_HINT` and `validate_searxng_base_url` carry the operator-facing rules for
-  the mandatory endpoint (absolute `http(s)` URL with a host and no query or fragment). The shared
-  `null_as_default` and `read_response_limited` helpers moved from `web_search/mod.rs` to `web_search/provider.rs`
-  (crate-private, re-exported unchanged).
+- Bounded Tokio runtime shutdown to 1 second after request draining, followed by a separate 3-second telemetry
+  shutdown deadline. In-flight blocking work no longer keeps process exit waiting indefinitely (#341).
+- Modeled `refusal` as an assistant-history content part so OpenAI-style history replays through the typed
+  Responses executor instead of being rejected as unmodeled (#253).
+- Changed Rust input-content APIs (#263): `InputTextContent`, `InputImageContent`, and `InputFileContent` now retain
+  unmodeled fields in `extra`. Use `InputTextContent::new(text)` or supply `extra: Default::default()` when migrating
+  struct literals. `InputContent` gains `Refusal(RefusalContent)` and replaces the unit `Unknown` variant with
+  `Unknown(String)`; update exhaustive matches and constructors. `Unknown` cannot be serialized and typed execution
+  rejects it with the original content type in the error. Existing content-type re-export paths are preserved.
+- Rust `agentic_core::config::Config` struct literals must now provide `responses: ResponsesConfig::default()`
+  (or validated custom limits). `ExecutionContext::new` keeps its signature and defaults; use
+  `ExecutionContext::with_responses_config` to override them. `ExecuteRequest::with_max_stream_event_bytes` and
+  `GatewayStreamAccumulator::with_max_stream_event_bytes` add explicit delivery limits; existing constructors and
+  `call_inference` remain available, with `inference::call_inference_limited` exposing a custom SSE-line limit.
+- Response-size failures now use `ExecutorError::ResourceLimitExceeded { limit, max_bytes }`; `ResourceLimit` is
+  re-exported from `agentic_core::executor`. Callers classifying size failures should handle this typed variant
+  instead of inspecting error messages (#304).
 - Modeled the Codex model catalog and the upstream model listing as typed Rust structs instead of
   untyped JSON, and reported an undecodable upstream `/v1/models` payload as `502` rather than
   serving it as an empty catalog (#252).
@@ -67,9 +125,21 @@ All notable changes to Agentic API are documented here.
   uses it. With `provider` unset, You.com behavior, configuration, and model-facing output are unchanged; a generated
   `config.toml` now records `provider = "you"` and leaves `api_key_env` unset so provider switches select the matching
   default credential variable.
+- `WebSearchProviderKind` gains a `Tavily` variant; `WebSearchProviderKind::ALL` is now a `&'static [Self]` slice
+  listing all three providers, so adding a provider no longer changes its type; and
+  `WebSearchHandler::from_config` builds the Tavily provider for it (#327). The shared `null_as_default` and
+  `read_response_limited` helpers moved from `tool/web_search/mod.rs` to `tool/web_search/provider.rs`; both were and
+  remain crate-private, so no public API changed.
 
 ### Fixed
 
+- Reported accumulated token usage across all hidden gateway-executed Messages tool rounds instead of reporting
+  only the final inference round, for both JSON responses and streaming responses (#325).
+- Fixed Python release setup, fixture readiness, and portable wheel builds; validate Linux x86_64, macOS Intel,
+  and macOS Apple Silicon wheels in CI. Included the package description and documentation links in PyPI
+  metadata (#305, #307, #309).
+- Built public container dependencies before Docker Hub authentication so repository-scoped credentials can
+  publish releases, and skipped unchanged nightly publications using recorded successful commit status (#337).
 - Rejected message content the typed Responses executor cannot convey — unmodeled part types and empty part arrays,
   alongside the existing `input_file` rejection — with a `400` naming the offending part, instead of forwarding a
   synthetic `{"type": "unknown"}` part or silently dropping it. Modeled parts keep their unmodeled extension fields

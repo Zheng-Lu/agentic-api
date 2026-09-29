@@ -155,7 +155,10 @@ what stops the HTTP catalog and a launcher catalog from disagreeing about image 
 |---|---|---|
 | `POST /v1/responses` | `responses` | `handler/http/responses.rs` |
 | `POST /v1/responses/compact` | `compact_response` | `handler/http/responses.rs` |
-| `POST /v1/conversations` | `conversations` | `handler/http/conversations.rs` |
+| `POST /v1/conversations` | `create_conversation` | `handler/http/conversations.rs` |
+| `GET/POST/DELETE /v1/conversations/{id}` | Conversation CRUD | `handler/http/conversations.rs` |
+| `POST/GET /v1/conversations/{id}/items` | Batch append and ordered listing | `handler/http/conversation_items.rs` |
+| `GET/DELETE /v1/conversations/{id}/items/{item_id}` | Item retrieval and removal | `handler/http/conversation_items.rs` |
 | `POST /v1/messages` | `messages` | `handler/http/messages.rs` |
 | `POST /v1/messages/count_tokens` | `count_tokens` | `handler/http/messages.rs` |
 | `GET /v1/models` | `models` | `handler/http/models.rs` |
@@ -370,12 +373,17 @@ access happen — those live in `tool/`, `executor/`, and `storage/` respectivel
   (the normalized `FunctionTool` and `ToolChoice`, distinct from tool *declarations*),
   `usage.rs` (token accounting structs). `ResponsesInput::model_input()` is the final
   model-visibility boundary used by `RequestPayload::to_upstream_request`: it removes
-  orchestration-only `McpListTools` and `CompactionTrigger` input items. A persisted
+  orchestration-only `McpListTools`, `CompactionTrigger`, and public collaboration input items. A persisted
   `Compaction` item is different: the latest checkpoint supersedes earlier model
   context and is converted into an assistant `output_text` summary, while canonical
   retained user messages and items after the checkpoint remain. This keeps rich
   continuation state available to orchestration without sending unsupported public
   item types to vLLM.
+- **`types/io/multi_agent.rs`** — public collaboration output items and agent-message
+  content. Its `input` module defines replay forms with optional IDs; output IDs remain
+  required. Agent-message content includes text, images, files, refusals and encrypted
+  parts, preserving response content during replay. These wire types do not impose a
+  storage policy; stored-only execution is a gateway admission constraint.
 - **`types/tools/params.rs`** — the tool **declaration** shapes a client sends:
   `ResponsesTool` (tagged enum: `Function`, `ToolSearch`, `Mcp`, `WebSearch`, `FileSearch`,
   `CodeInterpreter`, `Namespace`, `Custom`, `Unknown`) and each variant's param struct.
@@ -507,9 +515,10 @@ call inference, run the tool loop, persist. `agentic-server` never reaches past 
   `run_blocking`, and `run_stream` (spawns the loop, forwards events as SSE, persists
   before yielding the terminal event). `engine/streaming.rs` owns the streaming task's
   cancellation, failure delivery, and terminal validation before persistence.
-- **`persist.rs`** — `persist_response`/`persist_turn`, which route to
-  `ConversationHandler` or `ResponseHandler` in `modes/` depending on whether the turn
-  is conversation-scoped or response-scoped.
+- **`persist.rs`** — `persist_response`/`persist_turn`, which apply the request's
+  storage policy (`should_persist`: a no-session `store: false` turn is not written) and
+  route to `ConversationHandler` or `ResponseHandler` in `modes/` depending on whether the
+  turn is conversation-scoped or response-scoped.
 - **`compaction.rs`** — `compact_response()` (the explicit `/v1/responses/compact`
   path) and `maybe_compact_context()` (automatic, threshold-triggered, called from the
   round loop before each inference call).
@@ -604,6 +613,11 @@ semantic identities, and `json.rs` contains strict JSON response-shape validatio
 `active.rs` dispatches exhaustively to per-kind state; `active_text.rs` owns message
 parts and reasoning text/summary accounting. Both JSON and SSE ultimately use the same finalization
 state.
+
+Shared `response.content_part.*` events identify an item by output index and item ID,
+not by content type. Normalization parses a typed completed part; the existing slot
+resolves whether it belongs to a message or an agent message. Each owner's state
+validates the allowed content, duplicate completion and consistency with the final item.
 
 Output items are constructed through their `TryFrom<&EventPayload>` implementations in
 `types/io/output.rs`. Active slots fold deltas in place and use the type's `ApplyDone`
@@ -833,6 +847,13 @@ function tools and truncated rounds remain terminal. A completed client-executed
 calls and await the client's output. Token limits, other stop reasons and streams
 without a completed round keep their original terminal semantics.
 
+Hide-the-call covers every terminal round, not only a mixed one. A round can end while a
+gateway `tool_use` is present whenever the stop reason is not a tool-call stop — a
+`max_tokens` truncation mid-call, or an `end_turn` the context does not accept — and that
+call is never executed. `messages_loop.rs`'s `deliver` strips gateway-owned `tool_use`
+blocks from the returned message, matching the streaming accumulator, which suppresses them
+on every round. The assistant turn fed back to the model still carries the call.
+
 Each round's `usage` is folded into `messages_usage.rs`'s `MessagesUsageTotals`, so when
 hidden gateway rounds ran, the returned message (JSON) and the terminal `message_delta` (SSE)
 report the saturating sum of the Anthropic token counters across every round rather than the
@@ -850,14 +871,19 @@ round that omits `usage` still reports the hidden rounds' counters.
   connection URL, plus URL redaction for safe logging.
 - **`schema.rs`** — migrations and readiness (`PoolWithSchema::ensure_schema_ready`),
   including a path for a supervisor-managed schema that skips running migrations
-  itself and just verifies compatibility.
+  itself and just verifies compatibility. Readiness probes live in `schema/readiness.rs`.
+- **`conversation/api.rs`** — tenant-scoped conversation and item CRUD. Item ownership is checked through
+  the conversation so Responses-persisted items are visible too. Item writes share `lock_in_tx` with
+  turn persistence; a monotonic conversation revision makes deletions invalidate active snapshots.
+  Removal detaches items rather than destroying history referenced by stored responses.
 - **`models/`** — raw `sqlx::FromRow` row structs per table (`Conversation`, `Item`,
   `Response`) plus their raw, transaction-aware SQL functions (`create_in_tx`, `get`,
   `lock_in_tx`, ...). This is the literal DB row shape: JSON columns are still strings
   here.
 - **`types/`** — the conversion layer from those raw rows into business types, via
   `From`/`TryFrom` impls: `ConversationData`/`ConversationSnapshot`, `ResponseData`/
-  `ResponseMetadata` (parses the JSON metadata column into a typed struct),
+  `ResponseMetadata` (parses the JSON metadata column into a typed struct, including an optional
+  terminal `ResponsePayload` snapshot for GET retrieval),
   `InOutItem` (parses an `Item.data` JSON blob back into a typed `InputItem` or
   `OutputItem`), and `StorageError`. `InOutItem::into_input_items` turns a full
   history into the `Vec<InputItem>` used for continuation processing: stored
@@ -886,6 +912,12 @@ round that omits `usage` still reports the hidden rounds' counters.
   `executor/modes/response.rs`, described above. (Integration tests and benches import
   them directly for fixtures — that's expected and fine; production code paths should
   not.)
+
+Stored Responses snapshots are written in the same transaction as response history. Retrieval goes through
+`ResponseHandler::retrieve`, independently of upstream availability. Continuation checkpoints omit the
+snapshot to avoid retaining a duplicate response; they continue to use canonical history and effective
+settings. Legacy history-only records remain usable for continuation, but GET retrieval reports a conflict
+rather than fabricating status, usage, or output.
 
 ### `tool/` — the tool framework
 
@@ -988,7 +1020,8 @@ declaration until they have a complete handler and execution path.
     are returned for the client to resolve; the gateway does not execute them.
   - **Gateway-owned / built-in** tools implement both traits: see `web_search/mod.rs`
     (`WebSearchHandler`, backed by the configured `WebSearchProvider` in `web_search/you.rs`,
-    `web_search/brave.rs`, or `web_search/searxng.rs`) and `mcp/handler.rs` (`McpHandler`, backed
+    `web_search/brave.rs`, `web_search/tavily.rs`, or `web_search/searxng.rs`) and `mcp/handler.rs` (`McpHandler`,
+    backed
     by `mcp/client.rs`'s MCP protocol client and `mcp/pool.rs`'s connection pool). They
     have no client translator association because the gateway owns their execution and
     public lifecycle.

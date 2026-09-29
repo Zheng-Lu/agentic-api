@@ -2,14 +2,15 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
-use super::io::{
-    FunctionTool, InputItem, InputMessage, InputMessageContent, OutputItem, ResponseUsage, ResponsesInput, ToolChoice,
-};
+use super::io::{FunctionTool, InputItem, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use super::tools::ResponsesTool;
 use crate::tool::{CodexNamespaceHandler, CustomHandler, ToolError};
-use crate::utils::common::serialize_to_string;
+
+mod response_stream;
+mod serde_helpers;
+use serde_helpers::{default_true, is_absent_or_default_tool_choice, serialize_upstream_tool_choice};
 
 /// Standard Responses API reasoning generation settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,7 +29,7 @@ pub struct ReasoningConfig {
 }
 
 /// Responses text-generation settings forwarded to the upstream service.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ResponseTextConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,6 +166,7 @@ impl utoipa::PartialSchema for RequestPayload {
                 ObjectBuilder::new().schema_type(SchemaType::from_iter([Type::Object, Type::Null])),
             )
             .property("parallel_tool_calls", nullable_bool())
+            .property("prompt_cache_key", nullable_str())
             .property("cache_salt", nullable_str())
             .property(
                 "context_management",
@@ -182,13 +184,17 @@ impl utoipa::ToSchema for RequestPayload {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A Responses request. Rust's derived default uses `store: false`; JSON deserialization
+/// uses `store: true` when storage is not specified. Set `store` explicitly when constructing
+/// a stored request with struct update syntax.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(bound(serialize = "Box<T>: Serialize", deserialize = "Box<T>: Deserialize<'de>"))]
 pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
     pub model: String,
     pub input: ResponsesInput,
     pub instructions: Option<String>,
     pub previous_response_id: Option<String>,
+    #[serde(alias = "conversation")]
     pub conversation_id: Option<String>,
     pub tools: Option<Vec<ResponsesTool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,13 +218,11 @@ pub struct RequestPayload<T: ?Sized = ResponseTextConfig> {
     pub metadata: Option<Value>,
     pub parallel_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_salt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Vec<ContextManagement>>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Serialize)]
@@ -228,8 +232,8 @@ pub struct UpstreamRequest<'a> {
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<&'a str>,
-    /// Tools forwarded to vLLM. Function-like declarations are normalized to
-    /// ordinary function tools.
+    /// Tools forwarded to vLLM. Function-like declarations are normalized to ordinary function
+    /// tools.
     /// Skipped when empty so vLLM does not receive an empty array.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<UpstreamTool>>,
@@ -259,6 +263,8 @@ pub struct UpstreamRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_salt: Option<&'a str>,
 }
 
@@ -270,25 +276,6 @@ pub struct UpstreamRequest<'a> {
 #[serde(untagged)]
 pub enum UpstreamTool {
     Function(FunctionTool),
-}
-
-// serde's `skip_serializing_if` requires a `&Option<T>` receiver, so the
-// idiomatic `Option<&T>` clippy suggests does not apply here.
-#[allow(clippy::ref_option)]
-fn is_absent_or_default_tool_choice(choice: &Option<ToolChoice>) -> bool {
-    choice.as_ref().is_none_or(|choice| matches!(choice, ToolChoice::Auto))
-}
-
-// serde's `serialize_with` passes a reference to the field's concrete type.
-#[allow(clippy::ref_option)]
-fn serialize_upstream_tool_choice<S>(choice: &Option<ToolChoice>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    choice
-        .as_ref()
-        .map(ToolChoice::normalized_for_upstream)
-        .serialize(serializer)
 }
 
 impl<T: ?Sized> RequestPayload<T> {
@@ -352,6 +339,7 @@ impl<T: ?Sized> RequestPayload<T> {
             truncation: self.truncation,
             metadata: self.metadata,
             parallel_tool_calls: self.parallel_tool_calls,
+            prompt_cache_key: self.prompt_cache_key,
             cache_salt: self.cache_salt,
             context_management: self.context_management,
         })
@@ -401,7 +389,7 @@ impl RequestPayload {
         });
         let tools = tools.filter(|tools| !tools.is_empty());
         let namespace_map = CodexNamespaceHandler.build_namespace_map(self.tools.as_deref())?;
-        let input = CodexNamespaceHandler.resolve_input(namespace_map.as_ref(), self.input.model_input());
+        let input = CodexNamespaceHandler.resolve_input(namespace_map.as_ref(), self.input.normalized_model_input());
         let tool_choice = CodexNamespaceHandler.resolve_tool_choice(namespace_map.as_ref(), self.tool_choice.as_ref());
         CustomHandler::validate_tool_choice(self.tools.as_deref(), &tool_choice)?;
         Ok(UpstreamRequest {
@@ -421,6 +409,7 @@ impl RequestPayload {
             truncation: self.truncation.as_deref(),
             metadata: self.metadata.as_ref(),
             parallel_tool_calls,
+            prompt_cache_key: self.prompt_cache_key.as_deref(),
             cache_salt: self.cache_salt.as_deref(),
         })
     }
@@ -491,98 +480,51 @@ pub struct ResponsePayload {
     pub tool_choice: Option<ToolChoice>,
 }
 
-impl ResponsePayload {
-    #[must_use]
-    pub fn as_created_response_chunk(&self) -> String {
-        let mut response = self.clone();
-        "in_progress".clone_into(&mut response.status);
-        let event = json!({
-            "type": "response.created",
-            "response": response,
-        });
-        let json_str = serialize_to_string(&event).unwrap_or_else(|_| String::new());
-        format!("data: {json_str}\n\n")
-    }
-
-    #[must_use]
-    pub fn as_responses_chunk(&self) -> String {
-        let json_str = serialize_to_string(self).unwrap_or_else(|_| String::new());
-        format!("data: {json_str}\n\n")
-    }
-
-    #[must_use]
-    pub fn as_terminal_response_chunk(&self) -> String {
-        let event = json!({
-            "type": self.terminal_event_type(),
-            "response": self,
-        });
-        let json_str = serialize_to_string(&event).unwrap_or_else(|_| String::new());
-        format!("data: {json_str}\n\n")
-    }
-
-    pub(crate) fn terminal_event_type(&self) -> &'static str {
-        match self.status.as_str() {
-            "incomplete" => "response.incomplete",
-            "failed" | "error" => "response.failed",
-            "in_progress" => "response.in_progress",
-            _ => "response.completed",
-        }
-    }
-}
-
-impl From<&ResponsesInput> for Vec<InputItem> {
-    fn from(input: &ResponsesInput) -> Self {
-        match input {
-            ResponsesInput::Text(text) => vec![InputItem::Message(InputMessage {
-                id: None,
-                role: "user".into(),
-                status: None,
-                content: InputMessageContent::Text(text.clone()),
-            })],
-            ResponsesInput::Items(items) => items
-                .iter()
-                .filter_map(|item| match item {
-                    InputItem::Unknown => None,
-                    InputItem::ShellCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
-                    InputItem::ShellCallOutput(output) => Some(InputItem::FunctionCallOutput(output.clone().into())),
-                    InputItem::CustomToolCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
-                    InputItem::CustomToolCallOutput(output) => {
-                        Some(InputItem::FunctionCallOutput(output.clone().into()))
-                    }
-                    item => Some(item.clone()),
-                })
-                .collect(),
-        }
-    }
-}
-
-impl From<ResponsesInput> for Vec<InputItem> {
-    fn from(input: ResponsesInput) -> Self {
-        match input {
-            ResponsesInput::Text(text) => vec![InputItem::Message(InputMessage {
-                id: None,
-                role: "user".into(),
-                status: None,
-                content: InputMessageContent::Text(text),
-            })],
-            ResponsesInput::Items(items) => items
-                .into_iter()
-                .filter_map(|item| match item {
-                    InputItem::Unknown => None,
-                    InputItem::ShellCall(call) => Some(InputItem::FunctionCall(call.into())),
-                    InputItem::ShellCallOutput(output) => Some(InputItem::FunctionCallOutput(output.into())),
-                    InputItem::CustomToolCall(call) => Some(InputItem::FunctionCall(call.into())),
-                    InputItem::CustomToolCallOutput(output) => Some(InputItem::FunctionCallOutput(output.into())),
-                    item => Some(item),
-                })
-                .collect(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_struct_defaults_match_minimal_wire_request() {
+        let wire: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello"
+        }))
+        .unwrap();
+        let fixture: RequestPayload = RequestPayload {
+            model: "test-model".into(),
+            input: ResponsesInput::Text("hello".into()),
+            store: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(fixture).unwrap(),
+            serde_json::to_value(wire).unwrap()
+        );
+    }
+
+    #[test]
+    fn rust_defaults_do_not_make_required_wire_fields_optional() {
+        let default: RequestPayload = RequestPayload::default();
+        assert!(!default.store);
+        assert!(matches!(default.input, ResponsesInput::Items(items) if items.is_empty()));
+
+        for wire in [
+            serde_json::json!({"model": "test-model"}),
+            serde_json::json!({"input": "hello"}),
+        ] {
+            assert!(serde_json::from_value::<RequestPayload>(wire).is_err());
+        }
+    }
+
+    #[test]
+    fn request_payload_accepts_openai_conversation_field() {
+        let request: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hello", "conversation": "conv_test"
+        }))
+        .expect("OpenAI conversation field should deserialize");
+        assert_eq!(request.conversation_id.as_deref(), Some("conv_test"));
+        assert_eq!(request.in_process_feature(), Some("conversation_id"));
+    }
 
     #[test]
     fn request_payload_preserves_ignore_eos_upstream() {
@@ -662,6 +604,55 @@ mod tests {
             .expect("upstream request should serialize");
 
         assert_eq!(upstream["cache_salt"], "tenant-a");
+    }
+
+    #[test]
+    fn request_payload_omits_absent_and_forwards_present_prompt_cache_key_upstream() {
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello"
+        }))
+        .expect("request should deserialize");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert!(upstream.get("prompt_cache_key").is_none());
+
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "prompt_cache_key": "workspace-a"
+        }))
+        .expect("request should deserialize");
+        let upstream = serde_json::to_value(payload.to_upstream_request(false).expect("request should normalize"))
+            .expect("upstream request should serialize");
+        assert_eq!(upstream["prompt_cache_key"], "workspace-a");
+
+        let null_payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "prompt_cache_key": null
+        }))
+        .expect("null should deserialize as an absent key");
+        let upstream = serde_json::to_value(
+            null_payload
+                .to_upstream_request(false)
+                .expect("request should normalize"),
+        )
+        .expect("upstream request should serialize");
+        assert!(upstream.get("prompt_cache_key").is_none());
+
+        for invalid in [
+            serde_json::json!(1),
+            serde_json::json!(true),
+            serde_json::json!({"tenant": "a"}),
+        ] {
+            let result = serde_json::from_value::<RequestPayload>(serde_json::json!({
+                "model": "test-model",
+                "input": "hello",
+                "prompt_cache_key": invalid
+            }));
+            assert!(result.is_err(), "non-string prompt_cache_key must be rejected");
+        }
     }
 
     #[test]

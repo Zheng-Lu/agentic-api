@@ -2,13 +2,15 @@
 //!
 //! `mod.rs` owns the OpenAI-facing adapter: the [`WebSearchHandler`], the
 //! mapping to public `web_search_call` output items. [`provider`] defines the
-//! private provider contract, normalized result types, and shared response helpers. [`args`] parses the model's
-//! arguments; provider modules ([`you`], [`brave`], [`searxng`]) shape requests and map responses.
+//! private provider contract, normalized result types, and the response helpers every provider shares. [`args`]
+//! parses the model's arguments; provider modules ([`you`], [`brave`], [`tavily`], [`searxng`]) shape requests and
+//! map responses.
 
 pub(crate) mod args;
 pub(crate) mod brave;
 mod provider;
 pub(crate) mod searxng;
+pub(crate) mod tavily;
 pub(crate) mod you;
 
 use std::collections::HashMap;
@@ -27,9 +29,10 @@ use self::args::{MAX_WEB_SEARCH_QUERIES, WebSearchArguments};
 use self::brave::BraveSearchProvider;
 use self::provider::{
     ApiKey, WebSearchProvider, WebSearchProviderMetadata, WebSearchProviderResponse, WebSearchResult, clean_base_url,
+    null_as_default, read_response_limited,
 };
-pub(crate) use self::provider::{null_as_default, read_response_limited};
 use self::searxng::SearxngSearchProvider;
+use self::tavily::TavilySearchProvider;
 use self::you::{YOU_API_BASE_URL, YOU_API_KEY, YouSearchProvider};
 use super::handler::MAX_GATEWAY_TOOL_OUTPUT_BYTES;
 use super::handler::{GatewayExecutor, GatewayToolEventPlan, ToolError, ToolHandler, ToolOutput};
@@ -230,11 +233,23 @@ impl WebSearchHandler {
                     .or(WebSearchProviderKind::Brave.default_max_concurrent_queries())
                     .unwrap_or(max_concurrent_gateway_calls),
             )),
+            WebSearchProviderKind::Tavily => Arc::new(TavilySearchProvider::from_values(
+                client,
+                config.api_key.clone(),
+                config.base_url.clone(),
+                config
+                    .max_concurrent_queries
+                    .or(WebSearchProviderKind::Tavily.default_max_concurrent_queries())
+                    .unwrap_or(max_concurrent_gateway_calls),
+            )),
             WebSearchProviderKind::Searxng => Arc::new(SearxngSearchProvider::from_values(
                 client,
                 config.api_key.clone(),
                 config.base_url.clone(),
-                config.max_concurrent_queries.unwrap_or(max_concurrent_gateway_calls),
+                config
+                    .max_concurrent_queries
+                    .or(WebSearchProviderKind::Searxng.default_max_concurrent_queries())
+                    .unwrap_or(max_concurrent_gateway_calls),
             )),
         };
         let effective = effective_query_concurrency(provider.as_ref(), requested);

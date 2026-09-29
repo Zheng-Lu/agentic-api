@@ -15,8 +15,16 @@ use utoipa::OpenApi;
         crate::handler::http::models::ready,
         crate::handler::http::models::models,
         crate::handler::http::responses::responses,
+        crate::handler::http::responses::retrieve_response,
         crate::handler::http::responses::compact_response,
-        crate::handler::http::conversations::conversations,
+        crate::handler::http::conversations::create_conversation,
+        crate::handler::http::conversations::retrieve_conversation,
+        crate::handler::http::conversations::update_conversation,
+        crate::handler::http::conversations::delete_conversation,
+        crate::handler::http::conversation_items::create_item,
+        crate::handler::http::conversation_items::list_items,
+        crate::handler::http::conversation_items::retrieve_item,
+        crate::handler::http::conversation_items::delete_item,
         crate::handler::http::messages::messages,
         crate::handler::http::messages::count_tokens,
     ),
@@ -48,6 +56,20 @@ use utoipa::OpenApi;
         agentic_core::types::io::CompactionItem,
         agentic_core::types::io::CustomToolCallOutputMessage,
         agentic_core::types::io::OutputItem,
+        agentic_core::types::io::AgentAttribution,
+        agentic_core::types::io::MultiAgentAction,
+        agentic_core::types::io::MultiAgentCall,
+        agentic_core::types::io::InputMultiAgentCall,
+        agentic_core::types::io::MultiAgentCallOutput,
+        agentic_core::types::io::InputMultiAgentCallOutput,
+        agentic_core::types::io::MultiAgentCallOutputContent,
+        agentic_core::types::io::AgentMessage,
+        agentic_core::types::io::InputAgentMessage,
+        agentic_core::types::io::AgentMessageContent,
+        agentic_core::types::io::MessagePhase,
+        agentic_core::types::io::OutputMessageContent,
+        agentic_core::types::io::OutputTextLogprob,
+        agentic_core::types::io::TopLogprob,
         agentic_core::types::io::OutputTextContent,
         agentic_core::types::io::OutputMessage,
         agentic_core::types::io::FunctionToolCall,
@@ -55,6 +77,7 @@ use utoipa::OpenApi;
         agentic_core::types::io::CustomToolCall,
         agentic_core::types::io::ShellCall,
         agentic_core::types::io::ShellCallAction,
+        agentic_core::types::io::ShellCallLimit,
         agentic_core::types::io::ShellCallStatus,
         agentic_core::types::io::ShellCallOutputMessage,
         agentic_core::types::io::ShellCallOutputContent,
@@ -127,8 +150,15 @@ use utoipa::OpenApi;
         CodexModelsResponse,
         CodexModelObject,
         ModelsListResponse,
-        CreateConversationRequest,
-        ConversationResponse,
+        agentic_core::types::conversations::CreateConversationRequest,
+        agentic_core::types::conversations::ConversationResponse,
+        agentic_core::types::conversations::UpdateConversationRequest,
+        agentic_core::types::conversations::DeletedResponse,
+        agentic_core::types::conversations::CreateItemRequest,
+        agentic_core::types::conversations::ItemResponse,
+        agentic_core::types::conversations::ListItemsResponse,
+        agentic_core::types::conversations::ConversationItem,
+        agentic_core::types::conversations::ItemOrder,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -253,27 +283,6 @@ pub struct CodexModelObject {
 pub enum ModelsListResponse {
     OpenAi(ModelsResponse),
     Codex(CodexModelsResponse),
-}
-
-/// Request body for POST /v1/conversations.
-#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-pub struct CreateConversationRequest {
-    #[serde(default = "default_true")]
-    #[schema(default = true)]
-    pub store: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Response from POST /v1/conversations.
-#[derive(serde::Serialize, utoipa::ToSchema)]
-pub struct ConversationResponse {
-    pub id: String,
-    pub created_at: i64,
-    pub object: String,
-    pub metadata: serde_json::Value,
 }
 
 pub fn swagger_ui_router<S>() -> axum::Router<S>

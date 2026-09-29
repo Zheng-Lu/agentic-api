@@ -1,69 +1,27 @@
-use std::future::Future;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
+pub(super) mod history;
+mod policy;
+
+pub(super) use history::{append_gateway_calls_to_new_input, append_output_items_to_input, append_tool_outputs};
+pub(crate) use policy::GatewaySchedulerPolicy;
+#[cfg(test)]
+pub(super) use policy::MAX_CONCURRENT_MATERIALIZATIONS;
+
 use std::time::Duration;
 
 use futures::future::join_all;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
-use crate::config::DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS;
 use crate::events::SSEEventType;
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent, synthetic_event};
 use crate::executor::pipeline::emit_gateway_event;
-use crate::executor::request::RequestContext;
 use crate::executor::response_budget::ExecutorResponseBudget;
 use crate::tool::handler::MAX_GATEWAY_TOOL_OUTPUT_BYTES;
 use crate::tool::{GatewayBinding, ToolError, ToolOutput, ToolOwnership, ToolRegistry};
 use crate::types::io::output::{FunctionToolCall, GatewayCallStatus, McpCallStatus};
-use crate::types::io::{InputItem, OutputItem, ResponsesInput};
+use crate::types::io::{InputItem, OutputItem};
 use crate::types::request_response::ResponsePayload;
 use crate::utils::common::{serialize_to_string, serialize_to_value};
-
-pub(super) const MAX_CONCURRENT_MATERIALIZATIONS: usize = 16;
-
-/// Request-independent execution policy owned by one [`ExecutionContext`].
-///
-/// The nonzero type prevents a zero-capacity per-request semaphore. Distinct
-/// execution contexts retain their own limits instead of sharing process-global state.
-#[derive(Debug, Clone)]
-pub(crate) struct GatewaySchedulerPolicy {
-    max_concurrent_calls: NonZeroUsize,
-    materialization_permits: Arc<Semaphore>,
-}
-
-impl GatewaySchedulerPolicy {
-    #[must_use]
-    pub(crate) fn new(max_concurrent_calls: NonZeroUsize) -> Self {
-        // Each permit protects one handler whose output is capped at
-        // MAX_GATEWAY_TOOL_OUTPUT_BYTES. The policy is cloned with an
-        // ExecutionContext, so this bound is shared by concurrent requests
-        // (including WebSocket lanes) instead of being recreated per turn.
-        Self {
-            max_concurrent_calls,
-            materialization_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_MATERIALIZATIONS)),
-        }
-    }
-
-    /// Acquires one process-wide materialization slot shared by cloned execution contexts.
-    pub(crate) fn acquire_materialization_permit(
-        &self,
-    ) -> impl Future<Output = OwnedSemaphorePermit> + Send + 'static + use<> {
-        let materialization_permits = Arc::clone(&self.materialization_permits);
-        async move {
-            materialization_permits
-                .acquire_owned()
-                .await
-                .expect("materialization semaphore is never closed")
-        }
-    }
-}
-
-impl Default for GatewaySchedulerPolicy {
-    fn default() -> Self {
-        Self::new(DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS)
-    }
-}
 
 /// Per-call wall-clock budget. A tool exceeding this yields an error output fed
 /// back to the model (never a whole-request failure). `Duration::ZERO` disables
@@ -118,6 +76,7 @@ enum GatewayExecutionPlan {
 /// relationship cannot diverge.
 #[derive(Clone)]
 struct GatewayCallPlan {
+    tool_type: crate::tool::ToolType,
     item_index: usize,
     call: FunctionToolCall,
     execution: GatewayExecutionPlan,
@@ -174,6 +133,7 @@ impl GatewayScheduler {
                         GatewayExecutionPlan::Bound(binding.clone())
                     });
                 Some(GatewayCallPlan {
+                    tool_type: entry.tool_type,
                     item_index,
                     call: call.clone(),
                     execution,
@@ -268,6 +228,9 @@ impl GatewayScheduler {
         Ok(results)
     }
 
+    #[tracing::instrument(name = "agentic.tool.execute", skip_all, fields(
+        agentic.tool.r#type = super::telemetry::stages::tool_type(plan.tool_type)
+    ))]
     async fn run_one(
         &self,
         plan: GatewayCallPlan,
@@ -538,6 +501,9 @@ pub(super) async fn emit_gateway_start_events<'a>(
             | OutputItem::ShellCall(_)
             | OutputItem::Reasoning(_)
             | OutputItem::Compaction(_)
+            | OutputItem::MultiAgentCall(_)
+            | OutputItem::MultiAgentCallOutput(_)
+            | OutputItem::AgentMessage(_)
             | OutputItem::Unknown => {}
         }
     }
@@ -585,6 +551,9 @@ pub(super) async fn emit_gateway_completed_events<'a, T: GatewayPublicOutputSour
             | OutputItem::ToolSearchCall(_)
             | OutputItem::CustomToolCall(_)
             | OutputItem::Reasoning(_)
+            | OutputItem::MultiAgentCall(_)
+            | OutputItem::MultiAgentCallOutput(_)
+            | OutputItem::AgentMessage(_)
             | OutputItem::Unknown => continue,
         };
         let item = output_item_value(public_output)?;
@@ -634,46 +603,6 @@ pub(super) async fn execute_and_emit_output_calls(
         .await?;
     }
     Ok(gateway_results)
-}
-
-pub(super) fn append_input_item(input: &mut ResponsesInput, item: InputItem) {
-    match input {
-        ResponsesInput::Items(items) => items.push(item),
-        ResponsesInput::Text(text) => {
-            let text_input = ResponsesInput::Text(std::mem::take(text));
-            let mut items = Vec::<InputItem>::from(&text_input);
-            items.push(item);
-            *input = ResponsesInput::Items(items);
-        }
-    }
-}
-
-pub(super) fn append_output_items_to_input(input: &mut ResponsesInput, output_items: &[OutputItem]) {
-    for input_item in output_items.iter().filter_map(OutputItem::to_input_item) {
-        append_input_item(input, input_item);
-    }
-}
-
-pub(super) fn append_tool_outputs(ctx: &mut RequestContext, tool_outputs: Vec<InputItem>) {
-    for output in tool_outputs {
-        ctx.new_input_items.push(output.clone());
-        append_input_item(&mut ctx.enriched_request.input, output);
-    }
-}
-
-pub(super) fn append_gateway_calls_to_new_input(
-    ctx: &mut RequestContext,
-    output_items: &[OutputItem],
-    registry: &ToolRegistry,
-) {
-    ctx.new_input_items.extend(output_items.iter().filter_map(|item| {
-        let OutputItem::FunctionCall(call) = item else {
-            return None;
-        };
-        registry
-            .is_gateway_owned_name(&call.name)
-            .then(|| InputItem::FunctionCall(call.clone().into()))
-    }));
 }
 
 #[cfg(test)]
@@ -980,6 +909,7 @@ mod tests {
 
     fn web_search_call(call_id: &str) -> FunctionToolCall {
         FunctionToolCall {
+            agent: None,
             id: format!("fc_{call_id}"),
             call_id: call_id.to_owned(),
             name: "web_search".to_owned(),
@@ -1466,6 +1396,7 @@ mod tests {
         let mut call = web_search_call(call_id);
         call.name = name.to_owned();
         GatewayCallPlan {
+            tool_type: crate::tool::ToolType::WebSearch,
             item_index,
             events: GatewayEventPlan {
                 output_index: u32::try_from(item_index).expect("test item index fits in u32"),
@@ -1628,6 +1559,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_uses_shared_gateway_event_lifecycle_without_intermediate_event() {
         let public_output = [OutputItem::Compaction(CompactionItem {
+            agent: None,
             id: Some("cmp_1".to_owned()),
             encrypted_content: "durable summary".to_owned(),
         })];
@@ -1672,6 +1604,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_gateway_events_follow_openai_lifecycle() {
         let call = FunctionToolCall {
+            agent: None,
             id: "fc_1".to_owned(),
             call_id: "call_1".to_owned(),
             name: "mcp__counter__increment".to_owned(),
@@ -1772,6 +1705,7 @@ mod tests {
     #[tokio::test]
     async fn failed_mcp_gateway_events_keep_contiguous_sequence_numbers() {
         let call = FunctionToolCall {
+            agent: None,
             id: "fc_1".to_owned(),
             call_id: "call_1".to_owned(),
             name: "mcp__counter__increment".to_owned(),

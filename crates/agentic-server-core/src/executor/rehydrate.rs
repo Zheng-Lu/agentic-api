@@ -162,6 +162,9 @@ pub async fn rehydrate_in_session(
     rehydrate_with_continuation(request, exec_ctx, Some(continuation)).await
 }
 
+#[tracing::instrument(name = "agentic.rehydrate", skip_all, fields(
+    agentic.rehydrate.source = super::telemetry::stages::StateSource::from_request(&request).as_str()
+))]
 pub(crate) async fn rehydrate_with_continuation(
     request: RequestPayload,
     exec_ctx: &ExecutionContext,
@@ -424,6 +427,7 @@ mod tests {
 
     fn reasoning_item(content: &[&str], encrypted_content: Option<serde_json::Value>) -> InputItem {
         InputItem::Reasoning(ReasoningOutput {
+            agent: None,
             id: "rs_prior".to_owned(),
             content: content.iter().map(|text| ReasoningTextContent::new(*text)).collect(),
             summary: vec![serde_json::json!({"type": "summary_text", "text": "public summary"})],
@@ -571,6 +575,7 @@ mod tests {
             truncation: None,
             metadata: None,
             parallel_tool_calls: None,
+            prompt_cache_key: None,
             cache_salt: None,
             context_management: None,
         }
@@ -594,7 +599,7 @@ mod tests {
 
         let ctx = rehydrate_conversation(request(Some(&conversation.conversation_id), None), &exec_ctx).await?;
 
-        assert_eq!(ctx.conversation_version, Some(ConversationVersion::Empty));
+        assert_eq!(ctx.conversation_version, Some(ConversationVersion::default()));
         Ok(())
     }
 
@@ -622,8 +627,9 @@ mod tests {
 
         assert_eq!(
             ctx.conversation_version,
-            Some(ConversationVersion::LastResponse {
-                response_id: "resp_prior".to_owned(),
+            Some(ConversationVersion {
+                response_id: Some("resp_prior".to_owned()),
+                revision: 1,
                 last_sequence: Some(0),
             })
         );
