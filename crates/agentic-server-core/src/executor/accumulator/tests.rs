@@ -1875,6 +1875,69 @@ fn strict_ingestion_rejects_malformed_typed_reasoning_on_both_paths() {
     }
 }
 
+/// Lenient ingestion keeps what earlier releases relayed; strict still rejects it.
+#[test]
+fn lenient_ingestion_projects_reasoning_earlier_releases_accepted() {
+    let stream = |item: &serde_json::Value| {
+        [
+            serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}),
+            serde_json::json!({"type":"response.output_item.done","output_index":0,"item":item}),
+            serde_json::json!({"type":"response.completed","response":{"id":"resp_1","status":"completed"}}),
+        ]
+        .map(|event| format!("data: {event}"))
+    };
+    let json = |item: &serde_json::Value, validation| {
+        let mut acc = ResponseAccumulator::with_validation("resp_1".to_owned(), None, validation);
+        let body = serde_json::json!({"id":"resp_1","status":"completed","output":[item]});
+        acc.load_json_body(&body.to_string()).map(|()| acc.output)
+    };
+    let pre_typed = serde_json::json!({
+        "id": "rs_1", "type": "reasoning",
+        "content": [{"type": "provider_text", "text": "kept plaintext"}],
+        "summary": [{"type": "summary_text", "text": "kept summary"}, {"type": "reasoning_text", "text": "dropped"}],
+        "encrypted_content": {"ciphertext": "sensitive-state"},
+        "status": "failed",
+    });
+    let projected = serde_json::json!([{
+        "type": "reasoning", "id": "rs_1",
+        "content": [{"type": "reasoning_text", "text": "kept plaintext"}],
+        "summary": [{"type": "summary_text", "text": "kept summary"}],
+        "encrypted_content": null, "status": null,
+    }]);
+    let streamed = from_sse_lines(stream(&pre_typed), None);
+    assert_eq!(serde_json::to_value(&streamed.output).unwrap(), projected);
+    let parsed = json(&pre_typed, Validation::Lenient).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), projected);
+    let error = json(&pre_typed, Validation::Strict).unwrap_err();
+    assert!(!error.to_string().contains("sensitive-state"));
+
+    // Earlier releases rejected these too: JSON drops the item, and a stream keeps
+    // the opened item without the completion's fields.
+    for fields in [
+        serde_json::json!({"content": "not an array"}),
+        serde_json::json!({"content": [{"text": "part without a type"}]}),
+        serde_json::json!({"status": 5}),
+        serde_json::json!({"agent": "/root/worker"}),
+    ] {
+        let mut item = serde_json::json!({
+            "id": "rs_1", "type": "reasoning", "content": [{"type": "reasoning_text", "text": "from done"}]
+        });
+        item.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        assert!(json(&item, Validation::Lenient).unwrap().is_empty(), "{fields}");
+        let streamed = from_sse_lines(stream(&item), None);
+        assert_eq!(
+            serde_json::to_value(&streamed.output).unwrap(),
+            serde_json::json!([{
+                "type": "reasoning", "id": "rs_1", "content": [], "summary": [],
+                "encrypted_content": null, "status": null,
+            }]),
+            "{fields}"
+        );
+    }
+}
+
 #[test]
 fn done_only_reasoning_uses_output_index_order() {
     let lines = [

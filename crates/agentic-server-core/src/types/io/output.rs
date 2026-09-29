@@ -878,7 +878,13 @@ impl TryFrom<&EventPayload> for ReasoningOutput {
                 Ok(Self::new(id))
             }
             EventPayload::OutputItemDone { item, .. } => {
-                let Some(OutputItem::Reasoning(item)) = deserialize_from_value_opt::<OutputItem>(item.clone()) else {
+                // Strict ingestion validates the typed item first; lenient ingestion
+                // keeps what earlier releases accepted, as for JSON responses.
+                let item = match deserialize_from_value_opt::<OutputItem>(item.clone()) {
+                    Some(OutputItem::Reasoning(item)) => Some(item),
+                    _ => Self::from_legacy_value(item),
+                };
+                let Some(item) = item else {
                     return Err(ExecutorError::ParseError(
                         "expected a complete reasoning output item".into(),
                     ));

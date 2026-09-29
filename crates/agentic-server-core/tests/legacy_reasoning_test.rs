@@ -1,0 +1,238 @@
+//! Reasoning stored before typed reasoning stays readable and continuable. Shapes
+//! earlier releases could not have stored still fail closed.
+
+mod support;
+
+use std::sync::Arc;
+
+use agentic_core::executor::{ConversationHandler, ExecuteRequest, ExecutionContext, ExecutorError, ResponseHandler};
+use agentic_core::storage::{ConversationStore, InOutItem, ResponseMetadata, ResponseStore, StorageError};
+use agentic_core::types::ReasoningStatus;
+use agentic_core::types::io::{InputItem, OutputItem, ReasoningOutput, ReasoningTextContent, ReasoningTextKind};
+use serde_json::{Value, json};
+
+/// Persist one typed reasoning item, then rewrite its row to a shape an earlier release stored.
+async fn stored_legacy_row(legacy: serde_json::Value) -> (Arc<agentic_core::storage::DbPool>, ResponseStore) {
+    let pool = support::setup_pool().await;
+    let store = ResponseStore::new(Arc::clone(&pool));
+    let mut reasoning = ReasoningOutput::new("rs_legacy");
+    reasoning.content.push(ReasoningTextContent::new("placeholder"));
+    store
+        .persist(
+            "resp_legacy",
+            None,
+            vec![InOutItem::Input(InputItem::Reasoning(reasoning))],
+            &ResponseMetadata {
+                model: "Qwen/Qwen3-30B-A3B-FP8".into(),
+                ..ResponseMetadata::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (data,): (String,) = sqlx::query_as("SELECT data FROM items")
+        .fetch_one(pool.as_ref())
+        .await
+        .unwrap();
+    let mut data: serde_json::Value = serde_json::from_str(&data).unwrap();
+    for (key, value) in legacy.as_object().unwrap() {
+        data[key] = value.clone();
+    }
+    sqlx::query("UPDATE items SET data = $1")
+        .bind(data.to_string())
+        .execute(pool.as_ref())
+        .await
+        .unwrap();
+    (pool, store)
+}
+
+fn recording(name: &str) -> support::Cassette {
+    support::load_cassette(&format!(
+        "{}/tests/cassettes/reasoning/responses/{name}-nonstreaming.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+}
+
+fn only_reasoning(items: Vec<InOutItem>) -> ReasoningOutput {
+    match InOutItem::into_input_items(items).pop() {
+        Some(InputItem::Reasoning(reasoning)) => reasoning,
+        other => panic!("expected one reasoning item, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn legacy_rows_keep_every_field_that_still_decodes() {
+    let (_pool, store) = stored_legacy_row(serde_json::json!({
+        "content": [{"type": "unexpected_provider_type", "text": "keep this"}],
+        "summary": [{"type": "summary_text", "text": "kept summary"}, {"text": "untyped summary"}],
+        "encrypted_content": {"ciphertext": "untyped state"},
+        "status": "failed"
+    }))
+    .await;
+    let reasoning = only_reasoning(store.rehydrate("resp_legacy").await.unwrap());
+    assert_eq!(reasoning.content.len(), 1);
+    assert_eq!(reasoning.content[0].type_, ReasoningTextKind::ReasoningText);
+    assert_eq!(reasoning.content[0].text, "keep this");
+    assert_eq!(reasoning.summary.len(), 1);
+    assert_eq!(reasoning.summary[0].text, "kept summary");
+    assert!(reasoning.encrypted_content.is_none());
+    assert!(reasoning.status.is_none());
+
+    let (_pool, store) = stored_legacy_row(serde_json::json!({
+        "content": [{"type": "reasoning_text", "text": "plaintext"}],
+        "summary": [{"text": "untyped summary"}],
+        "encrypted_content": "opaque string state",
+        "status": "completed",
+        "agent": {"agent_name": "/root/worker"}
+    }))
+    .await;
+    let reasoning = only_reasoning(store.rehydrate("resp_legacy").await.unwrap());
+    assert!(reasoning.summary.is_empty());
+    assert_eq!(
+        reasoning
+            .encrypted_content
+            .as_ref()
+            .map(agentic_core::types::OpaqueReasoning::as_str),
+        Some("opaque string state")
+    );
+    assert_eq!(reasoning.status, Some(ReasoningStatus::Completed));
+    assert_eq!(
+        reasoning.agent.as_ref().map(|agent| agent.agent_name.as_str()),
+        Some("/root/worker")
+    );
+}
+
+#[tokio::test]
+async fn legacy_rows_remain_continuable_on_the_default_path() {
+    let cassette = recording("reasoning-single-Qwen-Qwen3-30B-A3B-FP8");
+    for legacy in [
+        serde_json::json!({"content": [{"type": "unexpected_provider_type", "text": "plaintext for vLLM"}]}),
+        serde_json::json!({
+            "content": [{"type": "reasoning_text", "text": "plaintext for vLLM"}],
+            "encrypted_content": {"ciphertext": "untyped state"}
+        }),
+        serde_json::json!({"content": [{"type": "reasoning_text", "text": "plaintext for vLLM"}], "status": "failed"}),
+    ] {
+        let (pool, _store) = stored_legacy_row(legacy.clone()).await;
+        let server = support::MockServer::start_deque(vec![support::MockResponse::from_turn(&cassette.turns[0])]).await;
+        let exec_ctx = Arc::new(ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::new(Arc::clone(&pool))),
+            ResponseHandler::new(ResponseStore::new(Arc::clone(&pool))),
+            Arc::new(reqwest::Client::new()),
+            server.url().to_string(),
+        ));
+        let followup = support::make_request("continue", false, false, Some("resp_legacy".into()), None);
+        let response = support::unwrap_blocking(ExecuteRequest::new(followup, exec_ctx).run().await.unwrap());
+        assert_eq!(response.status, "completed", "{legacy}");
+        let sent = server.request_bodies().await;
+        let replayed = &sent[0]["input"][0];
+        assert_eq!(replayed["type"], "reasoning", "{legacy}");
+        assert_eq!(replayed["content"][0]["type"], "reasoning_text", "{legacy}");
+        assert_eq!(replayed["content"][0]["text"], "plaintext for vLLM", "{legacy}");
+        assert!(!sent[0].to_string().contains("untyped state"), "{legacy}");
+    }
+}
+
+#[tokio::test]
+async fn rows_earlier_releases_could_not_store_fail_closed() {
+    for legacy in [
+        json!({"content": [{"text": "part without a type"}]}),
+        json!({"content": [{"type": 7, "text": "non-string type"}]}),
+        json!({"content": "not an array"}),
+        json!({"status": 5}),
+        json!({"agent": "/root/worker"}),
+    ] {
+        let (_pool, store) = stored_legacy_row(legacy.clone()).await;
+        let error = store.rehydrate("resp_legacy").await.unwrap_err();
+        assert!(
+            matches!(error, StorageError::InvalidHistoryItem { .. }),
+            "{legacy}: {error:?}"
+        );
+    }
+}
+
+/// Store one response, then rewrite the reasoning in its stored snapshot to `legacy`.
+async fn stored_legacy_snapshot(legacy: &Value) -> (support::MockServer, Arc<ExecutionContext>, String) {
+    let pool = support::setup_pool().await;
+    let server = support::MockServer::start_deque(vec![
+        support::MockResponse::from_turn(&recording("reasoning-single-Qwen-Qwen3-30B-A3B-FP8").turns[0]),
+        support::MockResponse::from_turn(&recording("reasoning-single-openai-gpt-oss-20b").turns[0]),
+    ])
+    .await;
+    let exec_ctx = Arc::new(ExecutionContext::new(
+        ConversationHandler::new(ConversationStore::new(Arc::clone(&pool))),
+        ResponseHandler::new(ResponseStore::new(Arc::clone(&pool))),
+        Arc::new(reqwest::Client::new()),
+        server.url().to_string(),
+    ));
+    let request = support::make_request("hello", true, false, None, None);
+    let stored = support::unwrap_blocking(ExecuteRequest::new(request, Arc::clone(&exec_ctx)).run().await.unwrap());
+    let (metadata,): (String,) = sqlx::query_as("SELECT metadata FROM responses WHERE id = $1")
+        .bind(&stored.id)
+        .fetch_one(pool.as_ref())
+        .await
+        .unwrap();
+    let mut metadata: Value = serde_json::from_str(&metadata).unwrap();
+    let reasoning = metadata["response_snapshot"]["output"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["type"] == "reasoning")
+        .expect("stored snapshot has reasoning");
+    reasoning
+        .as_object_mut()
+        .unwrap()
+        .extend(legacy.as_object().unwrap().clone());
+    sqlx::query("UPDATE responses SET metadata = $1 WHERE id = $2")
+        .bind(metadata.to_string())
+        .bind(&stored.id)
+        .execute(pool.as_ref())
+        .await
+        .unwrap();
+    (server, exec_ctx, stored.id)
+}
+
+#[tokio::test]
+async fn legacy_snapshots_remain_retrievable_and_continuable() {
+    let (_server, exec_ctx, id) = stored_legacy_snapshot(&json!({
+        "content": [{"type": "unexpected_provider_type", "text": "snapshot plaintext"}],
+        "summary": [{"type": "summary_text", "text": "kept summary"}, {"text": "untyped summary"}],
+        "encrypted_content": {"ciphertext": "untyped state"},
+        "status": "failed"
+    }))
+    .await;
+    let retrieved = exec_ctx.resp_handler.retrieve(&id).await.unwrap();
+    let Some(OutputItem::Reasoning(reasoning)) = retrieved
+        .output
+        .iter()
+        .find(|item| matches!(item, OutputItem::Reasoning(_)))
+    else {
+        panic!("expected reasoning in {:?}", retrieved.output);
+    };
+    assert_eq!(reasoning.content, vec![ReasoningTextContent::new("snapshot plaintext")]);
+    assert_eq!(reasoning.summary.len(), 1);
+    assert!(reasoning.encrypted_content.is_none());
+    assert!(reasoning.status.is_none());
+
+    let followup = support::make_request("continue", false, false, Some(id), None);
+    let response = support::unwrap_blocking(ExecuteRequest::new(followup, exec_ctx).run().await.unwrap());
+    assert_eq!(response.status, "completed");
+}
+
+#[tokio::test]
+async fn snapshots_earlier_releases_could_not_store_fail_closed() {
+    let (_server, exec_ctx, id) = stored_legacy_snapshot(&json!({"content": [{"text": "part without a type"}]})).await;
+    let retrieved = exec_ctx.resp_handler.retrieve(&id).await.unwrap_err();
+    let followup = support::make_request("continue", false, false, Some(id), None);
+    let Err(continued) = ExecuteRequest::new(followup, exec_ctx).run().await else {
+        panic!("continuation read an unreadable snapshot");
+    };
+    for error in [retrieved, continued] {
+        assert!(
+            matches!(
+                error,
+                ExecutorError::Storage(StorageError::InvalidResponseMetadata { .. })
+            ),
+            "{error:?}"
+        );
+    }
+}

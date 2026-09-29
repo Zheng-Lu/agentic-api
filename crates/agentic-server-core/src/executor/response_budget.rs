@@ -7,6 +7,7 @@
 //! incrementally and reconciles against this measurement at completion, so a
 //! new variable-sized field is added in exactly one place.
 mod client_outputs;
+mod reasoning;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,13 +15,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value;
 
 use crate::executor::error::{ExecutorError, ExecutorResult, ResourceLimit};
-use crate::types::io::output::{McpListTool, McpListTools, McpToolExecutionError, ReasoningTextContent};
+use crate::types::io::output::{McpListTool, McpListTools, McpToolExecutionError};
 use crate::types::io::{
     AgentAttribution, AgentMessage, AgentMessageContent, CodeInterpreterCall, CodeInterpreterCallOutput,
     CompactionItem, CustomToolCall, FunctionToolCall, McpCall, McpCallError, MultiAgentCall, MultiAgentCallOutput,
-    MultiAgentCallOutputContent, OpaqueReasoning, OutputItem, OutputMessage, OutputMessageContent, OutputTextContent,
-    OutputTextLogprob, ReasoningOutput, ReasoningSummaryContent, ShellCall, ToolSearchCall, TopLogprob, WebSearchAction,
-    WebSearchCall,
+    MultiAgentCallOutputContent, OutputItem, OutputMessage, OutputMessageContent, OutputTextContent, OutputTextLogprob,
+    ShellCall, ToolSearchCall, TopLogprob, WebSearchAction, WebSearchCall,
 };
 use crate::types::request_response::IncompleteDetails;
 #[cfg(test)]
@@ -271,35 +271,6 @@ impl RetainedSize for ShellCall {
             + self.call_id.len()
             + commands
             + extras
-    }
-}
-
-impl RetainedSize for ReasoningTextContent {
-    fn retained_bytes(&self) -> usize {
-        RETAINED_CONTAINER_OVERHEAD_BYTES + self.text.len()
-    }
-}
-
-impl RetainedSize for ReasoningSummaryContent {
-    fn retained_bytes(&self) -> usize {
-        RETAINED_CONTAINER_OVERHEAD_BYTES + self.text.len()
-    }
-}
-
-impl RetainedSize for OpaqueReasoning {
-    fn retained_bytes(&self) -> usize {
-        self.as_str().len()
-    }
-}
-
-impl RetainedSize for ReasoningOutput {
-    fn retained_bytes(&self) -> usize {
-        RETAINED_CONTAINER_OVERHEAD_BYTES
-            + self.agent.retained_bytes()
-            + self.id.len()
-            + self.encrypted_content.retained_bytes()
-            + sum_retained(&self.content)
-            + sum_retained(&self.summary)
     }
 }
 
@@ -557,7 +528,7 @@ mod tests {
         McpListTool, McpListTools, ReasoningOutput, ReasoningTextContent, WebSearchActionOpenPage,
         WebSearchActionSearch, WebSearchCall, WebSearchCallStatus,
     };
-    use crate::types::io::{CodeInterpreterCallStatus, McpCall, McpCallStatus};
+    use crate::types::io::{CodeInterpreterCallStatus, McpCall, McpCallStatus, OpaqueReasoning};
 
     #[test]
     fn retained_accounting_for_code_interpreter_call_and_outputs() {

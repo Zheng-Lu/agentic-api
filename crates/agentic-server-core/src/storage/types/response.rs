@@ -3,11 +3,13 @@
 use std::convert::TryFrom;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::super::models::Response as StorageDbResponse;
 use super::errors::StorageError;
 use crate::types::agent_tree::StoredTreeSnapshot;
 use crate::types::io::ToolChoice;
+use crate::types::io::reasoning::upgrade_legacy_reasoning;
 use crate::types::request_response::ResponsePayload;
 use crate::types::tools::ResponsesTool;
 use crate::utils::common::serialize_to_string;
@@ -59,8 +61,7 @@ impl TryFrom<StorageDbResponse> for ResponseData {
             .map_err(|_| StorageError::InvalidResponseHistory {
                 response_id: row.id.clone(),
             })?;
-        let metadata = row
-            .metadata_as::<ResponseMetadata>()
+        let metadata = decode_metadata(&row)
             .map_err(|_| StorageError::InvalidResponseMetadata {
                 response_id: row.id.clone(),
             })?
@@ -75,6 +76,34 @@ impl TryFrom<StorageDbResponse> for ResponseData {
             metadata,
         })
     }
+}
+
+/// Decode stored metadata. Snapshots and agent trees stored before typed reasoning
+/// can hold reasoning items in the earlier shape; project those and decode again.
+/// Anything the projection can't read still fails closed.
+fn decode_metadata(row: &StorageDbResponse) -> Result<Option<ResponseMetadata>, serde_json::Error> {
+    row.metadata_as::<ResponseMetadata>().or_else(|error| {
+        let Some(mut metadata) = row.metadata_as::<Value>()? else {
+            return Err(error);
+        };
+        if let Some(output) = metadata
+            .pointer_mut("/response_snapshot/output")
+            .and_then(Value::as_array_mut)
+        {
+            upgrade_legacy_reasoning(output);
+        }
+        if let Some(agents) = metadata
+            .pointer_mut("/multi_agent_tree/agents")
+            .and_then(Value::as_array_mut)
+        {
+            for agent in agents {
+                if let Some(history) = agent.get_mut("history").and_then(Value::as_array_mut) {
+                    upgrade_legacy_reasoning(history);
+                }
+            }
+        }
+        ResponseMetadata::deserialize(metadata).map(Some)
+    })
 }
 
 impl TryFrom<&ResponseMetadata> for String {
@@ -280,5 +309,69 @@ mod tests {
         assert_eq!(response.history_item_ids[0], "item_1");
         assert_eq!(response.history_item_ids[2], "item_3");
         assert_eq!(response.previous_response_id, Some("resp_prev".to_string()));
+    }
+
+    /// Agent histories in a stored tree get the same projection as snapshots and rows.
+    #[test]
+    fn legacy_reasoning_in_stored_agent_history_is_projected_or_fails_closed() {
+        use crate::types::agent::{AgentIdentity, AgentTurnId};
+        use crate::types::agent_tree::{AgentState, StoredAgent};
+        use crate::types::io::{InputItem, MultiAgentConfig, ReasoningOutput};
+
+        let metadata = ResponseMetadata {
+            multi_agent_tree: Some(StoredTreeSnapshot {
+                version: 1,
+                config: MultiAgentConfig {
+                    enabled: true,
+                    max_concurrent_subagents: None,
+                },
+                agents: vec![StoredAgent {
+                    identity: AgentIdentity::root(),
+                    parent: None,
+                    turn: AgentTurnId::new(),
+                    state: AgentState::Idle,
+                    mailbox: Vec::new(),
+                    history: vec![InputItem::Reasoning(ReasoningOutput::new("rs_tree"))],
+                    loaded_tools: Vec::new(),
+                    last_task: String::new(),
+                    final_answer: None,
+                    rounds: 0,
+                    wait: None,
+                }],
+                client_calls: Vec::new(),
+            }),
+            ..ResponseMetadata::default()
+        };
+        let stored = |legacy: Value| {
+            let mut metadata: Value = serde_json::from_str(&String::try_from(&metadata).unwrap()).unwrap();
+            metadata["multi_agent_tree"]["agents"][0]["history"][0]
+                .as_object_mut()
+                .unwrap()
+                .extend(legacy.as_object().unwrap().clone());
+            ResponseData::try_from(StorageDbResponse {
+                id: "resp_tree".into(),
+                conversation_id: None,
+                previous_response_id: None,
+                history_item_ids: None,
+                metadata: Some(metadata.to_string()),
+                created_at: 0,
+            })
+        };
+
+        let projected = stored(serde_json::json!({
+            "content": [{"type": "unexpected_provider_type", "text": "tree plaintext"}],
+            "encrypted_content": {"ciphertext": "untyped state"},
+            "status": "failed"
+        }))
+        .unwrap();
+        let tree = projected.metadata.multi_agent_tree.unwrap();
+        let InputItem::Reasoning(reasoning) = &tree.agents[0].history[0] else {
+            panic!("expected reasoning history");
+        };
+        assert_eq!(reasoning.content[0].text, "tree plaintext");
+        assert!(reasoning.encrypted_content.is_none() && reasoning.status.is_none());
+
+        let error = stored(serde_json::json!({"content": [{"text": "part without a type"}]})).unwrap_err();
+        assert!(matches!(error, StorageError::InvalidResponseMetadata { .. }));
     }
 }

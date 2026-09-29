@@ -1,8 +1,5 @@
 //! Conversation history item stored in the database.
 
-mod legacy_reasoning;
-
-use serde::Deserialize;
 use serde_json::Value;
 use std::convert::TryFrom;
 use std::fmt::Write;
@@ -13,7 +10,7 @@ use super::super::types::item::{InOutItem, ItemKind, STORED_CODE_INTERPRETER_ORI
 use crate::storage::{StorageError, StoreResult};
 use crate::types::conversations::ItemOrder;
 use crate::types::io::code_interpreter::CodeInterpreterCallOrigin;
-use crate::types::io::{InputItem, OutputItem};
+use crate::types::io::{InputItem, OutputItem, ReasoningOutput};
 use crate::utils::common::{deserialize_from_str_opt, utcnow_str, uuid7_str};
 
 const ITEM_COLUMN_COUNT: usize = 5;
@@ -70,23 +67,30 @@ impl Item {
     /// Deserialize data column as `InputItem`, projecting pre-typed reasoning rows.
     #[must_use]
     pub fn as_input(&self) -> Option<InputItem> {
-        let (data, _) = self.data_without_storage_marker()?;
-        InputItem::deserialize(&data)
+        let (value, _) = self.data_without_storage_marker()?;
+        serde_json::from_value(value)
             .ok()
-            .or_else(|| self.legacy_reasoning(&data).map(InputItem::Reasoning))
+            .or_else(|| self.legacy_reasoning().map(InputItem::Reasoning))
     }
 
     /// Deserialize data column as `OutputItem`, projecting pre-typed reasoning rows.
     #[must_use]
     pub fn as_output(&self) -> Option<OutputItem> {
-        let (data, gateway_origin) = self.data_without_storage_marker()?;
-        let mut output = OutputItem::deserialize(&data)
+        let (value, gateway_origin) = self.data_without_storage_marker()?;
+        let mut output = serde_json::from_value(value)
             .ok()
-            .or_else(|| self.legacy_reasoning(&data).map(OutputItem::Reasoning))?;
+            .or_else(|| self.legacy_reasoning().map(OutputItem::Reasoning))?;
         if gateway_origin && let OutputItem::CodeInterpreterCall(call) = &mut output {
             call.origin = CodeInterpreterCallOrigin::Gateway;
         }
         Some(output)
+    }
+
+    /// Project a reasoning row written before typed reasoning. Typed decoding already
+    /// failed, so this rare path parses the row again instead of copying every row up front.
+    fn legacy_reasoning(&self) -> Option<ReasoningOutput> {
+        let (value, _) = self.data_without_storage_marker()?;
+        ReasoningOutput::from_legacy_value(&value)
     }
 
     /// Deserialize data column as either `InputItem` or `OutputItem`.
