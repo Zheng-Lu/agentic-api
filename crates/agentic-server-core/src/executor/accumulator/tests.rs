@@ -1936,6 +1936,14 @@ fn lenient_ingestion_projects_reasoning_earlier_releases_accepted() {
             "{fields}"
         );
     }
+
+    // Without plaintext, opaque state the typed schema drops leaves nothing vLLM can
+    // replay, so JSON drops the item instead of relaying an emptied one.
+    let opaque_only = serde_json::json!({
+        "id": "rs_1", "type": "reasoning", "content": [], "encrypted_content": {"ciphertext": "sensitive-state"}
+    });
+    assert!(json(&opaque_only, Validation::Lenient).unwrap().is_empty());
+    assert!(json(&opaque_only, Validation::Strict).is_err());
 }
 
 #[test]

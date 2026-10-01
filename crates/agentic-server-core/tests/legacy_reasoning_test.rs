@@ -151,18 +151,19 @@ async fn rows_earlier_releases_could_not_store_fail_closed() {
     }
 }
 
-/// A stored response whose snapshot reasoning was rewritten to an earlier shape.
-struct LegacySnapshot {
-    _server: support::MockServer,
+/// One stored response and the request that continues it.
+struct StoredTurn {
+    server: support::MockServer,
+    pool: Arc<agentic_core::storage::DbPool>,
     exec_ctx: Arc<ExecutionContext>,
     response_id: String,
     /// Continues the stored response by `previous_response_id`, or by `conversation`.
     followup: RequestPayload,
 }
 
-/// Store one response, optionally as a conversation turn, then rewrite the
-/// reasoning in its stored snapshot to `legacy`.
-async fn stored_legacy_snapshot(legacy: &Value, in_conversation: bool) -> LegacySnapshot {
+/// Store one response, optionally as a conversation turn. The mock serves a second
+/// recording for a continuation that reaches the model.
+async fn stored_turn(in_conversation: bool) -> StoredTurn {
     let pool = support::setup_pool().await;
     let server = support::MockServer::start_deque(vec![
         support::MockResponse::from_turn(&recording("reasoning-single-Qwen-Qwen3-30B-A3B-FP8").turns[0]),
@@ -183,9 +184,52 @@ async fn stored_legacy_snapshot(legacy: &Value, in_conversation: bool) -> Legacy
     ));
     let request = support::make_request("hello", true, false, None, conversation_id.clone());
     let stored = support::unwrap_blocking(ExecuteRequest::new(request, Arc::clone(&exec_ctx)).run().await.unwrap());
+    let followup = match conversation_id {
+        Some(conversation_id) => support::make_request("continue", false, false, None, Some(conversation_id)),
+        None => support::make_request("continue", false, false, Some(stored.id.clone()), None),
+    };
+    StoredTurn {
+        server,
+        pool,
+        exec_ctx,
+        response_id: stored.id,
+        followup,
+    }
+}
+
+/// Rewrite every stored reasoning history row with the fields of `legacy`.
+async fn rewrite_reasoning_rows(turn: &StoredTurn, legacy: &Value) {
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, data FROM items")
+        .fetch_all(turn.pool.as_ref())
+        .await
+        .unwrap();
+    let mut rewritten = 0;
+    for (id, data) in rows {
+        let mut data: Value = serde_json::from_str(&data).unwrap();
+        if data["type"] != "reasoning" {
+            continue;
+        }
+        data.as_object_mut()
+            .unwrap()
+            .extend(legacy.as_object().unwrap().clone());
+        sqlx::query("UPDATE items SET data = $1 WHERE id = $2")
+            .bind(data.to_string())
+            .bind(&id)
+            .execute(turn.pool.as_ref())
+            .await
+            .unwrap();
+        rewritten += 1;
+    }
+    assert!(rewritten > 0, "stored history has reasoning");
+}
+
+/// Store one response, optionally as a conversation turn, then rewrite the
+/// reasoning in its stored snapshot with the fields of `legacy`.
+async fn stored_legacy_snapshot(legacy: &Value, in_conversation: bool) -> StoredTurn {
+    let turn = stored_turn(in_conversation).await;
     let (metadata,): (String,) = sqlx::query_as("SELECT metadata FROM responses WHERE id = $1")
-        .bind(&stored.id)
-        .fetch_one(pool.as_ref())
+        .bind(&turn.response_id)
+        .fetch_one(turn.pool.as_ref())
         .await
         .unwrap();
     let mut metadata: Value = serde_json::from_str(&metadata).unwrap();
@@ -201,19 +245,40 @@ async fn stored_legacy_snapshot(legacy: &Value, in_conversation: bool) -> Legacy
         .extend(legacy.as_object().unwrap().clone());
     sqlx::query("UPDATE responses SET metadata = $1 WHERE id = $2")
         .bind(metadata.to_string())
-        .bind(&stored.id)
-        .execute(pool.as_ref())
+        .bind(&turn.response_id)
+        .execute(turn.pool.as_ref())
         .await
         .unwrap();
-    let followup = match conversation_id {
-        Some(conversation_id) => support::make_request("continue", false, false, None, Some(conversation_id)),
-        None => support::make_request("continue", false, false, Some(stored.id.clone()), None),
-    };
-    LegacySnapshot {
-        _server: server,
-        exec_ctx,
-        response_id: stored.id,
-        followup,
+    turn
+}
+
+/// vLLM can't replay opaque state without plaintext, so such a continuation is
+/// rejected before inference. When an earlier release stored that state in a shape
+/// the typed schema drops, the continuation must still never reach the model.
+#[tokio::test]
+async fn opaque_only_reasoning_never_reaches_the_model() {
+    for in_conversation in [false, true] {
+        for state in [json!("string state"), json!({"ciphertext": "object state"})] {
+            let turn = stored_turn(in_conversation).await;
+            rewrite_reasoning_rows(&turn, &json!({"content": [], "encrypted_content": state})).await;
+            let Err(error) = ExecuteRequest::new(turn.followup, Arc::clone(&turn.exec_ctx))
+                .run()
+                .await
+            else {
+                panic!("in_conversation={in_conversation} {state}: continuation reached the model");
+            };
+            let failed_closed = if state.is_string() {
+                matches!(error, ExecutorError::InvalidRequest(_))
+            } else {
+                matches!(error, ExecutorError::Storage(StorageError::InvalidHistoryItem { .. }))
+            };
+            assert!(failed_closed, "in_conversation={in_conversation} {state}: {error:?}");
+            assert_eq!(
+                turn.server.request_bodies().await.len(),
+                1,
+                "only the stored turn reached the model"
+            );
+        }
     }
 }
 
@@ -258,9 +323,16 @@ async fn legacy_snapshots_remain_retrievable_and_continuable() {
 
 #[tokio::test]
 async fn snapshots_earlier_releases_could_not_store_fail_closed() {
-    for in_conversation in [false, true] {
-        let stored =
-            stored_legacy_snapshot(&json!({"content": [{"text": "part without a type"}]}), in_conversation).await;
+    let unreadable = [
+        json!({"content": [{"text": "part without a type"}]}),
+        // Its only replay state would be dropped.
+        json!({"content": [], "encrypted_content": {"ciphertext": "object state"}}),
+    ];
+    for (in_conversation, legacy) in [false, true]
+        .into_iter()
+        .flat_map(|mode| unreadable.iter().map(move |legacy| (mode, legacy)))
+    {
+        let stored = stored_legacy_snapshot(legacy, in_conversation).await;
         let retrieved = stored
             .exec_ctx
             .resp_handler
@@ -268,7 +340,7 @@ async fn snapshots_earlier_releases_could_not_store_fail_closed() {
             .await
             .unwrap_err();
         let Err(continued) = ExecuteRequest::new(stored.followup, stored.exec_ctx).run().await else {
-            panic!("in_conversation={in_conversation}: continuation read an unreadable snapshot");
+            panic!("in_conversation={in_conversation} {legacy}: continuation read an unreadable snapshot");
         };
         for error in [retrieved, continued] {
             assert!(
@@ -276,7 +348,7 @@ async fn snapshots_earlier_releases_could_not_store_fail_closed() {
                     error,
                     ExecutorError::Storage(StorageError::InvalidResponseMetadata { .. })
                 ),
-                "in_conversation={in_conversation}: {error:?}"
+                "in_conversation={in_conversation} {legacy}: {error:?}"
             );
         }
     }

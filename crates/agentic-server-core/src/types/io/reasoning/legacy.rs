@@ -43,13 +43,15 @@ impl ReasoningOutput {
     /// Plaintext parts become `reasoning_text`. Summary parts, opaque state, and
     /// a status that don't satisfy the typed schema are dropped; dropped opaque
     /// state is logged by size. Items that are already typed decode unchanged.
-    /// Returns `None` for anything else.
+    /// Returns `None` for anything else, and for an item whose only replay state
+    /// was dropped.
     pub(crate) fn from_legacy_value(item: &Value) -> Option<Self> {
         if item.get("type").and_then(Value::as_str) != Some("reasoning") {
             return None;
         }
         let legacy = LegacyReasoning::deserialize(item).ok()?;
-        Some(Self {
+        let had_state = legacy.encrypted_content.as_ref().is_some_and(|state| !state.is_null());
+        let reasoning = Self {
             agent: legacy.agent,
             id: legacy.id,
             content: legacy
@@ -68,7 +70,14 @@ impl ReasoningOutput {
             status: legacy
                 .status
                 .and_then(|status| ReasoningStatus::deserialize(Value::String(status)).ok()),
-        })
+        };
+        // Opaque state without plaintext can't be replayed to vLLM and is rejected
+        // before inference. An item emptied by dropping that state would pass that
+        // check and reach the model, so it is unreadable instead.
+        let replayable = !had_state
+            || reasoning.encrypted_content.is_some()
+            || reasoning.content.iter().any(|part| !part.text.is_empty());
+        replayable.then_some(reasoning)
     }
 }
 
@@ -146,6 +155,7 @@ mod tests {
             .finish();
         let item = serde_json::json!({
             "type": "reasoning", "id": "rs_1", "status": "failed", "encrypted_content": encrypted_content,
+            "content": [{"type": "reasoning_text", "text": "plaintext"}],
         });
         let reasoning = tracing::subscriber::with_default(subscriber, || ReasoningOutput::from_legacy_value(&item));
         let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
@@ -180,6 +190,38 @@ mod tests {
             let (state, logs) = project(&encrypted_content);
             assert_eq!(state.is_some(), kept);
             assert!(logs.is_empty(), "{logs}");
+        }
+    }
+
+    /// An item whose only replay state was dropped is unreadable; plaintext keeps it usable.
+    #[test]
+    fn opaque_only_items_are_unreadable_when_their_state_is_dropped() {
+        let item = |content: &Value, state: &Value| serde_json::json!({"type": "reasoning", "id": "rs_1", "content": content, "encrypted_content": state});
+        let plaintext = serde_json::json!([{"type": "reasoning_text", "text": "plaintext"}]);
+        let no_plaintext = [
+            serde_json::json!([]),
+            serde_json::json!([{"type": "reasoning_text", "text": ""}]),
+            Value::Null,
+        ];
+        let oversized = Value::String("s".repeat(MAX_OPAQUE_REASONING_BYTES + 1));
+        for state in [serde_json::json!({"ciphertext": "object state"}), oversized] {
+            for content in &no_plaintext {
+                assert!(
+                    ReasoningOutput::from_legacy_value(&item(content, &state)).is_none(),
+                    "{content}"
+                );
+            }
+            let kept = ReasoningOutput::from_legacy_value(&item(&plaintext, &state)).unwrap();
+            assert!(kept.encrypted_content.is_none());
+            assert_eq!(kept.content, vec![ReasoningTextContent::new("plaintext")]);
+        }
+
+        // Nothing was dropped, so an item without plaintext reads as it did before.
+        for state in [Value::Null, Value::String("kept state".into())] {
+            for content in &no_plaintext {
+                let kept = ReasoningOutput::from_legacy_value(&item(content, &state)).unwrap();
+                assert_eq!(kept.encrypted_content.is_some(), state.is_string());
+            }
         }
     }
 }
