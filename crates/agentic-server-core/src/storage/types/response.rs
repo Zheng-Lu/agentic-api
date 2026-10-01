@@ -78,10 +78,14 @@ impl TryFrom<StorageDbResponse> for ResponseData {
     }
 }
 
-/// Decode stored metadata. Snapshots and agent trees stored before typed reasoning
-/// can hold reasoning items in the earlier shape; project those and decode again.
-/// Anything the projection can't read still fails closed.
-fn decode_metadata(row: &StorageDbResponse) -> Result<Option<ResponseMetadata>, serde_json::Error> {
+/// Decode stored metadata; every reader of stored [`ResponseMetadata`] goes through here.
+///
+/// Snapshots and agent trees stored before typed reasoning can hold reasoning items
+/// in the earlier shape; project those and decode again. Anything the projection
+/// can't read still fails closed.
+pub(in crate::storage) fn decode_metadata(
+    row: &StorageDbResponse,
+) -> Result<Option<ResponseMetadata>, serde_json::Error> {
     row.metadata_as::<ResponseMetadata>().or_else(|error| {
         let Some(mut metadata) = row.metadata_as::<Value>()? else {
             return Err(error);

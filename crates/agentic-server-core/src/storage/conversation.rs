@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use super::models::{conversation, item, response};
 use super::pool::DbPool;
+use super::types::response::decode_metadata;
 use super::types::{
     ConversationData, ConversationSnapshot, ConversationVersion, InOutItem, ResponseMetadata, StorageError, StoreResult,
 };
@@ -138,7 +139,7 @@ impl ConversationStore {
         let response = response::get_conversation_turn(pool, conversation_id, response_id)
             .await?
             .ok_or_else(invalid_metadata)?;
-        response.metadata_as().map_err(|_| invalid_metadata())
+        decode_metadata(&response).map_err(|_| invalid_metadata())
     }
 
     /// Persists conversation turn with new items and response metadata.

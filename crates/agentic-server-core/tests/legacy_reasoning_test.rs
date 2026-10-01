@@ -9,6 +9,7 @@ use agentic_core::executor::{ConversationHandler, ExecuteRequest, ExecutionConte
 use agentic_core::storage::{ConversationStore, InOutItem, ResponseMetadata, ResponseStore, StorageError};
 use agentic_core::types::ReasoningStatus;
 use agentic_core::types::io::{InputItem, OutputItem, ReasoningOutput, ReasoningTextContent, ReasoningTextKind};
+use agentic_core::types::request_response::RequestPayload;
 use serde_json::{Value, json};
 
 /// Persist one typed reasoning item, then rewrite its row to a shape an earlier release stored.
@@ -150,21 +151,37 @@ async fn rows_earlier_releases_could_not_store_fail_closed() {
     }
 }
 
-/// Store one response, then rewrite the reasoning in its stored snapshot to `legacy`.
-async fn stored_legacy_snapshot(legacy: &Value) -> (support::MockServer, Arc<ExecutionContext>, String) {
+/// A stored response whose snapshot reasoning was rewritten to an earlier shape.
+struct LegacySnapshot {
+    _server: support::MockServer,
+    exec_ctx: Arc<ExecutionContext>,
+    response_id: String,
+    /// Continues the stored response by `previous_response_id`, or by `conversation`.
+    followup: RequestPayload,
+}
+
+/// Store one response, optionally as a conversation turn, then rewrite the
+/// reasoning in its stored snapshot to `legacy`.
+async fn stored_legacy_snapshot(legacy: &Value, in_conversation: bool) -> LegacySnapshot {
     let pool = support::setup_pool().await;
     let server = support::MockServer::start_deque(vec![
         support::MockResponse::from_turn(&recording("reasoning-single-Qwen-Qwen3-30B-A3B-FP8").turns[0]),
         support::MockResponse::from_turn(&recording("reasoning-single-openai-gpt-oss-20b").turns[0]),
     ])
     .await;
+    let conversations = ConversationStore::new(Arc::clone(&pool));
+    let conversation_id = if in_conversation {
+        Some(conversations.create().await.unwrap().conversation_id)
+    } else {
+        None
+    };
     let exec_ctx = Arc::new(ExecutionContext::new(
-        ConversationHandler::new(ConversationStore::new(Arc::clone(&pool))),
+        ConversationHandler::new(conversations),
         ResponseHandler::new(ResponseStore::new(Arc::clone(&pool))),
         Arc::new(reqwest::Client::new()),
         server.url().to_string(),
     ));
-    let request = support::make_request("hello", true, false, None, None);
+    let request = support::make_request("hello", true, false, None, conversation_id.clone());
     let stored = support::unwrap_blocking(ExecuteRequest::new(request, Arc::clone(&exec_ctx)).run().await.unwrap());
     let (metadata,): (String,) = sqlx::query_as("SELECT metadata FROM responses WHERE id = $1")
         .bind(&stored.id)
@@ -188,51 +205,79 @@ async fn stored_legacy_snapshot(legacy: &Value) -> (support::MockServer, Arc<Exe
         .execute(pool.as_ref())
         .await
         .unwrap();
-    (server, exec_ctx, stored.id)
+    let followup = match conversation_id {
+        Some(conversation_id) => support::make_request("continue", false, false, None, Some(conversation_id)),
+        None => support::make_request("continue", false, false, Some(stored.id.clone()), None),
+    };
+    LegacySnapshot {
+        _server: server,
+        exec_ctx,
+        response_id: stored.id,
+        followup,
+    }
 }
 
 #[tokio::test]
 async fn legacy_snapshots_remain_retrievable_and_continuable() {
-    let (_server, exec_ctx, id) = stored_legacy_snapshot(&json!({
-        "content": [{"type": "unexpected_provider_type", "text": "snapshot plaintext"}],
-        "summary": [{"type": "summary_text", "text": "kept summary"}, {"text": "untyped summary"}],
-        "encrypted_content": {"ciphertext": "untyped state"},
-        "status": "failed"
-    }))
-    .await;
-    let retrieved = exec_ctx.resp_handler.retrieve(&id).await.unwrap();
-    let Some(OutputItem::Reasoning(reasoning)) = retrieved
-        .output
-        .iter()
-        .find(|item| matches!(item, OutputItem::Reasoning(_)))
-    else {
-        panic!("expected reasoning in {:?}", retrieved.output);
-    };
-    assert_eq!(reasoning.content, vec![ReasoningTextContent::new("snapshot plaintext")]);
-    assert_eq!(reasoning.summary.len(), 1);
-    assert!(reasoning.encrypted_content.is_none());
-    assert!(reasoning.status.is_none());
+    for in_conversation in [false, true] {
+        let stored = stored_legacy_snapshot(
+            &json!({
+                "content": [{"type": "unexpected_provider_type", "text": "snapshot plaintext"}],
+                "summary": [{"type": "summary_text", "text": "kept summary"}, {"text": "untyped summary"}],
+                "encrypted_content": {"ciphertext": "untyped state"},
+                "status": "failed"
+            }),
+            in_conversation,
+        )
+        .await;
+        let retrieved = stored
+            .exec_ctx
+            .resp_handler
+            .retrieve(&stored.response_id)
+            .await
+            .unwrap();
+        let Some(OutputItem::Reasoning(reasoning)) = retrieved
+            .output
+            .iter()
+            .find(|item| matches!(item, OutputItem::Reasoning(_)))
+        else {
+            panic!("expected reasoning in {:?}", retrieved.output);
+        };
+        assert_eq!(reasoning.content, vec![ReasoningTextContent::new("snapshot plaintext")]);
+        assert_eq!(reasoning.summary.len(), 1);
+        assert!(reasoning.encrypted_content.is_none());
+        assert!(reasoning.status.is_none());
 
-    let followup = support::make_request("continue", false, false, Some(id), None);
-    let response = support::unwrap_blocking(ExecuteRequest::new(followup, exec_ctx).run().await.unwrap());
-    assert_eq!(response.status, "completed");
+        let response = match ExecuteRequest::new(stored.followup, stored.exec_ctx).run().await {
+            Ok(response) => support::unwrap_blocking(response),
+            Err(error) => panic!("in_conversation={in_conversation}: {error:?}"),
+        };
+        assert_eq!(response.status, "completed", "in_conversation={in_conversation}");
+    }
 }
 
 #[tokio::test]
 async fn snapshots_earlier_releases_could_not_store_fail_closed() {
-    let (_server, exec_ctx, id) = stored_legacy_snapshot(&json!({"content": [{"text": "part without a type"}]})).await;
-    let retrieved = exec_ctx.resp_handler.retrieve(&id).await.unwrap_err();
-    let followup = support::make_request("continue", false, false, Some(id), None);
-    let Err(continued) = ExecuteRequest::new(followup, exec_ctx).run().await else {
-        panic!("continuation read an unreadable snapshot");
-    };
-    for error in [retrieved, continued] {
-        assert!(
-            matches!(
-                error,
-                ExecutorError::Storage(StorageError::InvalidResponseMetadata { .. })
-            ),
-            "{error:?}"
-        );
+    for in_conversation in [false, true] {
+        let stored =
+            stored_legacy_snapshot(&json!({"content": [{"text": "part without a type"}]}), in_conversation).await;
+        let retrieved = stored
+            .exec_ctx
+            .resp_handler
+            .retrieve(&stored.response_id)
+            .await
+            .unwrap_err();
+        let Err(continued) = ExecuteRequest::new(stored.followup, stored.exec_ctx).run().await else {
+            panic!("in_conversation={in_conversation}: continuation read an unreadable snapshot");
+        };
+        for error in [retrieved, continued] {
+            assert!(
+                matches!(
+                    error,
+                    ExecutorError::Storage(StorageError::InvalidResponseMetadata { .. })
+                ),
+                "in_conversation={in_conversation}: {error:?}"
+            );
+        }
     }
 }
