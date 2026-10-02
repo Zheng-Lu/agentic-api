@@ -30,6 +30,8 @@ use tokio::sync::mpsc;
 /// into the stream so the span stays open, and is entered on every poll,
 /// until the terminal frame has been yielded or the stream is dropped. The
 /// stream owns and polls orchestration, so its stages run inside that span.
+/// Dropping the stream drops orchestration. For a multi-agent response that
+/// includes its `RunOwner`, which aborts round tasks without joining them.
 pub(super) fn run_stream(
     ctx: RequestContext,
     tool_search_state: Option<ToolSearchState>,

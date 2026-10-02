@@ -609,7 +609,8 @@ call inference, run the tool loop, persist. `agentic-server` never reaches past 
   Canonical histories and pending calls remain owned by the coordinator; the pipeline never
   spawns subagents. Its `context`, `actions`, `rounds`, `delivery`, and `compaction`
   modules separate restoration, collaboration commands, scheduling, public output and
-  explicit root compaction. The run owner cancels and joins tasks during teardown.
+  explicit root compaction. The run owner cancels and joins tasks when a run finishes or
+  its retained owner cancels it; dropping an HTTP stream aborts them without joining.
   Interruption takes effect at the current round boundary. The contracts are described below.
 - **`persist.rs`** — `persist_response`/`persist_turn`, which apply the request's
   storage policy (`should_persist`: a no-session `store: false` turn is not written) and
@@ -945,19 +946,23 @@ the same delivery path before the terminal event, without executing gateway tool
 The Responses `BoxStream` owns its orchestration future directly. It polls that future
 and the existing bounded event receiver on the consumer's task; there is no detached
 producer, asynchronous abort reaper, or producer `JoinHandle`. When the consumer stops
-polling, the producer cannot continue in the background. Dropping an unpolled or active
-stream synchronously drops its producer, active per-request tool futures, and continuation
-lease. Remote services and shared HTTP/MCP connection drivers still have their own
-lifetimes; dropping a local future does not undo external side effects.
+polling, the orchestration future stops with it. Dropping an unpolled or active stream
+synchronously drops its producer, active per-request tool futures, and continuation lease.
+A multi-agent run is the exception inside that future: its rounds are tasks owned by
+`RunOwner`. They progress only until the bounded frame channel is full, and dropping the
+stream drops `RunOwner`, which aborts them without joining; each stops at its next await
+point and its result is discarded. Remote services and shared HTTP/MCP connection drivers
+still have their own lifetimes; dropping a local future does not undo external side effects.
 
 Producer completion and panic both dispose of the producer future before draining
 accepted events in order and exposing one outcome. Panic isolation uses `catch_unwind`
 and a typed, static client error; it does not alter the process panic hook. On success,
 the engine still validates terminal size and persists/publishes the checkpoint before
 yielding completion. Cancellation during storage waits drops the pending persistence
-future through the same owner. WebSocket request tasks still need explicit abort/join;
-joining one now also finishes disposal of its nested stream-owned producer. Their
-`wait_until_idle` lease fences remain in place.
+future through the same owner. WebSocket responses run through the retained owner in
+`engine/retained.rs`, which spawns execution and cancels and joins it explicitly; a
+multi-agent run cancels and joins its rounds through the coordinator's cancellation arm.
+Their `wait_until_idle` lease fences remain in place.
 
 `GatewayStreamAccumulator` carries only cross-round presentation state: monotonic
 `sequence_number`s, public `output_index` rebasing, and deduplication of response start
