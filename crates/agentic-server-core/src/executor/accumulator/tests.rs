@@ -1037,6 +1037,7 @@ fn test_process_event_response_created_sets_id() {
             id: "resp_new".into(),
             status: "in_progress".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     };
@@ -1053,6 +1054,7 @@ fn test_process_event_response_created_empty_id_no_overwrite() {
             id: String::new(),
             status: "in_progress".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     };
@@ -1069,6 +1071,7 @@ fn test_empty_id_response_created_allows_subsequent_created() {
             id: String::new(),
             status: "in_progress".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     };
@@ -1082,6 +1085,7 @@ fn test_empty_id_response_created_allows_subsequent_created() {
             id: "resp_real".into(),
             status: "in_progress".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     };
@@ -1135,6 +1139,7 @@ fn test_process_event_text_delta_accumulates() {
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     });
@@ -1573,6 +1578,7 @@ fn test_process_event_completed_with_usage() {
                 total_tokens: 15,
                 ..Default::default()
             }),
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     };
@@ -1580,6 +1586,41 @@ fn test_process_event_completed_with_usage() {
     assert_eq!(acc.status, ResponseStatus::Completed);
     assert!(acc.usage.is_some());
     assert_eq!(acc.usage.unwrap().total_tokens, 15);
+}
+
+#[test]
+fn terminal_service_tier_replaces_created_service_tier() {
+    let lines = vec![
+        r#"data: {"type":"response.created","response":{"id":"resp_1","status":"in_progress","service_tier":"auto"}}"#.to_owned(),
+        r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed","service_tier":"default","usage":null}}"#.to_owned(),
+    ];
+
+    let payload = from_sse_lines(lines, None).finalize("test", None, None);
+    assert_eq!(payload.service_tier.as_deref(), Some("default"));
+
+    let lines = vec![
+        r#"data: {"type":"response.created","response":{"id":"resp_2","status":"in_progress","service_tier":"auto"}}"#
+            .to_owned(),
+        r#"data: {"type":"response.completed","response":{"id":"resp_2","status":"completed","usage":null}}"#
+            .to_owned(),
+    ];
+    let payload = from_sse_lines(lines, None).finalize("test", None, None);
+    assert!(payload.service_tier.is_none());
+}
+
+#[test]
+fn json_response_preserves_actual_service_tier() {
+    let body = serde_json::json!({
+        "id": "resp_1",
+        "status": "completed",
+        "output": [],
+        "service_tier": "flex"
+    });
+
+    let payload = ResponseAccumulator::from_json(&body.to_string(), None)
+        .expect("valid response")
+        .finalize("test", None, None);
+    assert_eq!(payload.service_tier.as_deref(), Some("flex"));
 }
 
 #[test]
@@ -1591,6 +1632,7 @@ fn test_process_event_failed_sets_error_status() {
             id: "resp_1".into(),
             status: "failed".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("response.failed"),
     });
@@ -1606,6 +1648,7 @@ fn test_process_event_incomplete_sets_incomplete_status() {
             id: "resp_1".into(),
             status: "incomplete".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     });
@@ -1715,8 +1758,8 @@ fn reasoning_done_events_keep_part_index_order() {
     assert_eq!(
         reasoning.summary,
         [
-            serde_json::json!({"type": "summary_text", "text": "first summary"}),
-            serde_json::json!({"type": "summary_text", "text": "second summary"}),
+            crate::types::ReasoningSummaryContent::new("first summary"),
+            crate::types::ReasoningSummaryContent::new("second summary"),
         ]
     );
 }
@@ -1727,7 +1770,7 @@ fn completed_reasoning_preserves_done_fields_when_omitted() {
         r#"data: {"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}"#.to_owned(),
         r#"data: {"type":"response.reasoning_text.done","item_id":"rs_1","output_index":0,"content_index":0,"text":"completed content"}"#.to_owned(),
         r#"data: {"type":"response.reasoning_summary_text.done","item_id":"rs_1","output_index":0,"summary_index":0,"text":"completed summary"}"#.to_owned(),
-        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","encrypted_content":{"token":"opaque"},"status":"completed"}}"#.to_owned(),
+        r#"data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","encrypted_content":"opaque","status":"completed"}}"#.to_owned(),
         r#"data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#.to_owned(),
     ];
 
@@ -1739,13 +1782,16 @@ fn completed_reasoning_preserves_done_fields_when_omitted() {
     assert_eq!(reasoning.content[0].text, "completed content");
     assert_eq!(
         reasoning.summary,
-        [serde_json::json!({"type": "summary_text", "text": "completed summary"})]
+        [crate::types::ReasoningSummaryContent::new("completed summary")]
     );
     assert_eq!(
-        reasoning.encrypted_content,
-        Some(serde_json::json!({"token": "opaque"}))
+        reasoning
+            .encrypted_content
+            .as_ref()
+            .map(crate::types::OpaqueReasoning::as_str),
+        Some("opaque")
     );
-    assert_eq!(reasoning.status.as_deref(), Some("completed"));
+    assert_eq!(reasoning.status, Some(crate::types::ReasoningStatus::Completed));
 }
 
 #[test]
@@ -1768,7 +1814,7 @@ fn completed_reasoning_null_and_empty_fields_are_authoritative_independently() {
         panic!("expected reasoning output");
     };
     assert!(content_null.content.is_empty());
-    assert_eq!(content_null.summary[0]["text"], "kept summary");
+    assert_eq!(content_null.summary[0].text, "kept summary");
 
     let summary_empty = from_sse_lines(summary_empty, None);
     let OutputItem::Reasoning(summary_empty) = &summary_empty.output[0] else {
@@ -1794,6 +1840,110 @@ fn streaming_and_nonstreaming_nullable_reasoning_fields_are_equivalent() {
         serde_json::to_value(&streaming.output).unwrap(),
         serde_json::to_value(&nonstreaming.output).unwrap()
     );
+}
+
+#[test]
+fn strict_ingestion_rejects_malformed_typed_reasoning_on_both_paths() {
+    for fields in [
+        serde_json::json!({"encrypted_content":{"ciphertext":"sensitive-state"}}),
+        serde_json::json!({"summary":[{"type":"reasoning_text","text":"not a summary"}]}),
+        serde_json::json!({"content":[{"type":"summary_text","text":"not plaintext reasoning"}]}),
+        serde_json::json!({"status":"complete"}),
+    ] {
+        let mut item = serde_json::json!({"id":"rs_1","type":"reasoning"});
+        item.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        let mut stream = ResponseAccumulator::with_validation("resp_1".to_owned(), None, Validation::Strict);
+        for event in [
+            serde_json::json!({"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}),
+            serde_json::json!({"type":"response.in_progress","response":{"id":"resp_1","status":"in_progress"}}),
+            serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}),
+        ] {
+            stream.process_line(SseLine::parse(&format!("data: {event}"))).unwrap();
+        }
+        let done = serde_json::json!({"type":"response.output_item.done","output_index":0,"item":item});
+        let error = stream
+            .process_line(SseLine::parse(&format!("data: {done}")))
+            .unwrap_err();
+        assert!(!error.to_string().contains("sensitive-state"));
+
+        let mut json = ResponseAccumulator::with_validation("resp_1".to_owned(), None, Validation::Strict);
+        let body = serde_json::json!({"id":"resp_1","status":"completed","output":[item]});
+        let error = json.load_json_body(&body.to_string()).unwrap_err();
+        assert!(!error.to_string().contains("sensitive-state"));
+    }
+}
+
+/// Lenient ingestion keeps what earlier releases relayed; strict still rejects it.
+#[test]
+fn lenient_ingestion_projects_reasoning_earlier_releases_accepted() {
+    let stream = |item: &serde_json::Value| {
+        [
+            serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}),
+            serde_json::json!({"type":"response.output_item.done","output_index":0,"item":item}),
+            serde_json::json!({"type":"response.completed","response":{"id":"resp_1","status":"completed"}}),
+        ]
+        .map(|event| format!("data: {event}"))
+    };
+    let json = |item: &serde_json::Value, validation| {
+        let mut acc = ResponseAccumulator::with_validation("resp_1".to_owned(), None, validation);
+        let body = serde_json::json!({"id":"resp_1","status":"completed","output":[item]});
+        acc.load_json_body(&body.to_string()).map(|()| acc.output)
+    };
+    let pre_typed = serde_json::json!({
+        "id": "rs_1", "type": "reasoning",
+        "content": [{"type": "provider_text", "text": "kept plaintext"}],
+        "summary": [{"type": "summary_text", "text": "kept summary"}, {"type": "reasoning_text", "text": "dropped"}],
+        "encrypted_content": {"ciphertext": "sensitive-state"},
+        "status": "failed",
+    });
+    let projected = serde_json::json!([{
+        "type": "reasoning", "id": "rs_1",
+        "content": [{"type": "reasoning_text", "text": "kept plaintext"}],
+        "summary": [{"type": "summary_text", "text": "kept summary"}],
+        "encrypted_content": null, "status": null,
+    }]);
+    let streamed = from_sse_lines(stream(&pre_typed), None);
+    assert_eq!(serde_json::to_value(&streamed.output).unwrap(), projected);
+    let parsed = json(&pre_typed, Validation::Lenient).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), projected);
+    let error = json(&pre_typed, Validation::Strict).unwrap_err();
+    assert!(!error.to_string().contains("sensitive-state"));
+
+    // Earlier releases rejected these too: JSON drops the item, and a stream keeps
+    // the opened item without the completion's fields.
+    for fields in [
+        serde_json::json!({"content": "not an array"}),
+        serde_json::json!({"content": [{"text": "part without a type"}]}),
+        serde_json::json!({"status": 5}),
+        serde_json::json!({"agent": "/root/worker"}),
+    ] {
+        let mut item = serde_json::json!({
+            "id": "rs_1", "type": "reasoning", "content": [{"type": "reasoning_text", "text": "from done"}]
+        });
+        item.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        assert!(json(&item, Validation::Lenient).unwrap().is_empty(), "{fields}");
+        let streamed = from_sse_lines(stream(&item), None);
+        assert_eq!(
+            serde_json::to_value(&streamed.output).unwrap(),
+            serde_json::json!([{
+                "type": "reasoning", "id": "rs_1", "content": [], "summary": [],
+                "encrypted_content": null, "status": null,
+            }]),
+            "{fields}"
+        );
+    }
+
+    // Without plaintext, opaque state the typed schema drops leaves nothing vLLM can
+    // replay, so JSON drops the item instead of relaying an emptied one.
+    let opaque_only = serde_json::json!({
+        "id": "rs_1", "type": "reasoning", "content": [], "encrypted_content": {"ciphertext": "sensitive-state"}
+    });
+    assert!(json(&opaque_only, Validation::Lenient).unwrap().is_empty());
+    assert!(json(&opaque_only, Validation::Strict).is_err());
 }
 
 #[test]
@@ -1828,7 +1978,7 @@ fn malformed_completed_reasoning_retains_done_fields() {
     };
 
     assert_eq!(reasoning.content[0].text, "completed content");
-    assert_eq!(reasoning.summary[0]["text"], "completed summary");
+    assert_eq!(reasoning.summary[0].text, "completed summary");
     assert!(reasoning.encrypted_content.is_none());
 }
 
@@ -1995,6 +2145,7 @@ fn test_function_call_accumulation_basic() {
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     });
@@ -2123,6 +2274,7 @@ fn test_function_call_multiple_parallel() {
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     });
@@ -2191,6 +2343,7 @@ fn test_function_call_interleaved_with_message() {
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     });
@@ -2388,6 +2541,7 @@ fn test_function_call_finalized_on_response_completed() {
             id: "resp_1".into(),
             status: "completed".into(),
             usage: None,
+            service_tier: None,
         },
         wire: WireEvent::new("test"),
     });

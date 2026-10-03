@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
@@ -20,9 +21,12 @@ use agentic_server::auth::OidcConfig;
 use agentic_server::telemetry::{self, DEFAULT_SHUTDOWN_TIMEOUT, TelemetryConfig, TelemetryError, TelemetryGuard};
 use tracing::warn;
 
+#[cfg(feature = "embedded-code-interpreter")]
+mod code_interpreter_startup;
 mod config_file;
 mod responses_config;
 mod server;
+mod web_fetch_config;
 mod web_search_config;
 use responses_config::{generated_responses_file_config, resolve_responses_config};
 
@@ -30,6 +34,7 @@ use config_file::{
     CodeInterpreterFileConfig, FileConfig, McpFileConfig, MessagesGatewayFileConfig, ServerFileConfig, ToolsFileConfig,
 };
 use server::GatewayOptions;
+use web_fetch_config::resolve_web_fetch_config;
 use web_search_config::{generated_web_search_file_config, resolve_web_search_config};
 
 /// Environment override for the serialized request-size ceiling.
@@ -458,6 +463,7 @@ fn build_config(llm_api_base: String, common: &CommonArgs, file: &FileConfig) ->
         .map_or_else(default_database_url, Ok)?;
     let (postgres, sqlite) = database_configs_from_env(&db_url)?;
     let web_search = resolve_web_search_config(&file.web_search, environment_value)?;
+    let web_fetch = resolve_web_fetch_config(&file.web_fetch, environment_value)?;
     let mcp_allowed_hosts = environment_value("AGENTIC_MCP_ALLOWED_HOSTS")
         .map_or_else(|| file.mcp.allowed_hosts.clone(), |value| parse_comma_separated(&value));
     let max_concurrent_gateway_calls_default = file
@@ -484,6 +490,7 @@ fn build_config(llm_api_base: String, common: &CommonArgs, file: &FileConfig) ->
         sqlite,
         tools: ToolRuntimeConfig {
             web_search,
+            web_fetch,
             mcp_servers: file.mcp_servers.clone(),
             mcp_allowed_hosts,
             messages_gateway_tool_aliases: file.messages_gateway.tool_aliases.clone(),
@@ -563,29 +570,21 @@ const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> Result<(), server::ServerError> {
     #[cfg(feature = "embedded-code-interpreter")]
-    {
-        use std::ffi::OsStr;
-        let mut args = std::env::args_os();
-        let _executable = args.next();
-        if args.next().as_deref() == Some(OsStr::new("--agentic-code-interpreter-worker")) {
-            let socket = args.next().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "worker socket path is required")
-            })?;
-            if args.next().is_some() {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "unexpected worker argument").into());
-            }
-            return agentic_core::tool::code_interpreter::run_embedded_worker(std::path::Path::new(&socket))
-                .map_err(Into::into);
-        }
+    if let Some(result) = code_interpreter_startup::run_worker() {
+        return result.map_err(Into::into);
     }
     // Parse first so `--help`/`--version` never build exporters.
     let cli = Cli::parse();
+    let agentic_home = ensure_agentic_api_home()?;
+    let loaded_file_config = FileConfig::load(&agentic_home)?;
+    #[cfg(feature = "embedded-code-interpreter")]
+    code_interpreter_startup::prepare(loaded_file_config.as_ref())?;
     // Providers and the subscriber are created outside the runtime so the
     // guard outlives every task.
     let telemetry_config = TelemetryConfig::from_env().map_err(TelemetryError::from)?;
     let telemetry = telemetry::init(&telemetry_config)?;
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let result = runtime.block_on(run(cli));
+    let result = runtime.block_on(run(cli, agentic_home, loaded_file_config));
     // Stop the runtime before flushing telemetry: connection tasks that outlived
     // the gateway drain are dropped now, so their final measurements land in
     // providers that are still accepting them.
@@ -602,14 +601,16 @@ fn shutdown_telemetry(telemetry: TelemetryGuard) {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), server::ServerError> {
+async fn run(
+    cli: Cli,
+    agentic_home: PathBuf,
+    loaded_file_config: Option<FileConfig>,
+) -> Result<(), server::ServerError> {
     let Cli {
         command,
         llm_api_base,
         common,
     } = cli;
-    let agentic_home = ensure_agentic_api_home()?;
-    let loaded_file_config = FileConfig::load(&agentic_home)?;
     let config_file_missing = loaded_file_config.is_none();
     let mut file_config = loaded_file_config.unwrap_or_default();
     let oidc_config = oidc_config_from_values(common.oidc_issuer.as_deref(), common.oidc_audience.as_deref())?;

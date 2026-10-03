@@ -7,6 +7,7 @@
 //! incrementally and reconciles against this measurement at completion, so a
 //! new variable-sized field is added in exactly one place.
 mod client_outputs;
+mod reasoning;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,12 +15,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde_json::Value;
 
 use crate::executor::error::{ExecutorError, ExecutorResult, ResourceLimit};
-use crate::types::io::output::{McpListTool, McpListTools, McpToolExecutionError, ReasoningTextContent};
+use crate::types::io::output::{McpListTool, McpListTools, McpToolExecutionError};
 use crate::types::io::{
     AgentAttribution, AgentMessage, AgentMessageContent, CodeInterpreterCall, CodeInterpreterCallOutput,
     CompactionItem, CustomToolCall, FunctionToolCall, McpCall, McpCallError, MultiAgentCall, MultiAgentCallOutput,
     MultiAgentCallOutputContent, OutputItem, OutputMessage, OutputMessageContent, OutputTextContent, OutputTextLogprob,
-    ReasoningOutput, ShellCall, ToolSearchCall, TopLogprob, WebSearchAction, WebSearchCall,
+    ShellCall, ToolSearchCall, TopLogprob, WebSearchAction, WebSearchCall,
 };
 use crate::types::request_response::IncompleteDetails;
 #[cfg(test)]
@@ -273,24 +274,6 @@ impl RetainedSize for ShellCall {
     }
 }
 
-impl RetainedSize for ReasoningTextContent {
-    fn retained_bytes(&self) -> usize {
-        RETAINED_CONTAINER_OVERHEAD_BYTES + self.type_.len() + self.text.len()
-    }
-}
-
-impl RetainedSize for ReasoningOutput {
-    fn retained_bytes(&self) -> usize {
-        RETAINED_CONTAINER_OVERHEAD_BYTES
-            + self.agent.retained_bytes()
-            + self.id.len()
-            + opt_len(self.status.as_ref())
-            + self.encrypted_content.retained_bytes()
-            + sum_retained(&self.content)
-            + sum_retained(&self.summary)
-    }
-}
-
 impl RetainedSize for ToolSearchCall {
     fn retained_bytes(&self) -> usize {
         RETAINED_CONTAINER_OVERHEAD_BYTES
@@ -520,13 +503,20 @@ pub(in crate::executor) fn retained_output_item_bytes(item: &OutputItem) -> usiz
     item.retained_bytes()
 }
 
-pub(in crate::executor) fn retained_response_parts_bytes(response_id: &str, output: &[OutputItem]) -> usize {
-    RETAINED_CONTAINER_OVERHEAD_BYTES + response_id.len() + sum_retained(output)
+pub(in crate::executor) fn retained_response_parts_bytes(
+    response_id: &str,
+    output: &[OutputItem],
+    service_tier: Option<&str>,
+) -> usize {
+    RETAINED_CONTAINER_OVERHEAD_BYTES
+        + response_id.len()
+        + sum_retained(output)
+        + service_tier.map_or(0, |tier| RETAINED_CONTAINER_OVERHEAD_BYTES + tier.len())
 }
 
 #[cfg(test)]
 pub(in crate::executor) fn retained_response_bytes(response: &ResponsePayload) -> usize {
-    retained_response_parts_bytes(&response.id, &response.output)
+    retained_response_parts_bytes(&response.id, &response.output, response.service_tier.as_deref())
         + response.incomplete_details.retained_bytes()
         + response.error.retained_bytes()
 }
@@ -538,7 +528,7 @@ mod tests {
         McpListTool, McpListTools, ReasoningOutput, ReasoningTextContent, WebSearchActionOpenPage,
         WebSearchActionSearch, WebSearchCall, WebSearchCallStatus,
     };
-    use crate::types::io::{CodeInterpreterCallStatus, McpCall, McpCallStatus};
+    use crate::types::io::{CodeInterpreterCallStatus, McpCall, McpCallStatus, OpaqueReasoning};
 
     #[test]
     fn retained_accounting_for_code_interpreter_call_and_outputs() {
@@ -646,7 +636,7 @@ mod tests {
 
     #[test]
     fn retained_response_bytes_accounts_for_id_and_items() {
-        let payload = ResponsePayload {
+        let mut payload = ResponsePayload {
             id: "resp_test".to_owned(),
             object: "response".to_owned(),
             created_at: 1000,
@@ -659,12 +649,20 @@ mod tests {
             previous_response_id: None,
             conversation_id: None,
             instructions: None,
+            service_tier: None,
             tools: None,
             tool_choice: None,
         };
         let expected = RETAINED_CONTAINER_OVERHEAD_BYTES + "resp_test".len() + RETAINED_CONTAINER_OVERHEAD_BYTES;
         assert_eq!(retained_response_bytes(&payload), expected);
-        assert_eq!(retained_response_parts_bytes(&payload.id, &payload.output), expected);
+        assert_eq!(
+            retained_response_parts_bytes(&payload.id, &payload.output, None),
+            expected
+        );
+
+        payload.service_tier = Some("priority".to_owned());
+        let expected_with_tier = expected + RETAINED_CONTAINER_OVERHEAD_BYTES + "priority".len();
+        assert_eq!(retained_response_bytes(&payload), expected_with_tier);
     }
 
     #[test]
@@ -739,19 +737,16 @@ mod tests {
         let reasoning = OutputItem::Reasoning(ReasoningOutput {
             agent: None,
             id: "rs_1".to_owned(),
-            status: Some("completed".to_owned()),
+            status: Some(crate::types::ReasoningStatus::Completed),
             content: vec![ReasoningTextContent::new("thought")],
             summary: vec![],
-            encrypted_content: Some(Value::String("encrypted_blob".to_owned())),
+            encrypted_content: Some(OpaqueReasoning::try_from("encrypted_blob".to_owned()).unwrap()),
         });
         assert_eq!(
             retained_output_item_bytes(&reasoning),
             RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "rs_1".len()
-                + "completed".len()
-                + RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "encrypted_blob".len()
-                + "reasoning_text".len()
                 + RETAINED_CONTAINER_OVERHEAD_BYTES
                 + "thought".len()
         );

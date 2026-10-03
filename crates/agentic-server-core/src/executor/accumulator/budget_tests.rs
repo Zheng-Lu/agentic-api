@@ -276,7 +276,7 @@ fn reasoning_streamed_indexes_charge_containers_and_reconcile_with_done_text() {
     // Container already charged with the first delta; done grows the text by 3.
     assert_eq!(
         budget.used() - opening,
-        3 * RETAINED_CONTAINER_OVERHEAD_BYTES + "reasoning_text".len() + "abcdef".len()
+        3 * RETAINED_CONTAINER_OVERHEAD_BYTES + "abcdef".len()
     );
 }
 
@@ -487,6 +487,15 @@ fn nested_empty_json_values_exhaust_retained_budget_on_both_paths() {
 }
 
 #[test]
+fn typed_reasoning_parts_exhaust_retained_budget_even_without_text() {
+    for (field, kind) in [("content", "reasoning_text"), ("summary", "summary_text")] {
+        let mut item = json!({"id":"rs_1", "type":"reasoning", "content":[], "summary":[]});
+        item[field] = json!(vec![json!({"type":kind, "text":""}); 1024]);
+        reject_item_on_both_paths(&item);
+    }
+}
+
+#[test]
 fn unrestricted_retained_strings_exhaust_budget_on_both_paths() {
     let huge = "x".repeat(100_000);
     for item in [
@@ -496,8 +505,9 @@ fn unrestricted_retained_strings_exhaust_budget_on_both_paths() {
                 "logprobs":[{"token":huge,"bytes":[],"logprob":-0.5,"top_logprobs":[]}]}]}),
         json!({"id":"msg_1","type":"message","role":"assistant","status":"completed",
             "agent":{"agent_name":huge},"content":[]}),
-        json!({"id":"rs_1","type":"reasoning","status":huge,"content":[],"summary":[]}),
-        json!({"id":"rs_1","type":"reasoning","content":[{"type":huge,"text":""}],"summary":[]}),
+        json!({"id":"rs_1","type":"reasoning","encrypted_content":huge,"content":[],"summary":[]}),
+        json!({"id":"rs_1","type":"reasoning","content":[{"type":"reasoning_text","text":huge}],"summary":[]}),
+        json!({"id":"rs_1","type":"reasoning","content":[],"summary":[{"type":"summary_text","text":huge}]}),
         json!({"id":"mcp_1","type":"mcp_call","server_label":"s","name":"tool","arguments":"{}",
             "error":{"type":huge,"content":[]}}),
         json!({"id":"mcp_1","type":"mcp_call","server_label":"s","name":"tool","arguments":"{}",
@@ -741,6 +751,54 @@ fn pending_identity_is_not_charged_again_at_completion() {
         budget.used(),
         RETAINED_CONTAINER_OVERHEAD_BYTES + "resp_1".len() + output[0].retained_bytes()
     );
+}
+
+#[test]
+fn service_tier_is_charged_and_bounded_on_both_ingestion_paths() {
+    for validation in [Validation::Lenient, Validation::Strict] {
+        let mut terminal = completed(&[]);
+        terminal["response"]["service_tier"] = json!("priority");
+        let events = [
+            created(),
+            json!({"type": "response.in_progress", "response": {"id": "resp_1", "status": "in_progress"}}),
+            terminal.clone(),
+        ];
+        let (mut stream, stream_budget) = budgeted(4096, validation);
+        feed(&mut stream, &events).unwrap();
+        let (mut json_acc, json_budget) = budgeted(4096, validation);
+        json_acc.load_json_body(&terminal["response"].to_string()).unwrap();
+        assert_eq!(stream_budget.used(), json_budget.used());
+        assert_eq!(stream.service_tier.as_deref(), Some("priority"));
+
+        let limit = stream_budget.used() - 1;
+        let (mut stream, _) = budgeted(limit, validation);
+        assert_budget_exceeded(&feed(&mut stream, &events).unwrap_err());
+        let (mut json_acc, _) = budgeted(limit, validation);
+        assert_budget_exceeded(&json_acc.load_json_body(&terminal["response"].to_string()).unwrap_err());
+    }
+}
+
+#[test]
+fn repeated_terminal_service_tiers_reconcile_retained_memory() {
+    let charge = RETAINED_CONTAINER_OVERHEAD_BYTES + "priority".len();
+    let (mut acc, budget) = budgeted(
+        "resp_1".len() + RETAINED_CONTAINER_OVERHEAD_BYTES + charge + 1,
+        Validation::Lenient,
+    );
+    feed(&mut acc, &[created()]).unwrap();
+    let base = budget.used();
+    for tier in [json!("priority"), json!("priority"), json!("flex"), Value::Null] {
+        let mut event = completed(&[]);
+        event["response"]["service_tier"] = tier.clone();
+        feed(&mut acc, &[event]).unwrap();
+        assert_eq!(budget.used(), base + charge);
+        assert_eq!(acc.service_tier.as_deref(), tier.as_str());
+    }
+    let mut larger = completed(&[]);
+    larger["response"]["service_tier"] = json!("priorityxx");
+    assert_budget_exceeded(&feed(&mut acc, &[larger]).unwrap_err());
+    assert!(acc.service_tier.is_none());
+    assert_eq!(budget.used(), base + charge);
 }
 
 #[test]
