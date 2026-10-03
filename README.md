@@ -434,12 +434,16 @@ api_key_env = "TAVILY_API_KEY"
 ```
 
 **SearXNG** (`provider = "searxng"`) runs against a [self-hosted SearXNG](https://docs.searxng.org/admin/installation.html)
-instance: the gateway talks only to your instance, no API key is needed, and no search vendor sees your
-deployment. Note that SearXNG itself forwards each query to the engines enabled in its `settings.yml`, so for a
-fully air-gapped setup restrict it to internal or offline engines. The endpoint is mandatory: the server refuses to
-start when `searxng` is selected without `AGENTIC_WEB_SEARCH_BASE_URL` or `[web_search] base_url` (an absolute
-`http(s)` URL without a query or fragment; a sub-path such as `http://host/searxng` is fine). Two instance settings
-matter:
+instance: the gateway only ever sends an HTTP request to that instance, no API key is needed, and no search vendor
+sees your deployment. Note that SearXNG itself forwards each query to the engines enabled in its `settings.yml`, so
+for a fully air-gapped setup restrict it to internal or offline engines. This does **not** cover SearXNG's "bang"
+syntax (`!!g rust`, `!ddg rust`, and its thousands of other pinned bangs): a bang makes SearXNG redirect straight to
+the named external engine without consulting the enabled-engines list at all, before it even looks at
+`format=json`. The gateway's SearXNG client disables HTTP redirects specifically so a bang in the query — written
+by the model, requested by the user, or picked up from a page the model read — fails that `web_search_call` instead
+of silently sending it past the configured instance. The endpoint is mandatory: the server refuses to start when
+`searxng` is selected without `AGENTIC_WEB_SEARCH_BASE_URL` or `[web_search] base_url` (an absolute `http(s)` URL
+without a query or fragment; a sub-path such as `http://host/searxng` is fine). Two instance settings matter:
 
 - The JSON output format must be enabled: add `json` to `search.formats` in SearXNG's `settings.yml`
   (`formats: [html, json]`). Without it SearXNG answers `403`, which the failed `web_search_call` explains.

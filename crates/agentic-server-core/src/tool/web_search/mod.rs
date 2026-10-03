@@ -242,8 +242,9 @@ impl WebSearchHandler {
                     .or(WebSearchProviderKind::Tavily.default_max_concurrent_queries())
                     .unwrap_or(max_concurrent_gateway_calls),
             )),
+            // SearXNG deliberately does not take `client`: it builds its own
+            // client with redirects disabled (see `redirect_free_client`).
             WebSearchProviderKind::Searxng => Arc::new(SearxngSearchProvider::from_values(
-                client,
                 config.api_key.clone(),
                 config.base_url.clone(),
                 config

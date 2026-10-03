@@ -39,70 +39,22 @@ use super::{
     null_as_default, read_response_limited,
 };
 use crate::config::WebSearchProviderKind;
-use crate::error::Error;
 use crate::tool::handler::ToolError;
 use crate::types::tools::{WebSearchContextSize, WebSearchToolParam};
 
+mod transport;
+
+pub use self::transport::{SEARXNG_BASE_URL_HINT, validate_searxng_base_url};
+use self::transport::{redirect_free_client, search_endpoint};
+
 pub(crate) const SEARXNG_API_KEY: &str = WebSearchProviderKind::Searxng.default_api_key_env();
-
-/// Operator-facing fix for a missing SearXNG endpoint, shared by the startup
-/// check in `agentic-server` and the execution-time fallback here.
-pub const SEARXNG_BASE_URL_HINT: &str = "SearXNG requires a base URL; set AGENTIC_WEB_SEARCH_BASE_URL or [web_search] base_url \
-     (for example http://searxng:8080)";
-
-const SEARCH_PATH: &str = "search";
 const CATEGORIES: &str = "general,news";
-
-/// Checks that a configured SearXNG endpoint can be addressed: an absolute
-/// `http`/`https` URL with a host and no query or fragment, because the
-/// provider appends `/search` to its path. A blank or missing value is
-/// reported with [`SEARXNG_BASE_URL_HINT`]. Shared by the `agentic-server`
-/// startup check and the provider so both reject the same inputs.
-///
-/// # Errors
-///
-/// Returns [`Error::Config`] with the operator-facing message when the value
-/// is blank, not an absolute `http(s)` URL with a host, or carries a query or
-/// fragment.
-pub fn validate_searxng_base_url(value: Option<&str>) -> Result<(), Error> {
-    let value = value.map(str::trim).filter(|value| !value.is_empty());
-    let Some(value) = value else {
-        return Err(Error::Config(SEARXNG_BASE_URL_HINT.to_owned()));
-    };
-    parse_base_url(value).map(drop).map_err(Error::Config)
-}
-
-/// Parses a non-blank endpoint, producing the operator-facing message on failure.
-fn parse_base_url(value: &str) -> Result<url::Url, String> {
-    match url::Url::parse(value) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") && url.has_host() => {
-            if url.query().is_some() || url.fragment().is_some() {
-                return Err(format!(
-                    "SearXNG base URL {value:?} must not contain a query or fragment; the gateway appends /search to \
-                     its path"
-                ));
-            }
-            Ok(url)
-        }
-        _ => Err(format!(
-            "SearXNG base URL {value:?} must be an absolute http(s) URL such as http://searxng:8080"
-        )),
-    }
-}
-
-/// Builds the `/search` endpoint under the configured base path, so a
-/// sub-path mount such as `http://host/searxng` resolves to
-/// `http://host/searxng/search`.
-fn search_endpoint(base_url: &str) -> Result<url::Url, ToolError> {
-    let mut url = parse_base_url(base_url).map_err(ToolError::Config)?;
-    let path = format!("{}/{SEARCH_PATH}", url.path().trim_end_matches('/'));
-    url.set_path(&path);
-    Ok(url)
-}
 const NEWS_CATEGORY: &str = "news";
 
 #[derive(Debug, Clone)]
 pub(crate) struct SearxngSearchProvider {
+    /// Dedicated to this provider, with redirects disabled; see
+    /// [`redirect_free_client`] for why this is not the gateway's shared client.
     client: Arc<reqwest::Client>,
     api_key: Option<ApiKey>,
     base_url: Option<String>,
@@ -113,14 +65,16 @@ impl SearxngSearchProvider {
     /// Builds a provider from optional environment-style values: a blank key
     /// counts as unset (SearXNG needs none); a blank base URL counts as unset
     /// and fails at execution time because SearXNG has no default endpoint.
+    ///
+    /// Unlike the other `web_search` providers, this does not take the
+    /// gateway's shared HTTP client — see [`redirect_free_client`].
     pub(crate) fn from_values(
-        client: Arc<reqwest::Client>,
         api_key: Option<String>,
         base_url: Option<String>,
         max_concurrent_requests: NonZeroUsize,
     ) -> Self {
         Self {
-            client,
+            client: Arc::new(redirect_free_client()),
             api_key: api_key
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty())
@@ -184,7 +138,10 @@ impl WebSearchProvider for SearxngSearchProvider {
 /// SearXNG answers `403` when `format=json` is not enabled, so that status is
 /// a configuration hint before it is an authentication one. `429` is what the
 /// bot-detection limiter returns for a request without `Accept-Encoding:
-/// gzip`, which this client cannot send; it is reported without retrying.
+/// gzip`, which this client cannot send; it is reported without retrying. A
+/// 3xx is a bang query trying to leave the instance (see
+/// [`redirect_free_client`]); the client never follows it, so this reports
+/// the status and, when present, where it would have gone.
 async fn failure_from_status(resp: reqwest::Response) -> ToolError {
     let status = resp.status();
     match status {
@@ -195,6 +152,19 @@ async fn failure_from_status(resp: reqwest::Response) -> ToolError {
         StatusCode::UNAUTHORIZED => ToolError::Execution(format!(
             "SearXNG rejected the credential ({status}); check {SEARXNG_API_KEY}"
         )),
+        _ if status.is_redirection() => {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map_or_else(String::new, |value| format!(" to {value}"));
+            ToolError::Execution(format!(
+                "SearXNG tried to redirect the request ({status}){location}; the gateway does not follow \
+                 redirects out of the configured instance (a bang such as !g or !ddg triggers this)"
+            ))
+        }
         StatusCode::TOO_MANY_REQUESTS => {
             let hint = resp
                 .headers()
@@ -344,6 +314,13 @@ fn searxng_time_range(freshness: Freshness) -> Option<&'static str> {
 /// (`^[a-z]{2,3}(-[a-zA-Z]{2})?$`); `auto` and `all` pass through. Script and
 /// variant subtags would make SearXNG answer `400`, so they are dropped, and a
 /// tag with no usable primary subtag is ignored.
+///
+/// Per RFC 5646, a region subtag can appear only immediately after the
+/// primary language or after a four-letter script subtag, never after a
+/// singleton — the one-character subtag that introduces an extension, such as
+/// Unicode `-u-` or private-use `-x-`. Stopping at the first singleton keeps
+/// its sub-parts (e.g. the `ca` calendar key in `en-u-ca-gregory`) from being
+/// mistaken for a region.
 fn searxng_language(value: &str) -> Option<String> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("auto") || value.eq_ignore_ascii_case("all") {
@@ -358,7 +335,12 @@ fn searxng_language(value: &str) -> Option<String> {
         );
         return None;
     }
-    let region = subtags.find(|subtag| subtag.len() == 2 && subtag.bytes().all(|byte| byte.is_ascii_alphabetic()));
+    let mut candidates = subtags.take_while(|subtag| subtag.len() > 1);
+    let mut next = candidates.next();
+    if next.is_some_and(|subtag| subtag.len() == 4) {
+        next = candidates.next(); // Skip an optional script subtag, e.g. `Hant`.
+    }
+    let region = next.filter(|subtag| subtag.len() == 2 && subtag.bytes().all(|byte| byte.is_ascii_alphabetic()));
     Some(match region {
         Some(region) => format!("{primary}-{}", region.to_ascii_uppercase()),
         None => primary,
@@ -464,7 +446,6 @@ mod tests {
 
     fn build_provider(api_key: Option<&str>, base_url: Option<&str>) -> SearxngSearchProvider {
         SearxngSearchProvider::from_values(
-            Arc::new(reqwest::Client::new()),
             api_key.map(str::to_owned),
             base_url.map(str::to_owned),
             NonZeroUsize::new(3).unwrap(),
@@ -494,55 +475,8 @@ mod tests {
         assert!(build_provider(None, None).base_url.is_none());
     }
 
-    #[test]
-    fn search_endpoint_appends_search_under_the_base_path() {
-        assert_eq!(
-            search_endpoint("http://searxng:8080").unwrap().as_str(),
-            "http://searxng:8080/search"
-        );
-        assert_eq!(
-            search_endpoint("https://search.internal/searxng").unwrap().as_str(),
-            "https://search.internal/searxng/search"
-        );
-        assert_eq!(
-            search_endpoint("http://[::1]:8080/a/b").unwrap().as_str(),
-            "http://[::1]:8080/a/b/search"
-        );
-        for invalid in [
-            "searxng:8080",
-            "ftp://searxng",
-            "http://",
-            "http://host?x=y",
-            "http://host/#top",
-        ] {
-            let error = search_endpoint(invalid).expect_err(invalid).to_string();
-            assert!(error.starts_with("invalid tool config: SearXNG base URL"), "{error}");
-        }
-    }
-
-    #[test]
-    fn validate_base_url_shares_the_provider_rules() {
-        assert!(validate_searxng_base_url(Some(" http://searxng:8080/ ")).is_ok());
-        assert_eq!(
-            validate_searxng_base_url(None).unwrap_err().to_string(),
-            SEARXNG_BASE_URL_HINT
-        );
-        assert_eq!(
-            validate_searxng_base_url(Some("  ")).unwrap_err().to_string(),
-            SEARXNG_BASE_URL_HINT
-        );
-        assert_eq!(
-            validate_searxng_base_url(Some("http://host?x=y"))
-                .unwrap_err()
-                .to_string(),
-            "SearXNG base URL \"http://host?x=y\" must not contain a query or fragment; the gateway appends /search \
-             to its path"
-        );
-        assert_eq!(
-            validate_searxng_base_url(Some("/searxng")).unwrap_err().to_string(),
-            "SearXNG base URL \"/searxng\" must be an absolute http(s) URL such as http://searxng:8080"
-        );
-    }
+    // `search_endpoint` and `validate_searxng_base_url` are tested in
+    // `transport::tests`, alongside the rest of the endpoint-validation code.
 
     #[tokio::test]
     async fn search_without_base_url_names_the_setting() {
@@ -625,9 +559,14 @@ mod tests {
         assert_eq!(searxng_language("pt_BR").as_deref(), Some("pt-BR"));
         assert_eq!(searxng_language("zh-Hans").as_deref(), Some("zh"));
         assert_eq!(searxng_language("zh-Hant-TW").as_deref(), Some("zh-TW"));
+        assert_eq!(searxng_language("de").as_deref(), Some("de"));
         assert_eq!(searxng_language("ast").as_deref(), Some("ast"));
         assert_eq!(searxng_language("Auto").as_deref(), Some("auto"));
         assert_eq!(searxng_language("all").as_deref(), Some("all"));
+        // RFC 5646 extension singletons (Unicode `-u-`, private-use `-x-`) are
+        // not regions: their sub-parts must not leak through as one.
+        assert_eq!(searxng_language("en-u-ca-gregory").as_deref(), Some("en"));
+        assert_eq!(searxng_language("en-x-ca").as_deref(), Some("en"));
         assert_eq!(searxng_language("x"), None);
         assert_eq!(searxng_language("english"), None);
         assert_eq!(searxng_language("e1"), None);

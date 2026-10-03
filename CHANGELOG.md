@@ -18,8 +18,11 @@ All notable changes to Agentic API are documented here.
   to SearXNG's `xx` / `xx-YY` form, `safesearch` maps to `0` / `1` / `2`, and `country` plus the You.com-specific
   arguments are ignored. A `403` is reported as the JSON format being disabled, and a `429` explains SearXNG's
   bot-detection limiter, which rejects the gateway's `Accept-Encoding`-free requests unless its address is on
-  `pass_ip`; neither is retried. Each SearXNG `metadata[]` entry carries `"provider": "searxng"`. Concurrency
-  inherits `max_concurrent_gateway_calls`.
+  `pass_ip`; neither is retried. The SearXNG provider uses a dedicated client with redirects disabled: a "bang"
+  query (`!!g`, `!ddg`, ...) makes SearXNG redirect to the named external engine before it looks at `format=json`,
+  and the gateway reports that 3xx as a failed `web_search_call` rather than following it out of the configured
+  instance. Each SearXNG `metadata[]` entry carries `"provider": "searxng"`. Concurrency inherits
+  `max_concurrent_gateway_calls`.
 
 ### Changed
 

@@ -51,7 +51,7 @@ enum MockBody {
 struct MockSearxng {
     tx: mpsc::Sender<CapturedSearxngRequest>,
     status: StatusCode,
-    headers: Vec<(&'static str, &'static str)>,
+    headers: Vec<(&'static str, String)>,
     body: MockBody,
 }
 
@@ -72,7 +72,7 @@ fn capture(headers: &HeaderMap, uri: &Uri) -> CapturedSearxngRequest {
 
 async fn spawn_mock_searxng(
     status: StatusCode,
-    headers: Vec<(&'static str, &'static str)>,
+    headers: Vec<(&'static str, String)>,
     body: MockBody,
 ) -> (
     String,
@@ -494,7 +494,7 @@ async fn searxng_handler_reports_rejected_credential_without_leaking_it() {
 async fn searxng_handler_surfaces_limiter_blocks_without_retrying() {
     let (base_url, mut captured, _handle) = spawn_mock_searxng(
         StatusCode::TOO_MANY_REQUESTS,
-        vec![("retry-after", "30")],
+        vec![("retry-after", "30".to_owned())],
         MockBody::Raw {
             content_type: "text/plain",
             body: "IP is on BLOCKLIST - HTTP header Accept-Encoding did not contain gzip nor deflate",
@@ -561,6 +561,95 @@ async fn searxng_handler_reports_html_body_as_misconfigured_endpoint() {
             "); confirm base_url points at a SearXNG instance and that `search.formats` in settings.yml includes `json`"
         ),
         "{error}"
+    );
+}
+
+/// Mock standing in for an external search engine. If the gateway ever
+/// followed a SearXNG redirect, the query would land here.
+async fn spawn_mock_external_engine() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/search",
+        get(|State(hits): State<Arc<AtomicUsize>>| async move {
+            hits.fetch_add(1, Ordering::SeqCst);
+            "external engine reached"
+        }),
+    );
+    let app = app.with_state(Arc::clone(&hits));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/search?q=rust"), hits, handle)
+}
+
+#[tokio::test]
+async fn searxng_handler_rejects_redirects_instead_of_following_them() {
+    // A bang query (`!!g rust`, `!ddg rust`, …) makes SearXNG answer with a
+    // redirect to the named external engine before it even looks at
+    // `format=json`. Disabling redirects (#328 review) must stop the gateway
+    // from ever reaching that engine, not merely report the redirect after
+    // the fact.
+    let (external_url, external_hits, _external_handle) = spawn_mock_external_engine().await;
+    let (base_url, mut captured, _handle) = spawn_mock_searxng(
+        StatusCode::FOUND,
+        vec![("location", external_url)],
+        MockBody::Raw {
+            content_type: "text/html; charset=utf-8",
+            body: "",
+        },
+    )
+    .await;
+    let handler = searxng_handler(Some(&base_url), None, None);
+
+    let error = execute(&handler, r#"{"query":"!!g rust"}"#, &WebSearchToolParam::default())
+        .await
+        .unwrap_err();
+    assert!(
+        error.starts_with("execution failed: SearXNG tried to redirect the request (302 Found) to http://"),
+        "{error}"
+    );
+    assert!(
+        error.ends_with(
+            "the gateway does not follow redirects out of the configured instance (a bang such as !g or !ddg \
+             triggers this)"
+        ),
+        "{error}"
+    );
+
+    captured.recv().await.expect("SearXNG received exactly one request");
+    assert!(
+        captured.try_recv().is_err(),
+        "the redirect must not be retried against SearXNG"
+    );
+    assert_eq!(
+        external_hits.load(Ordering::SeqCst),
+        0,
+        "the gateway must never follow the redirect to the external engine"
+    );
+}
+
+#[tokio::test]
+async fn searxng_handler_reports_a_redirect_with_no_location_header() {
+    let (base_url, _captured, _handle) = spawn_mock_searxng(
+        StatusCode::FOUND,
+        Vec::new(),
+        MockBody::Raw {
+            content_type: "text/html; charset=utf-8",
+            body: "",
+        },
+    )
+    .await;
+    let error = execute(
+        &searxng_handler(Some(&base_url), None, None),
+        r#"{"query":"q"}"#,
+        &WebSearchToolParam::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error,
+        "execution failed: SearXNG tried to redirect the request (302 Found); the gateway does not follow \
+         redirects out of the configured instance (a bang such as !g or !ddg triggers this)"
     );
 }
 
