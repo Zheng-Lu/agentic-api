@@ -30,11 +30,9 @@ mod web_fetch_config;
 mod web_search_config;
 use responses_config::{generated_responses_file_config, resolve_responses_config};
 
-use config_file::{
-    CodeInterpreterFileConfig, FileConfig, McpFileConfig, MessagesGatewayFileConfig, ServerFileConfig, ToolsFileConfig,
-};
+use config_file::{CodeInterpreterFileConfig, FileConfig, McpFileConfig, MessagesGatewayFileConfig, ToolsFileConfig};
 use server::GatewayOptions;
-use server_settings::{MAX_REQUEST_BODY_SIZE_ENV, resolve_max_request_body_size};
+use server_settings::{RateLimitArgs, generated_server_file_config, resolve_max_request_body_size, resolve_rate_limit};
 use web_fetch_config::resolve_web_fetch_config;
 use web_search_config::{generated_web_search_file_config, resolve_web_search_config};
 
@@ -73,6 +71,9 @@ struct CommonArgs {
     /// `server.max_request_body_size_bytes` in the configuration file.
     #[arg(long, global = true)]
     max_request_body_size_bytes: Option<NonZeroUsize>,
+
+    #[command(flatten)]
+    rate_limit: RateLimitArgs,
 
     /// `SQLite` or `PostgreSQL` URL for conversation and response storage.
     /// Defaults to `agentic_api.db` in the Agentic API home directory.
@@ -487,6 +488,7 @@ fn gateway_options<'a>(
             common.max_request_body_size_bytes,
             file.server.max_request_body_size_bytes,
         )?,
+        rate_limit: resolve_rate_limit(&common.rate_limit, &file.server)?,
         oidc,
     })
 }
@@ -499,10 +501,7 @@ fn generated_file_config(llm_api_base: String) -> FileConfig {
             allowed_hosts: environment_value("AGENTIC_MCP_ALLOWED_HOSTS")
                 .map_or_else(Vec::new, |value| parse_comma_separated(&value)),
         },
-        server: ServerFileConfig {
-            max_request_body_size_bytes: environment_value(MAX_REQUEST_BODY_SIZE_ENV)
-                .and_then(|value| value.parse::<NonZeroUsize>().ok()),
-        },
+        server: generated_server_file_config(environment_value),
         tools: ToolsFileConfig {
             max_concurrent_gateway_calls: environment_value("AGENTIC_MAX_CONCURRENT_GATEWAY_CALLS")
                 .and_then(|value| value.parse::<NonZeroUsize>().ok()),
